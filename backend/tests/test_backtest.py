@@ -1,0 +1,295 @@
+"""回测测试：前瞻对齐、涨跌停过滤、空池、指标、无未来函数。"""
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from rpsboard.analytics import backtest as bt
+from rpsboard.analytics.matrix import build_close_matrix
+
+from .fixtures import make_long, perturb_after
+
+
+def make_close(n_symbols=40, n_days=300, seed=61):
+    df = make_long(n_symbols=n_symbols, n_days=n_days, seed=seed)
+    return df, build_close_matrix(df)
+
+
+# ── 前瞻收益对齐 ────────────────────────────────────────────────────
+def test_forward_return_alignment():
+    """T 日的 fwd_ret(hold=2) = close[T+2]/close[T] - 1，不存在 off-by-one。"""
+    dates = pd.bdate_range("2024-01-01", periods=5)
+    close = pd.DataFrame(
+        [[10.0], [11.0], [12.0], [13.0], [14.0]],
+        index=dates, columns=["000001"],
+    )
+    fwd = bt._forward_return(close, hold=2)
+    assert fwd.loc[dates[0], "000001"] == pytest.approx(12.0 / 10.0 - 1)
+    assert fwd.loc[dates[1], "000001"] == pytest.approx(13.0 / 11.0 - 1)
+    assert pd.isna(fwd.loc[dates[3], "000001"])   # 末尾没有足够未来数据
+    assert pd.isna(fwd.loc[dates[4], "000001"])
+
+
+def test_signal_stability_under_future_perturbation():
+    """**回测的无未来函数核心断言**。
+
+    前瞻收益本来就依赖未来价格（这是回测的意义所在），所以正确的断言对象
+    不是「收益不变」，而是「**信号不变**」：
+
+        扰动 cutoff 之后的行情 → cutoff 当日选出的股票集合必须逐只相同。
+
+    如果信号用到了未来数据（例如错写成 close.shift(+N) 或用了未来复权因子），
+    这个断言必然失败。
+    """
+    from rpsboard.analytics import rps as rps_mod
+
+    df = make_long(n_symbols=30, n_days=260, seed=64)
+    cutoff = sorted(df["date"].unique())[200]
+
+    close_a = build_close_matrix(df)
+    frames_a = rps_mod.compute_rps_frames(close_a)
+    mask_a = (frames_a["rps60"] >= 80).loc[cutoff].dropna()
+    sel_a = set(mask_a[mask_a].index)
+
+    close_b = build_close_matrix(perturb_after(df, cutoff))
+    frames_b = rps_mod.compute_rps_frames(close_b)
+    mask_b = (frames_b["rps60"] >= 80).loc[cutoff].dropna()
+    sel_b = set(mask_b[mask_b].index)
+
+    assert sel_a == sel_b, "扰动未来行情改变了信号日的选股结果 —— 存在未来函数"
+
+
+def test_rps_at_signal_date_unchanged():
+    """信号日的 RPS 数值本身也不受未来数据影响。"""
+    from rpsboard.analytics import rps as rps_mod
+
+    df = make_long(n_symbols=20, n_days=150, seed=65)
+    cutoff = sorted(df["date"].unique())[100]
+    a = rps_mod.compute_rps_frames(build_close_matrix(df))["rps60"].loc[cutoff]
+    b = rps_mod.compute_rps_frames(
+        build_close_matrix(perturb_after(df, cutoff))
+    )["rps60"].loc[cutoff]
+    pd.testing.assert_series_equal(a, b, check_names=False)
+
+
+# ── 涨跌停阈值 ──────────────────────────────────────────────────────
+def test_limit_threshold_by_board():
+    from rpsboard import config
+    assert config.limit_threshold("600000") == pytest.approx(9.8)   # 主板
+    assert config.limit_threshold("000001") == pytest.approx(9.8)
+    assert config.limit_threshold("300750") == pytest.approx(19.8)  # 创业板
+    assert config.limit_threshold("688981") == pytest.approx(19.8)  # 科创板
+
+
+def test_exchange_detection_bj():
+    """920xxx 必须判为北交所，不能像某些参考实现那样归到上海。"""
+    from rpsboard import config
+    assert config.exchange_of("600000") == "sh"
+    assert config.exchange_of("000001") == "sz"
+    assert config.exchange_of("300750") == "sz"
+    assert config.exchange_of("688981") == "sh"
+    assert config.exchange_of("920001") == "bj"   # 北交所新代码段
+    assert config.exchange_of("830799") == "bj"
+    assert config.exchange_of("873122") == "bj"
+
+
+def test_limit_up_filter_excludes():
+    """涨幅达到涨停阈值的股票被排除出池。"""
+    pct = pd.DataFrame(
+        [[10.0, 5.0, 20.0], [2.0, 9.9, 1.0]],
+        index=pd.bdate_range("2024-01-01", periods=2),
+        columns=["600000", "000001", "300750"],
+    )
+    limits = bt._limit_filter(list(pct.columns))
+    blocked = pct >= limits
+    assert blocked.iloc[0]["600000"]      # 主板 +10% → 涨停
+    assert not blocked.iloc[0]["000001"]  # +5% → 未涨停
+    assert blocked.iloc[0]["300750"]      # 创业板 +20% → 涨停
+    assert not blocked.iloc[1]["600000"]
+    assert blocked.iloc[1]["000001"]      # +9.9% ≥ 9.8 → 算涨停
+
+
+# ── 指标 ────────────────────────────────────────────────────────────
+def test_metrics_handcomputed():
+    eq = pd.Series([1.0, 1.1, 1.05, 1.2, 1.0], dtype="float64")
+    m = bt.compute_metrics(eq, n_days_per_point=20)
+    assert m["total_return"] == pytest.approx(0.0, abs=1e-6)     # 1.0 → 1.0
+    assert m["max_drawdown"] == pytest.approx(-0.1666, abs=1e-3) # 1.2 → 1.0
+    assert m["days"] == 5
+    # 4 个间隔 × 20 交易日 / 252 ≈ 0.317 年
+    assert m["years"] == pytest.approx(80 / 252, abs=0.01)
+
+
+def test_metrics_annualization_is_sane():
+    """年化不能爆炸：净值 8 倍、跨 1 年，年化应约 700% 而不是几万。"""
+    eq = pd.Series([1.0 + i * 0.5 for i in range(14)])   # 13 个点
+    m = bt.compute_metrics(eq, n_days_per_point=20)      # 13*20/252 ≈ 1.03 年
+    assert 0.5 < m["annualized"] < 100.0, f"年化异常: {m['annualized']}"
+    assert m["years"] == pytest.approx(260 / 252, abs=0.01)
+
+
+def test_metrics_short_series():
+    m = bt.compute_metrics(pd.Series([1.0]))
+    assert m["days"] == 1 and m["max_drawdown"] == 0.0
+    assert bt.compute_metrics(pd.Series([], dtype="float64"))["days"] == 0
+
+
+def test_metrics_monotonic_equity():
+    eq = pd.Series(np.linspace(1.0, 2.0, 100))
+    m = bt.compute_metrics(eq)
+    assert m["max_drawdown"] == pytest.approx(0.0, abs=1e-9)
+    assert m["annualized"] > 0
+
+
+# ── 分档 ────────────────────────────────────────────────────────────
+def test_buckets_partition_and_boundaries():
+    rps = pd.DataFrame(
+        [[95.0, 85.0, 75.0, 60.0, 20.0, 100.0]],
+        index=pd.date_range("2024-01-01", periods=1),
+        columns=[f"{i:06d}" for i in range(6)],
+    )
+    fwd = pd.DataFrame(
+        [[0.10, 0.05, 0.02, 0.00, -0.05, 0.20]],
+        index=rps.index, columns=rps.columns,
+    )
+    out = bt.compute_buckets(rps, fwd)
+    by_bucket = {b["bucket"]: b for b in out}
+
+    # 100 应归入 90-100 档（不是 80-90）
+    assert by_bucket["90-100"]["samples"] == 2      # 95 和 100
+    assert by_bucket["80-90"]["samples"] == 1      # 85
+    assert by_bucket["70-80"]["samples"] == 1      # 75
+    assert by_bucket["50-70"]["samples"] == 1      # 60
+    assert by_bucket["<50"]["samples"] == 1        # 20
+    assert by_bucket["90-100"]["avg_forward_return"] == pytest.approx(0.15)
+    assert by_bucket["<50"]["win_rate"] == pytest.approx(0.0)
+
+
+def test_buckets_higher_rps_more_return():
+    """构造强动量数据：RPS 高的一档前瞻收益应显著更高。"""
+    rng = np.random.default_rng(99)
+    n_sym, n_days = 300, 300
+    # 前 30 只给强上行趋势，后 270 只走平
+    drift = np.concatenate([np.full(30, 0.004), np.full(270, 0.0)])
+    paths = np.array([
+        10.0 * np.exp(np.cumsum(drift[s] + rng.normal(0, 0.012, n_days)))
+        for s in range(n_sym)
+    ])
+    dates = pd.bdate_range("2024-01-01", periods=n_days)
+    cols = [f"{i:06d}" for i in range(n_sym)]
+    close = pd.DataFrame(paths.T, index=dates, columns=cols)
+    from rpsboard.analytics import rps as rps_mod
+    frames = rps_mod.compute_rps_frames(close)
+    fwd = bt._forward_return(close, hold=10)
+    out = {b["bucket"]: b for b in bt.compute_buckets(frames["rps20"], fwd)}
+
+    assert out["90-100"]["avg_forward_return"] > out["<50"]["avg_forward_return"]
+
+
+def test_buckets_empty():
+    empty = pd.DataFrame()
+    assert bt.compute_buckets(empty, empty) == []
+
+
+# ── 回测主流程（用临时库）──────────────────────────────────────────
+def _seed_db(tmp_path, name, n_symbols, n_days, seed):
+    """建一个用真实 SCHEMA 的临时库，灌入合成行情**并算出 RPS**。"""
+    from rpsboard import db as dbmod
+    from rpsboard.analytics import rps as rps_engine
+    from rpsboard.analytics.matrix import (
+        build_st_flags,
+        build_tradable_matrix,
+    )
+    from .fixtures import make_industry_map_zh
+
+    path = tmp_path / name
+    dbmod.init_db(path)
+    conn = dbmod.connect(path)
+    df = make_long(n_symbols=n_symbols, n_days=n_days, seed=seed)
+    df[["symbol", "date", "close", "pct_chg", "tradestatus", "is_st"]].assign(
+        volume=1_000_000.0, amount=1e8, open=1.0, high=1.0, low=1.0, turn=1.0
+    )[["symbol", "date", "open", "high", "low", "close", "volume", "amount",
+       "turn", "pct_chg", "is_st", "tradestatus"]].to_sql(
+        "daily_bar", conn, if_exists="append", index=False)
+
+    close = build_close_matrix(df)
+    tradable = build_tradable_matrix(df)
+    st = build_st_flags(df)
+    ind = make_industry_map_zh(sorted(df["symbol"].unique()), 5)
+    rps_engine.materialize(conn, close, tradable, st, ind, None)
+    conn.commit()
+    return conn
+
+
+def test_run_backtest_end_to_end(tmp_path):
+    conn = _seed_db(tmp_path, "bt.db", n_symbols=60, n_days=320, seed=71)
+    res = bt.run_backtest(conn, period=20, threshold=80, hold=20)
+    conn.close()
+
+    assert res.warnings, "必须始终携带幸存者偏差警示"
+    assert res.equity_curve, "净值曲线不应为空"
+    assert len(res.buckets) == 5
+    assert "total_return" in res.metrics
+
+
+def test_equity_curve_does_not_double_count(tmp_path):
+    """回归测试：净值曲线不得重复计算持有期收益。
+
+    早期 bug 把 hold+1 行的「未来 N 天累计收益」全部累乘，等于同一段收益
+    算了 20 次，出现单期 +667%、年化 61875% 的荒谬数字。
+    这里构造一段收益率恒定、可手算的行情，断言总收益量级正确。
+    """
+    from rpsboard import db as dbmod
+    from rpsboard.analytics import rps as rps_engine
+    from rpsboard.analytics.matrix import build_st_flags, build_tradable_matrix
+    from .fixtures import make_industry_map_zh
+
+    # 40 只股票，每天稳定涨 1%（后复权），持有 20 天 → 单期约 +21.9%
+    n_sym, n_days = 40, 200
+    dates = pd.bdate_range("2024-01-01", periods=n_days)
+    rows = []
+    for i in range(n_sym):
+        sym = f"{i:06d}"
+        closes = [10.0 * (1.01 ** day) for day in range(n_days)]
+        for d, c in zip(dates, closes):
+            rows.append({"symbol": sym, "date": d.strftime("%Y-%m-%d"),
+                         "close": c, "pct_chg": 0.01, "tradestatus": 1, "is_st": 0})
+    df = pd.DataFrame(rows)
+
+    path = tmp_path / "steady.db"
+    dbmod.init_db(path)
+    conn = dbmod.connect(path)
+    df[["symbol", "date", "close", "pct_chg", "tradestatus", "is_st"]].assign(
+        volume=1e6, amount=1e8, open=1.0, high=1.0, low=1.0, turn=1.0
+    )[["symbol", "date", "open", "high", "low", "close", "volume", "amount",
+       "turn", "pct_chg", "is_st", "tradestatus"]].to_sql(
+        "daily_bar", conn, if_exists="append", index=False)
+    close = build_close_matrix(df)
+    rps_engine.materialize(conn, close, build_tradable_matrix(df),
+                           build_st_flags(df),
+                           make_industry_map_zh(sorted(df["symbol"].unique()), 4), None)
+    conn.commit()
+
+    res = bt.run_backtest(conn, period=20, threshold=50, hold=20,
+                          exclude_limit_up=False)
+    conn.close()
+
+    m = res.metrics
+    assert m["total_return"] > 0, "稳定上涨行情应录得正收益"
+    # 199 天约 9 个 20 天周期，每期约 +21.9% → 总收益 ~5.6 倍。
+    # 若存在重复累乘 bug，总收益会是天文数字；这里给它一个宽松上限。
+    assert m["total_return"] < 50, f"总收益异常偏大（疑似重复计算）: {m['total_return']}"
+    # 每期净值不能暴涨
+    eq = [c["equity"] for c in res.equity_curve]
+    jumps = [eq[i] / eq[i - 1] for i in range(1, len(eq))]
+    assert max(jumps) < 2.0, f"单期净值跳涨超过 2 倍，疑似重复计算: {max(jumps):.2f}"
+
+
+def test_run_backtest_empty_pool_not_crash(tmp_path):
+    """阈值极高时入池为空，应优雅返回空组合而非崩溃。"""
+    conn = _seed_db(tmp_path, "empty.db", n_symbols=20, n_days=120, seed=73)
+    res = bt.run_backtest(conn, period=20, threshold=99.99, hold=20)
+    conn.close()
+    assert res.metrics["days"] >= 0
