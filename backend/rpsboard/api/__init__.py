@@ -1,0 +1,173 @@
+"""FastAPI 应用工厂与公共依赖。
+
+硬性约束：**所有 handler 只读 SQLite，绝不在请求链路内调用 baostock/akshare**。
+外部数据采集一律由 CLI / 定时任务离线完成。
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from .. import config, db
+
+_cache: dict[str, Any] = {"conn": None, "opened": None}
+
+
+def get_conn() -> sqlite3.Connection:
+    """复用单个只读连接（API 层不做写操作，无需每请求新建）。"""
+    if _cache["conn"] is None:
+        _cache["conn"] = db.connect()
+    return _cache["conn"]  # type: ignore[return-value]
+
+
+def latest_bar_date(conn: sqlite3.Connection) -> str | None:
+    # 刻意不用 count_rows() 判空：COUNT(*) 在 400 万行的表上要 235ms，
+    # 而这里每个请求都会走到一次。MAX(date) 走索引 seek，实测 0.0ms。
+    if not db.table_has_rows(conn, "daily_bar"):
+        return None
+    row = conn.execute("SELECT MAX(date) AS d FROM daily_bar").fetchone()
+    return row["d"] if row and row["d"] else None
+
+
+def resolve_date(conn: sqlite3.Connection, raw: str | None) -> str | None:
+    """把请求里的日期解析为一个**实际有数据的交易日**。
+
+    看板不能因为「周末请求」就报 400——回退到最近的有数据日期。
+    前端接上日期下拉之后，这里必须校验传入日期是否真的存在：
+    否则用户选到一个停市日或数据缺口日，页面会**静默显示空白**，
+    看起来像「当天没有强势股」，实际是查询打在了不存在的日期上。
+
+    回退策略是**就近**：优先取不晚于该日的最近交易日（周末/长假向后落回），
+    一个都没有才取更早的下一个交易日。直接退回「最新交易日」是错的——
+    用户选 2024-05-05 会被无声地换成 2026-10-12，看到的完全是另一天的数据。
+    """
+    fallback = latest_bar_date(conn)
+    if not raw:
+        return fallback
+    raw = str(raw).strip()
+    if not raw:
+        return fallback
+    hit = conn.execute(
+        "SELECT 1 FROM rps_daily WHERE date = ? LIMIT 1", (raw,)
+    ).fetchone()
+    if hit:
+        return raw
+    near = conn.execute(
+        "SELECT date FROM rps_daily WHERE date <= ? ORDER BY date DESC LIMIT 1", (raw,)
+    ).fetchone()
+    if near and near["date"]:
+        return near["date"]
+    near = conn.execute(
+        "SELECT date FROM rps_daily WHERE date > ? ORDER BY date ASC LIMIT 1", (raw,)
+    ).fetchone()
+    return near["date"] if near and near["date"] else fallback
+
+
+def nth_previous_date(conn: sqlite3.Connection, after: str, n: int) -> str | None:
+    """`after` 之前的第 n 个**有 RPS 数据的交易日**（n=1 表示紧邻的前一日）。
+
+    必须按交易日算而不是「日期减 n」：周末与节假日会让日历差和交易差
+    越偏越远，比较基准日就会错位。
+    """
+    if n <= 0:
+        return after
+    row = conn.execute(
+        "SELECT date FROM (SELECT DISTINCT date FROM rps_daily WHERE date < ? "
+        "ORDER BY date DESC) LIMIT 1 OFFSET ?",
+        (after, n - 1),
+    ).fetchone()
+    return row["date"] if row and row["date"] else None
+
+
+def read_sql(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> pd.DataFrame:
+    """执行只读查询。
+
+    表不存在（如尚未 init_db）时返回空表；但**其它 SQL 错误必须抛出**——
+    静默吞掉会把「列名写错」这类 bug 伪装成「查不到数据」，极难排查。
+    """
+    try:
+        return pd.read_sql_query(sql, conn, params=params)
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc):
+            return pd.DataFrame()
+        raise
+
+
+def jsonable(df: pd.DataFrame) -> list[dict]:
+    if df.empty:
+        return []
+    return df.replace({float("nan"): None}).to_dict("records")
+
+
+def create_app() -> FastAPI:
+    app = FastAPI(
+        title="A股 RPS 看板",
+        description="欧奈尔相对价格强度看板 · 数据源 baostock + akshare",
+        version="0.1.0",
+    )
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    from . import backtest as bt_api
+    from . import meta, rps, stock
+
+    app.include_router(meta.router)
+    app.include_router(rps.router)
+    app.include_router(stock.router)
+    app.include_router(bt_api.router)
+
+    _mount_frontend(app)
+
+    @app.on_event("shutdown")
+    def _close_conn() -> None:
+        if _cache["conn"] is not None:
+            _cache["conn"].close()
+            _cache["conn"] = None
+
+    return app
+
+
+def _mount_frontend(app: FastAPI) -> None:
+    """若已构建前端（frontend/dist），直接由后端托管，单端口即可访问。
+
+    这样日常使用不必同时起 vite dev server —— 既省一个进程，
+    也避开了 dev server 的 HMR/模块缓存在部分浏览器下不稳定的问题。
+    开发时仍可用 vite dev（5173）配合本 API（8000）。
+    """
+    from fastapi.responses import FileResponse
+    from fastapi.staticfiles import StaticFiles
+
+    dist = Path(__file__).resolve().parents[3] / "frontend" / "dist"
+    index = dist / "index.html"
+    if not index.is_file():
+        return
+
+    assets = dist / "assets"
+    if assets.is_dir():
+        app.mount("/assets", StaticFiles(directory=str(assets)), name="assets")
+
+    @app.get("/", include_in_schema=False)
+    def _root() -> FileResponse:
+        return FileResponse(str(index))
+
+    @app.get("/{path:path}", include_in_schema=False)
+    def _spa(path: str) -> FileResponse:
+        # 静态资源直接命中；其余路径一律回落到 index.html 交给 vue-router
+        candidate = dist / path
+        if candidate.is_file():
+            return FileResponse(str(candidate))
+        return FileResponse(str(index))
+
+
+app = create_app()
