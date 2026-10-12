@@ -1,0 +1,14 @@
+# 默认按 LF 存储、按 LF 检出，避免 Windows 上 core.autocrlf 把
+# 每个文件的行尾改写、导致跨平台协作时整文件 diff。
+* text=auto eol=lf
+
+# Windows 批处理脚本必须用 CRLF，否则 cmd.exe 可能解析异常
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制资源不做行尾转换
+*.jpg binary
+*.png binary
+*.ico binary
+*.woff binary
+*.woff2 binary

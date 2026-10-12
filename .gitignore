@@ -1,0 +1,32 @@
+# ── Python ─────────────────────────────────────────────────────────
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+
+# ── 数据与运行产物 ─────────────────────────────────────────────────
+# 数据库 1.3 GB，由 cli backfill / compute-rps 生成，绝不入库
+data/
+logs/
+# eltdx / 通达信客户端的本机缓存与二进制配置
+downloads/
+*.jsonl
+
+# ── 前端 ───────────────────────────────────────────────────────────
+node_modules/
+dist/
+
+# ── 可再生成的验证页 ───────────────────────────────────────────────
+# docs/sector-sort-rps*.html 每个约 1 MB（echarts 内联），由
+# `node backend/tests/build_sort_check.mjs` 随时重新生成，且会随行情过期，
+# 因此不入库；docs/screenshots/ 下的实拍图体积小、有留存价值，保留。
+docs/sector-sort-rps*.html
+
+# ── 系统 ───────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.db
+*.db-shm
+*.db-wal
