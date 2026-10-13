@@ -137,5 +137,3 @@ export const adminApi = {
   update: () => post('/admin/update', {}),
   updateStatus: () => get('/admin/update/status'),
 }
-
-export default { get, post, download }

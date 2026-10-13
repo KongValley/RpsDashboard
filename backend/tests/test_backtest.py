@@ -217,9 +217,9 @@ def _seed_db(tmp_path, name, n_symbols, n_days, seed):
     conn = dbmod.connect(path)
     df = make_long(n_symbols=n_symbols, n_days=n_days, seed=seed)
     df[["symbol", "date", "close", "pct_chg", "tradestatus", "is_st"]].assign(
-        volume=1_000_000.0, amount=1e8, open=1.0, high=1.0, low=1.0, turn=1.0
+        volume=1_000_000.0, amount=1e8, open=1.0, high=1.0, low=1.0
     )[["symbol", "date", "open", "high", "low", "close", "volume", "amount",
-       "turn", "pct_chg", "is_st", "tradestatus"]].to_sql(
+       "pct_chg", "is_st", "tradestatus"]].to_sql(
         "daily_bar", conn, if_exists="append", index=False)
 
     close = build_close_matrix(df)
@@ -270,9 +270,9 @@ def test_equity_curve_does_not_double_count(tmp_path):
     dbmod.init_db(path)
     conn = dbmod.connect(path)
     df[["symbol", "date", "close", "pct_chg", "tradestatus", "is_st"]].assign(
-        volume=1e6, amount=1e8, open=1.0, high=1.0, low=1.0, turn=1.0
+        volume=1e6, amount=1e8, open=1.0, high=1.0, low=1.0
     )[["symbol", "date", "open", "high", "low", "close", "volume", "amount",
-       "turn", "pct_chg", "is_st", "tradestatus"]].to_sql(
+       "pct_chg", "is_st", "tradestatus"]].to_sql(
         "daily_bar", conn, if_exists="append", index=False)
     close = build_close_matrix(df)
     rps_engine.materialize(conn, close, build_tradable_matrix(df),

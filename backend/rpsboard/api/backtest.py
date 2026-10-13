@@ -121,7 +121,7 @@ class CollectRequest(BaseModel):
 
 # ── 一键更新（后台线程 + 状态轮询）─────────────────────────────────
 # 早期实现是**同步**跑完整流程：eltdx 拉全市场日K 约 209 秒 + RPS 增量 10 秒。
-# 同步 HTTP 必然超时，而且 run_task 跑在请求线程里会阻塞整个服务。
+# 同步 HTTP 必然超时，而且采集任务跑在请求线程里会阻塞整个服务。
 _update_lock = threading.Lock()
 _update_state: dict = {"running": False, "phase": None, "run_id": None,
                       "error": None, "started_at": None, "finished_at": None}

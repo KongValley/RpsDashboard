@@ -123,13 +123,3 @@ def summarize(up: pd.DataFrame, dn: pd.DataFrame) -> dict:
     }
 
 
-def cost_of_blocked_exit(up: pd.DataFrame, dn: pd.DataFrame) -> pd.Series:
-    """返回每个日期「买入即被涨停挡住」的股票数（date → 数量）。"""
-    if up.empty:
-        return pd.Series(dtype="int64")
-    return up.sum(axis=1).astype("int64")
-
-
-def _ratio_to_series(ratios: pd.DataFrame) -> np.ndarray:
-    """测试辅助：把 ratio 矩阵转成 numpy，便于构造预期值。"""
-    return ratios.to_numpy(dtype="float64")

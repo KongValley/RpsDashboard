@@ -27,6 +27,13 @@ def detail(symbol: str) -> dict:
             raise HTTPException(status_code=404, detail=f"未找到股票 {symbol}")
 
         info = row.iloc[0].to_dict()
+        # 数据源不给上市日（security_master.ipo_date 恒为 NULL），
+        # 显示「上市日 —」等于给用户一个假字段；这里给出库中该股首根 K 线日期，
+        # 语义明确（单只股票走 (symbol,date) 主键索引，代价可忽略）。
+        first = conn.execute(
+            "SELECT MIN(date) AS d FROM daily_bar WHERE symbol = ?", (symbol,)
+        ).fetchone()
+        info["first_bar_date"] = first["d"] if first else None
         rps_row = read_sql(
             conn,
             "SELECT date, " + ", ".join(f"rps{p}" for p in config.PERIODS)

@@ -152,6 +152,3 @@ def _as_date(x) -> date | None:
 def default_cost_model(enabled: bool = True) -> CostModel:
     return CostModel(enabled=enabled)
 
-
-def disabled_cost_model() -> CostModel:
-    return CostModel(enabled=False)

@@ -11,7 +11,7 @@
           <span class="badge ind">{{ info.industry || '未分类' }}</span>
         </div>
         <div class="muted" style="margin-top:8px;font-size:12px">
-          上市日 {{ info.ipo_date || '—' }}
+          数据起始 {{ info.first_bar_date || '—' }}
           <span v-if="dataDate"> · 数据日期 {{ dataDate }}</span>
         </div>
       </div>

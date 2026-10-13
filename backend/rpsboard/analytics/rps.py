@@ -179,24 +179,6 @@ def compute_industry_rps(
     return long[[c for c in cols_order if c in long.columns]]
 
 
-def materialize_group_rps(
-    frames: dict[str, pd.DataFrame],
-    mapping: pd.Series,
-    leader_rps: pd.DataFrame | None = None,
-    names: pd.Series | None = None,
-    periods: tuple[int, ...] = config.PERIODS,
-) -> pd.DataFrame:
-    """按任意分组（行业 / 概念）计算板块 RPS —— 与 compute_industry_rps 同构。
-
-    概念板块 RPS 之所以能复用同一份实现，是因为它和行业 RPS 的算法完全一样，
-    只是「symbol → 分组」的映射表不同。上一轮把该函数向量化之后，
-    新增一种分组维度几乎零成本。
-    """
-    return compute_industry_rps(
-        frames, mapping, leader_rps=leader_rps, names=names, periods=periods
-    )
-
-
 def load_concept_map(conn) -> pd.Series:
     """symbol → concept 的多对多映射展开成 symbol → 主分组。
 
@@ -401,14 +383,3 @@ def materialize(
     db.finish_run(conn, run_id, "success", n_stock + n_ind,
                   f"mode={mode} 日期={n_dates or '全部'} 个股 {n_stock} 行 / 板块 {n_ind} 行")
     return n_stock, n_ind
-
-
-def load_matrices(conn: sqlite3.Connection, start: str | None = None):
-    """一次性加载回测/计算所需的全部矩阵。"""
-    long = matrix.load_long(conn, start)
-    return (
-        long,
-        matrix.build_close_matrix(long),
-        matrix.build_tradable_matrix(long),
-        matrix.build_st_flags(long),
-    )

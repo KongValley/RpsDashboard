@@ -26,8 +26,7 @@ CREATE TABLE IF NOT EXISTS security_master (
   symbol     TEXT PRIMARY KEY,
   name       TEXT NOT NULL,
   exchange   TEXT NOT NULL,
-  ipo_date   TEXT,
-  status     TEXT,
+  ipo_date   TEXT,           -- 数据源不给上市日（恒 NULL），UI 显示的是首根 K 线日期
   is_st      INTEGER DEFAULT 0,
   updated_at TEXT
 );
@@ -39,11 +38,6 @@ CREATE TABLE IF NOT EXISTS industry_map (
   updated_at    TEXT
 );
 
-CREATE TABLE IF NOT EXISTS trade_calendar (
-  date    TEXT PRIMARY KEY,
-  is_open INTEGER NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS daily_bar (
   symbol      TEXT NOT NULL,
   date        TEXT NOT NULL,
@@ -53,7 +47,6 @@ CREATE TABLE IF NOT EXISTS daily_bar (
   close       REAL,          -- 后复权收盘价
   volume      REAL,
   amount      REAL,
-  turn        REAL,
   pct_chg     REAL,
   is_st       INTEGER,
   tradestatus INTEGER,

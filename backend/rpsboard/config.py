@@ -60,10 +60,8 @@ TDX_WORKERS = int(os.environ.get("RPSBOARD_TDX_WORKERS", "8"))
 MAX_RETRIES = 3
 
 # ── 股票池过滤默认值 ────────────────────────────────────────────────
-#: 默认剔除 ST/*ST（API 可用 exclude_st=false 放开）
-DEFAULT_EXCLUDE_ST = True
-#: 默认剔除上市不足 N 个交易日的股票（新股 RPS 天然为 NaN，此项仅为显式语义）
-MIN_LISTED_BARS = max(PERIODS)
+#: 股票池过滤的默认值不在这里硬编码：API/回测的 exclude_st 等以函数默认参数形式
+#: 声明（backend/rpsboard/api/rps.py、analytics/backtest.py），改这里没人读。
 
 # ── 涨跌停 ──────────────────────────────────────────────────────────
 #: 涨跌停**不再用硬编码阈值**。原来的 LIMIT_MAIN=9.8 / LIMIT_GROWTH=19.8 是

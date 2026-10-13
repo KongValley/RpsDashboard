@@ -286,9 +286,6 @@ const bucketStats = computed(() => {
   const positive = hiRps.avg_forward_return >= loRps.avg_forward_return
   return {
     hiRps, loRps, positive,
-    // 数组严格单调递减（对应 RPS→收益 正向单调）
-    strict: positive && b.every(
-      (x, i) => i === 0 || x.avg_forward_return <= b[i - 1].avg_forward_return),
     gap: (hiRps.avg_forward_return - loRps.avg_forward_return) * 100,
   }
 })

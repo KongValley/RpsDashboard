@@ -136,34 +136,6 @@ def _exit_blocked(
     return out
 
 
-def load_stored_rps(
-    conn: sqlite3.Connection,
-    period: int,
-    index: pd.DatetimeIndex,
-    columns: list[str],
-) -> pd.DataFrame:
-    """从已落库的 rps_daily 取某一周期的 date × symbol 宽表。
-
-    **实测结论：这个路子在本项目的数据规模上并不更快。**
-    `SELECT date, symbol, rps60 FROM rps_daily WHERE rps60 IS NOT NULL` 要读回
-    400 万行再 pivot；而直接从已缓存的收盘价矩阵重算 compute_rps_frames 只要约 3 秒。
-    两条路径实测耗时几乎一样（36.1s vs 31.6s），差异全部来自数据加载而非 RPS 计算。
-
-    因此默认路径是 use_stored_rps=False（走缓存矩阵重算），本函数保留为
-    「想核对落库结果是否与实时计算一致」的对照手段，也供离线批处理使用。
-    """
-    df = pd.read_sql_query(
-        "SELECT date, symbol, rps{p} AS rps FROM rps_daily WHERE rps{p} IS NOT NULL"
-        .format(p=period),
-        conn,
-    )
-    if df.empty:
-        return pd.DataFrame(index=index, columns=columns, dtype="float64")
-    wide = df.pivot(index="date", columns="symbol", values="rps")
-    wide.index = pd.to_datetime(wide.index)
-    return wide.reindex(index=index, columns=columns)
-
-
 # ── 进程内矩阵缓存 ──────────────────────────────────────────────────
 # 回测页面允许用户反复调阈值/持有期/周期，每次都重新把 427 万行日K 读进内存
 # 再建 4 个矩阵，是单次请求里最大的一块固定开销。数据一天才更新一次，
@@ -253,7 +225,6 @@ def run_backtest(
     market_filter: str = "none",
     use_price_limits: bool = True,
     cost_model: CostModel | None = None,
-    use_stored_rps: bool = False,
     lookback_days: int | None = None,
 ) -> BacktestResult:
     """执行回测。返回结构化结果（含幸存者偏差警示）。
@@ -279,7 +250,6 @@ def run_backtest(
             "market_filter_label": MARKET_FILTER_LABELS[market_filter],
             "cost": cost_model.describe(),
             "use_price_limits": use_price_limits,
-            "use_stored_rps": use_stored_rps,
             "lookback_days": lookback_days,
         }
     )
@@ -298,35 +268,18 @@ def run_backtest(
     st_flags = ctx["st_flags"]
     pct_wide = ctx["pct"]
 
-    if use_stored_rps:
-        rps_main = load_stored_rps(
-            conn, period, close_wide.index, list(close_wide.columns)
-        )
-        if resonance:
-            mask = None
-            for p in config.PERIODS:
-                rp = load_stored_rps(conn, p, rps_main.index, list(rps_main.columns))
-                cond = rp >= threshold
-                mask = cond if mask is None else (mask & cond)
-        else:
-            mask = rps_main >= threshold
+    frames = get_frames(ctx, exclude_st)
+    rps_main = frames[f"rps{period}"]
+    if resonance:
+        # 多周期共振：20/60/120 同时 ≥ threshold
+        base = frames[f"rps{min(config.PERIODS)}"] >= threshold
+        mask = base
+        for p in config.PERIODS:
+            if p == period:
+                continue
+            mask &= frames[f"rps{p}"] >= threshold
     else:
-        frames = get_frames(ctx, exclude_st)
-        rps_main = frames[f"rps{period}"]
-        if resonance:
-            # 多周期共振：20/60/120 同时 ≥ threshold
-            base = frames[f"rps{min(config.PERIODS)}"] >= threshold
-            mask = base
-            for p in config.PERIODS:
-                if p == period:
-                    continue
-                mask &= frames[f"rps{p}"] >= threshold
-        else:
-            mask = rps_main >= threshold
-
-    if mask is None:
-        result.warnings.append("多周期共振所需数据不足")
-        return result
+        mask = rps_main >= threshold
 
     # 落库的 RPS 是用默认参数（剔除 ST）算的，但 ST 仍可能有分位值并越过阈值，
     # 因此这里显式再滤一次，与实时计算路径保持同一语义。

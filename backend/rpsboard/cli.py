@@ -19,12 +19,6 @@ from .analytics import matrix, rps as rps_engine
 from .sources import limit_src, tdxnet_src
 from .sources.base import SourceError
 
-BENCHMARK = "sh.000300"
-
-
-def _today() -> str:
-    return date.today().isoformat()
-
 
 # ── init ────────────────────────────────────────────────────────────
 def cmd_init(_: argparse.Namespace) -> int:
@@ -148,6 +142,9 @@ def cmd_compute_rps(args: argparse.Namespace) -> int:
             db.finish_run(conn, run_id, "failed", 0, str(exc))
             raise
     print(f"[rps] 个股 {n_stock} 行，板块 {n_ind} 行（{mode}）")
+    # RPS 变了 → 回测的进程内矩阵/帧缓存必须失效（否则最长 300s 用旧值）
+    from .analytics import backtest as bt_engine
+    bt_engine.clear_context_cache()
     return 0
 
 
@@ -430,24 +427,12 @@ def run_update_pipeline(progress=None) -> dict:
     if rc != 0:
         raise RuntimeError(f"形态计算失败（退出码 {rc}）")
 
+    # 数据更新后清掉回测的进程内矩阵缓存，否则最长 300s 内还在用旧数据出结论
+    from .analytics import backtest as bt_engine
+    bt_engine.clear_context_cache()
+
     say("done")
     return {"ok": True, "price_limit_rows": n_lim}
-
-
-def run_task(task: str) -> dict:
-    """执行单个采集任务（同步）。"""
-    handlers = {
-        "backfill": cmd_backfill,
-        "sync": cmd_sync,
-        "compute-rps": cmd_compute_rps,
-        "backtest": cmd_backtest,
-        "price-limits": lambda _ns: 0,
-    }
-    try:
-        rc = handlers[task](_ns())
-        return {"ok": rc == 0, "task": task, "returncode": rc}
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "task": task, "error": str(exc)}
 
 
 def build_parser() -> argparse.ArgumentParser:

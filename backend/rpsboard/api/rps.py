@@ -7,7 +7,7 @@ from fastapi import APIRouter, Query
 from fastapi.responses import StreamingResponse
 
 from .. import config, db
-from . import jsonable, latest_bar_date, nth_previous_date, read_sql, resolve_date
+from . import jsonable, nth_previous_date, read_sql, resolve_date
 
 router = APIRouter(prefix="/api/rps", tags=["rps"])
 
@@ -232,8 +232,6 @@ def _ranking_fast(
     )
     total_n = int(total_row["c"].iloc[0]) if not total_row.empty else 0
 
-    spot_params: tuple = ()
-
     sql = (
         "SELECT t.symbol, t.rps, t.period_return, s.name, s.is_st, i.industry, "
         "       b.pct_chg AS pct_chg, b.amount AS amount, "
@@ -251,7 +249,7 @@ def _ranking_fast(
 
     df = read_sql(
         conn, sql,
-        params_out + spot_params + (d,),
+        params_out + (d,),
     )
     return df, total_n
 

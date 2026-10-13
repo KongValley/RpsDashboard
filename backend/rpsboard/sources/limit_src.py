@@ -29,9 +29,6 @@ import pandas as pd
 from .. import db
 from .tdxnet_src import TdxSource
 
-#: daily_price_limits 全市场一次调用约 30 秒
-_FETCH_TIMEOUT_HINT = 40
-
 
 def fetch_limit_rows(trade_date: str, src: TdxSource | None = None) -> pd.DataFrame:
     """拉取指定交易日的全市场涨跌停信息。

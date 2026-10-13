@@ -93,7 +93,6 @@ const hasConcepts = ref(false)
 /** 空 = 最新交易日 */
 const date = ref('')
 const availableDates = ref([])
-const industries = ref([])
 const matrixData = ref([])
 const sectorRows = ref([])
 
@@ -105,8 +104,6 @@ async function loadHeatmap() {
       : await rpsApi.heatmap({ date: date.value || undefined })
     if (d.error) throw new Error(d.error)
     dataDate.value = d.data_date
-    // 行业接口字段叫 industries，概念接口叫 concepts，两者在下游是同一个东西
-    industries.value = (isConcept ? d.concepts : d.industries) || []
     // 概念热力图返回列名是 concept
     matrixData.value = (d.matrix || []).map((r) => ({
       industry: isConcept ? r.concept : r.industry,

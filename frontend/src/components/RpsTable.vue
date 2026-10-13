@@ -68,8 +68,6 @@ const props = defineProps({
 })
 defineEmits(['select'])
 
-const colSpan = computed(() => 9 + (props.showDelta ? 1 : 0) + (props.showPattern ? 1 : 0))
-
 /**
  * 表头定义。列宽拖拽按 key 记住，所以每列必须有稳定的 key
  * （不能用 label：两个列表头文字可能相同，且改名会丢用户的列宽设置）。

@@ -169,7 +169,7 @@ def test_invalidation_by_base_low():
     assert active(None) is True      # 没有后续数据 → 视为仍有效
 
 
-def test_nth_trading_date_back_uses_rps_dates():
+def test_window_start_uses_rps_dates():
     """窗口起点必须是「含当天在内」的最近 n 个交易日。
 
     早期用 `WHERE date < ?`，n=1 会退化成「前一个交易日」，

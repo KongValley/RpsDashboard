@@ -124,20 +124,6 @@ class TdxSource:
         df["close"] = pd.to_numeric(df["close"], errors="coerce")
         return df.dropna(subset=["close"]).reset_index(drop=True)
 
-    # ── 快照（成交额/换手/市值）──────────────────────────────────
-    def snapshot(self, symbols: list[str]) -> pd.DataFrame:
-        """全市场快照。eltdx 需要显式传 codes。"""
-        try:
-            prof = self._client.helpers.stock_profile_table(symbols)
-        except Exception:  # noqa: BLE001
-            return pd.DataFrame()
-        try:
-            df = pd.DataFrame(prof.to_dict("records") if hasattr(prof, "to_dict")
-                              else list(prof))
-        except Exception:  # noqa: BLE001
-            return pd.DataFrame()
-        return df if not df.empty else pd.DataFrame()
-
 
 # ── 全市场回填 ──────────────────────────────────────────────────────
 def backfill_bars(
@@ -159,7 +145,7 @@ def backfill_bars(
         st_map = master.set_index("symbol")["is_st"].to_dict()
         name_map = master.set_index("symbol")["name"].to_dict()
         db.upsert_master(conn, master[["symbol", "name", "exchange"]].assign(
-            ipo_date=None, status="1", is_st=master["is_st"], updated_at=db.now()
+            ipo_date=None, is_st=master["is_st"], updated_at=db.now()
         ))
 
         todo = list(master["symbol"]) if symbols is None else symbols
@@ -233,10 +219,9 @@ def backfill_bars(
         d = pd.to_datetime(df["date"])
         gap = d.groupby(df["symbol"]).diff().dt.days
         df["tradestatus"] = (gap.isna() | (gap <= 3)).astype(int)
-        df["turn"] = None          # 通达信协议不提供换手率（且无可靠替代来源）
         df = df.drop_duplicates(subset=["symbol", "date"], keep="last")
         cols = ["symbol", "date", "open", "high", "low", "close",
-                "volume", "amount", "turn", "pct_chg", "is_st", "tradestatus"]
+                "volume", "amount", "pct_chg", "is_st", "tradestatus"]
         df = df[cols]
 
         pairs = list(zip(df["symbol"], df["date"]))

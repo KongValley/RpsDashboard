@@ -150,7 +150,3 @@ def window_start(conn, date: str, n: int) -> str | None:
         (date, n - 1),
     ).fetchone()
     return row["date"] if row and row["date"] else None
-
-
-#: 兼容旧名
-nth_trading_date_back = window_start

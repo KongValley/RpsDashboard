@@ -30,9 +30,9 @@ def seeded(tmp_path, monkeypatch):
 
     df = make_long(n_symbols=40, n_days=320, seed=101)
     df[["symbol", "date", "close", "pct_chg", "tradestatus", "is_st"]].assign(
-        volume=1_000_000.0, amount=1e8, open=1.0, high=1.0, low=1.0, turn=1.5
+        volume=1_000_000.0, amount=1e8, open=1.0, high=1.0, low=1.0
     )[["symbol", "date", "open", "high", "low", "close", "volume", "amount",
-       "turn", "pct_chg", "is_st", "tradestatus"]].to_sql(
+       "pct_chg", "is_st", "tradestatus"]].to_sql(
         "daily_bar", conn, if_exists="append", index=False)
 
     symbols = sorted(df["symbol"].unique())
@@ -41,7 +41,6 @@ def seeded(tmp_path, monkeypatch):
         "name": [f"测试{i}" for i in range(len(symbols))],
         "exchange": ["sz"] * len(symbols),
         "ipo_date": ["20200101"] * len(symbols),
-        "status": ["1"] * len(symbols),
         "is_st": [0] * len(symbols),
         "updated_at": ["2026-01-01"] * len(symbols),
     }).to_sql("security_master", conn, if_exists="append", index=False)

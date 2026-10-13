@@ -82,11 +82,7 @@ export function useResizableColumns(storageKey, defaults = {}) {
     return w ? { width: `${w}px`, minWidth: `${w}px` } : {}
   }
 
-  function resetAll() {
-    for (const k of Object.keys(widths)) delete widths[k]
-  }
-
   onBeforeUnmount(onUp)
 
-  return { widths, colStyle, startResize, resetAll }
+  return { widths, colStyle, startResize }
 }
