@@ -464,3 +464,10 @@ backend/rpsboard/
   api/                   FastAPI 路由（只读 SQLite，不联网）
 frontend/src/views/      Rankings / Sectors / StockDetail / Backtest
 ```
+
+## 许可证
+
+[GPL-3.0-or-later](LICENSE) · Copyright (C) 2026 KongValley
+
+本项目以 GNU 通用公共许可证第 3 版（或更新版本）发布：可自由使用、修改、分发，
+但**衍生作品必须以同一许可证开源**，且不提供任何担保。

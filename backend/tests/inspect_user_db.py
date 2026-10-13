@@ -1,7 +1,15 @@
-"""检查用户已有 RPS 看板的本地数据库结构与数据规模。"""
-import sqlite3
+"""检查用户已有 RPS 看板的本地数据库结构与数据规模。
 
-DB = r"RPS_USER_DB"
+库路径从环境变量 RPS_USER_DB 读取（刻意不写死本机路径）：
+    set RPS_USER_DB=D:\\somewhere\\rps_market.db
+"""
+import os
+import sqlite3
+import sys
+
+DB = os.environ.get("RPS_USER_DB", "")
+if not DB:
+    sys.exit("请先设置 RPS_USER_DB 指向要检查的 SQLite 库文件")
 
 c = sqlite3.connect(DB)
 tables = [r[0] for r in c.execute(

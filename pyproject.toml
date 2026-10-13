@@ -2,6 +2,7 @@
 name = "rpsboard"
 version = "0.1.0"
 description = "A股 RPS（欧奈尔相对价格强度）看板"
+license = { text = "GPL-3.0-or-later" }
 requires-python = ">=3.11"
 dependencies = [
     "akshare>=1.19",
