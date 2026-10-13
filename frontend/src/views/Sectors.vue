@@ -6,9 +6,16 @@
         <span class="muted">
           数据日期 {{ dataDate || '—' }} · 行按
           <b class="sort-hint">RPS{{ period }} 降序</b>独立排列
-          （四个周期各自排序）· 点击格子查看该行业榜单
+          （四个周期各自排序）· 点击格子查看该{{ mode === 'concept' ? '概念' : '行业' }}榜单
         </span>
         <div class="spacer" />
+        <div class="group">
+          <label>口径</label>
+          <button class="btn" :class="{ active: mode === 'industry' }"
+                  @click="setMode('industry')">证监会行业</button>
+          <button class="btn" :class="{ active: mode === 'concept' }"
+                  :disabled="!hasConcepts" @click="setMode('concept')">概念题材</button>
+        </div>
         <div class="group">
           <label>数据日期</label>
           <select v-model="date" style="min-width:118px">
@@ -28,7 +35,11 @@
     </div>
 
     <div class="panel" style="margin-top:12px">
-      <h3 style="margin-top:0">板块排行 · RPS{{ period }}</h3>
+      <h3 style="margin-top:0">板块排行 · RPS{{ period }}
+        <span class="muted" style="font-weight:400;font-size:12px">
+          （{{ mode === 'concept' ? '概念题材' : '证监会行业' }}）
+        </span>
+      </h3>
       <div class="scroll-y">
       <table class="rps-table">
         <thead>
@@ -77,6 +88,9 @@ const route = useRoute()
 const periods = [20, 60, 120, 250]
 const period = ref(60)
 const dataDate = ref(null)
+/** 'industry' = 证监会行业（83 个）；'concept' = 概念题材 */
+const mode = ref('industry')
+const hasConcepts = ref(false)
 /** 空 = 最新交易日 */
 const date = ref('')
 const availableDates = ref([])
@@ -86,18 +100,41 @@ const sectorRows = ref([])
 
 async function loadHeatmap() {
   try {
-    const d = await rpsApi.heatmap({ date: date.value || undefined })
+    const isConcept = mode.value === 'concept'
+    const d = isConcept
+      ? await rpsApi.conceptHeatmap({ date: date.value || undefined })
+      : await rpsApi.heatmap({ date: date.value || undefined })
+    if (d.error) throw new Error(d.error)
     dataDate.value = d.data_date
-    industries.value = d.industries || []
-    matrixData.value = d.matrix || []
+    // 行业接口字段叫 industries，概念接口叫 concepts，两者在下游是同一个东西
+    industries.value = (isConcept ? d.concepts : d.industries) || []
+    // 概念热力图返回列名是 concept
+    matrixData.value = (d.matrix || []).map((r) => ({
+      industry: isConcept ? r.concept : r.industry,
+      rps20: r.rps20, rps60: r.rps60, rps120: r.rps120, rps250: r.rps250,
+    }))
   } catch (e) { console.error(e) }
 }
 
 async function loadSector() {
   try {
-    const d = await rpsApi.sector({ period: period.value, date: date.value || undefined })
-    sectorRows.value = d.rows || []
+    const isConcept = mode.value === 'concept'
+    const d = isConcept
+      ? await rpsApi.conceptRanking({ period: period.value, date: date.value || undefined })
+      : await rpsApi.sector({ period: period.value, date: date.value || undefined })
+    if (d.error) throw new Error(d.error)
+    // 概念接口列名是 concept
+    sectorRows.value = (d.rows || []).map((r) =>
+      isConcept ? { ...r, industry: r.concept } : r)
   } catch (e) { console.error(e) }
+}
+
+/** 证监会行业 / 概念题材切换。两套数据共用同一套渲染与排序逻辑。 */
+function setMode(m) {
+  if (mode.value === m) return
+  mode.value = m
+  loadHeatmap()
+  loadSector()
 }
 
 watch(date, () => { loadHeatmap(); loadSector() })
@@ -211,6 +248,9 @@ onMounted(() => {
   metaApi.dates(400)
     .then((ds) => { availableDates.value = ds || [] })
     .catch((e) => console.error('交易日历加载失败', e))
+  rpsApi.concepts()
+    .then((c) => { hasConcepts.value = (c || []).length > 0 })
+    .catch(() => { hasConcepts.value = false })
   if (route.query.date) date.value = String(route.query.date)
 })
 </script>

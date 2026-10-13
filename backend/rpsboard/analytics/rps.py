@@ -179,6 +179,62 @@ def compute_industry_rps(
     return long[[c for c in cols_order if c in long.columns]]
 
 
+def materialize_group_rps(
+    frames: dict[str, pd.DataFrame],
+    mapping: pd.Series,
+    leader_rps: pd.DataFrame | None = None,
+    names: pd.Series | None = None,
+    periods: tuple[int, ...] = config.PERIODS,
+) -> pd.DataFrame:
+    """按任意分组（行业 / 概念）计算板块 RPS —— 与 compute_industry_rps 同构。
+
+    概念板块 RPS 之所以能复用同一份实现，是因为它和行业 RPS 的算法完全一样，
+    只是「symbol → 分组」的映射表不同。上一轮把该函数向量化之后，
+    新增一种分组维度几乎零成本。
+    """
+    return compute_industry_rps(
+        frames, mapping, leader_rps=leader_rps, names=names, periods=periods
+    )
+
+
+def load_concept_map(conn) -> pd.Series:
+    """symbol → concept 的多对多映射展开成 symbol → 主分组。
+
+    一只股票属于多个概念时，取**第一个**作为它的主分组，
+    保证每个 symbol 只属于一个组——否则同一只票的涨幅会被重复计入多个概念，
+    概念 RPS 就失去可比性（成分数也会虚高）。
+    """
+    try:
+        df = pd.read_sql_query(
+            "SELECT symbol, concept FROM concept_map "
+            "ORDER BY concept, symbol", conn
+        )
+    except sqlite3.Error:
+        return pd.Series(dtype="object")
+    if df.empty:
+        return pd.Series(dtype="object")
+    return df.drop_duplicates("symbol").set_index("symbol")["concept"]
+
+
+def compute_concept_rps(
+    conn, frames: dict[str, pd.DataFrame], names: pd.Series | None = None,
+    periods: tuple[int, ...] = config.PERIODS,
+) -> pd.DataFrame:
+    """概念板块 RPS，复用行业 RPS 的向量化实现。"""
+    mapping = load_concept_map(conn)
+    if mapping.empty:
+        return pd.DataFrame()
+    leader = frames.get("rps60")
+    if leader is None:
+        leader = frames.get(f"rps{periods[0]}")
+    df = compute_industry_rps(
+        frames, mapping, leader_rps=leader, names=names, periods=periods
+    )
+    if df.empty:
+        return df
+    return df.rename(columns={"industry": "concept"})
+
+
 # ── 落库 ────────────────────────────────────────────────────────────
 def pending_dates(
     conn: sqlite3.Connection, table: str = "rps_daily"
