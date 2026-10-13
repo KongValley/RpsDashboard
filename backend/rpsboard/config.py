@@ -19,6 +19,18 @@ CACHE_DIR = DATA_DIR / "backtest_cache"
 PERIODS: tuple[int, ...] = (20, 60, 120, 250)
 DEFAULT_PERIOD = 60
 
+# ── 性能监测 ────────────────────────────────────────────────────────
+#: 运行日志目录（uvicorn 的 out/err 日志也写在这里）
+LOG_DIR = Path(os.environ.get("RPSBOARD_LOG_DIR", ROOT_DIR / "logs"))
+#: 每个请求追加一行 JSON。logs/ 已在 .gitignore，刻意不做轮转：
+#: 一行约 0.2 KB，个人盯盘的使用强度下一天也就几百 KB。
+PERF_LOG = Path(os.environ.get("RPSBOARD_PERF_LOG", LOG_DIR / "perf.jsonl"))
+#: 超过该毫秒数记为慢请求（ASGI 全程耗时，含响应体发送）
+PERF_SLOW_MS = float(os.environ.get("RPSBOARD_PERF_SLOW_MS", "300"))
+#: 内存环形缓冲条数：服务端请求与浏览器上报分开计
+PERF_RING_SERVER = int(os.environ.get("RPSBOARD_PERF_RING_SERVER", "1000"))
+PERF_RING_CLIENT = int(os.environ.get("RPSBOARD_PERF_RING_CLIENT", "500"))
+
 # ── 采集 ────────────────────────────────────────────────────────────
 #: **唯一数据源**：eltdx（通达信行情协议，TCP 直连）。
 #:
@@ -68,3 +80,4 @@ def exchange_of(symbol: str) -> str:
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)

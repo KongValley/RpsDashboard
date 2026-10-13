@@ -411,6 +411,31 @@ node backend\tests\verify_incremental.py                       # 验证增量==�
 > 400 万行再 pivot，和从缓存矩阵重算一样贵（36.1s vs 31.6s）。
 > 真正的收益来自**矩阵缓存 + 结果缓存**，已按实测结果调整。
 
+## 性能监测点
+
+上面的基线是**一次性手测**，会随行情与改动漂移。现在运行时自带监测：
+每个 HTTP 请求由纯 ASGI 中间件计时（`backend/rpsboard/api/perf.py`），
+进内存环形缓冲 + 追加一行 `logs/perf.jsonl`；前端在唯一网络出口
+（`frontend/src/api/index.js`）计时并批量上报，两端在同一个接口里对照。
+
+```powershell
+curl.exe -s http://127.0.0.1:8000/api/meta/perf      # 前后端耗时快照
+```
+
+响应里 `server.paths[].p50_ms / p95_ms` 是**最近 N 条请求**（默认 1000 条）的移动窗口值，
+不是全量累计；要跨重启的统计直接聚合 `logs/perf.jsonl`（每行一个 JSON）。
+中间件同时下发 `x-perf-ms` 响应头（服务端处理耗时），前端的
+`net_ms = ms - server_ms` 即网络 + 解析那一段。
+
+浏览器控制台：`window.__perf()` 看本页请求，`await window.__perf.server()` 看两端对照，
+`window.__perf.enable()` 后刷新即逐请求打点（默认静默，不在界面上暴露调试数字）。
+
+| 环境变量 | 默认 | 作用 |
+|---|---|---|
+| `RPSBOARD_PERF_SLOW_MS` | 300 | 超过该毫秒数记为慢请求 |
+| `RPSBOARD_PERF_LOG` | `logs/perf.jsonl` | 逐请求日志路径（不轮转） |
+| `RPSBOARD_PERF_RING_SERVER` / `_CLIENT` | 1000 / 500 | 内存窗口条数 |
+
 ## 未完成项
 
 - **P2**：交易日历只覆盖到 2024-10 起（daily_bar 回到 2023-02）；数据库 1329 MB，

@@ -12,6 +12,7 @@ import {
 
 import App from './App.vue'
 import './style.css'
+import { install as installPerf } from './perf'
 
 // heatmap 的着色依赖 VisualMapComponent，必须显式注册
 use([CanvasRenderer, LineChart, BarChart, HeatmapChart, ScatterChart,
@@ -39,4 +40,5 @@ const router = createRouter({
   routes,
 })
 
+installPerf()
 createApp(App).component('VChart', VChart).use(router).mount('#app')

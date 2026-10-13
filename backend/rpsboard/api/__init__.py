@@ -15,6 +15,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .. import config, db
+from . import perf
 
 _cache: dict[str, Any] = {"conn": None, "opened": None}
 
@@ -119,9 +120,13 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    # 放在 CORS 之后：Starlette 里后加者在外层，perf 要包住全部请求
+    app.add_middleware(perf.PerfMiddleware)
+
     from . import backtest as bt_api
     from . import meta, rps, stock
 
+    app.include_router(perf.router)
     app.include_router(meta.router)
     app.include_router(rps.router)
     app.include_router(stock.router)
