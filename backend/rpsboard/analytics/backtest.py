@@ -342,11 +342,17 @@ def run_backtest(
     # 不在同一基准，直接比会算出 4303 家假涨停）。
     lim_up = lim_dn = None
     if use_price_limits:
-        from .limits import limit_mask, load_ratio_frames
+        from .limits import coverage, limit_mask, load_ratio_frames
 
         dates = [d.strftime("%Y-%m-%d") for d in close_wide.index]
         ratios, statuses = load_ratio_frames(conn, dates, list(close_wide.columns))
         if not ratios.empty:
+            covered, total = coverage(conn, dates)
+            if covered < total:
+                result.warnings.append(
+                    f"涨跌停数据仅覆盖 {covered}/{total} 个交易日，"
+                    f"未覆盖的日子不筛涨停（覆盖不足只影响过滤精度，不影响价格与 RPS）"
+                )
             lim_up, lim_dn = limit_mask(close_wide, ratios, statuses)
             if exclude_limit_up:
                 mask &= ~lim_up.reindex(index=mask.index, columns=mask.columns) \
@@ -484,6 +490,13 @@ def run_backtest(
                 }
                 for d in bench_aligned.index
             ]
+    else:
+        # 基准取不到时（backfill 里基准指数抓取失败、或 benchmark 传错）原来
+        # 什么都不说，用户只看到基准线是空的
+        result.warnings.append(
+            f"基准指数（benchmark_bar.{benchmark_symbol}）无数据，"
+            f"回测的基准线与均线择时都不可用，请执行 cli backfill 重取"
+        )
 
     # ── 指标 ─────────────────────────────────────────────────────
     eq = pd.Series([c["equity"] for c in result.equity_curve], dtype="float64")

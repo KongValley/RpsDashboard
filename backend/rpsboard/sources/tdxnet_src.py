@@ -27,10 +27,14 @@ import numpy as np
 import pandas as pd
 
 from .. import config, db
+from .base import with_retry
 
 MAX_COUNT = 800          # 通达信协议单页上限
 CONNECT_POOL = 8
 CONNECT_TIMEOUT = 10
+
+#: 基准指数：eltdx 用的全代码 → 库内短代码
+BENCHMARKS = (("sh000300", "000300"), ("sh000001", "000001"), ("sz399001", "399001"))
 
 
 def to_full_code(symbol: str) -> str:
@@ -167,7 +171,11 @@ def backfill_bars(
 
         def one(sym: str):
             try:
-                return sym, src.hfq_bars(sym, count=count)
+                # 单只失败重试（config.MAX_RETRIES）：全市场 5000+ 只里偶发超时很常见，
+                # 一次失败就丢掉这只股票的整段历史代价太大
+                bars = with_retry(lambda: src.hfq_bars(sym, count=count),
+                                  max_retries=config.MAX_RETRIES)
+                return sym, bars
             except Exception:  # noqa: BLE001
                 return sym, pd.DataFrame()
 
@@ -189,8 +197,8 @@ def backfill_bars(
                           f"| {rate:.0f} 只/秒 | 预计剩余 {eta/60:.1f} 分钟", flush=True)
 
         # ── 指数 ──────────────────────────────────────────────────
-        for code, sym in (("sh000300", "000300"), ("sh000001", "000001"),
-                          ("sz399001", "399001")):
+        bench_failed: list[str] = []
+        for code, sym in BENCHMARKS:
             try:
                 idx = src.index_bars(code)
                 if not idx.empty:
@@ -200,8 +208,13 @@ def backfill_bars(
                         "benchmark_bar", conn, if_exists="append", index=False)
                     conn.commit()
                     print(f"[eltdx] 基准 {code} {len(idx)} 根")
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                # 原来这里是 pass：基准取不到时回测的基准线会整条空掉，而用户
+                # 只会以为「基准没画出来」，找不到原因
+                bench_failed.append(f"{sym}({exc})")
+        if bench_failed:
+            print(f"[eltdx] 基准指数抓取失败: {'; '.join(bench_failed)} "
+                  f"—— 回测的基准线会为空，可用 cli backfill 重试")
 
         if not frames:
             print("[eltdx] 未取到任何数据")

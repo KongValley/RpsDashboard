@@ -100,3 +100,32 @@ def test_deferred_not_counted_twice():
     remaining = pd.Index(names)[~bad.values]
     assert list(remaining) == ["B"]
     assert fwd.loc[idx[0], remaining].mean() == pytest.approx(0.1)
+
+
+def test_coverage_counts_covered_days(tmp_path):
+    """覆盖率只数「有数据的交易日」：部分覆盖必须能被算出来。
+
+    没有这个数字时，回测会把缺日静默当成「这些天不筛涨停」。
+    """
+    import sqlite3
+
+    from rpsboard import db as dbmod
+    from rpsboard.analytics.limits import coverage
+
+    conn = sqlite3.connect(str(tmp_path / "cov.db"))
+    conn.row_factory = sqlite3.Row
+    conn.executescript(dbmod.SCHEMA)
+    rows = [
+        ("2026-01-05", "600000", 10.0, "normal"),
+        ("2026-01-06", "600000", 10.0, "normal"),
+    ]
+    conn.executemany(
+        "INSERT INTO price_limit_daily(date, symbol, limit_ratio, status) VALUES (?,?,?,?)",
+        rows,
+    )
+    conn.commit()
+
+    dates = ["2026-01-05", "2026-01-06", "2026-01-07", "2026-01-08", "2026-01-09"]
+    assert coverage(conn, dates) == (2, 5)
+    assert coverage(conn, []) == (0, 0)
+    conn.close()

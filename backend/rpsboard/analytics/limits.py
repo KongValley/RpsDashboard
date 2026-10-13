@@ -96,6 +96,23 @@ def load_ratio_frames(
     )
 
 
+def coverage(conn: sqlite3.Connection, dates: list[str]) -> tuple[int, int]:
+    """回测区间内 price_limit_daily 有数据的交易日数 / 总交易日数。
+
+    没有这组数字时，部分覆盖会被静默当成「这些天不筛涨停」——
+    回测照跑、结论照给，用户无从知道过滤其实没生效。
+    """
+    if not dates:
+        return 0, 0
+    row = conn.execute(
+        "SELECT COUNT(DISTINCT date) AS c FROM price_limit_daily "
+        "WHERE date >= ? AND date <= ?",
+        (min(dates), max(dates)),
+    ).fetchone()
+    covered = int(row["c"]) if row and row["c"] is not None else 0
+    return covered, len(dates)
+
+
 def summarize(up: pd.DataFrame, dn: pd.DataFrame) -> dict:
     """统计区间内的涨停/跌停家数，用于回测告警与验证脚本。"""
     return {

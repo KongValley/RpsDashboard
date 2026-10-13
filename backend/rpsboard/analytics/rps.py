@@ -268,6 +268,30 @@ def pending_dates(
     ]
 
 
+def suspect_gaps(conn: sqlite3.Connection, min_symbols: int = 20) -> list[str]:
+    """疑似缺口：daily_bar 里当天股票数 ≥ min_symbols、日期**晚于** rps_daily 首日，
+    但 rps_daily 里一行都没有的交易日（升序）。
+
+    刻意不自动补：区间前那批日期（2023-02~05）本来是「前置 K 线不足、四个周期全
+    NaN」而被 dropna 掉的，永远补不出来（见 pending_dates 的说明）。这里只把
+    中间真正的空洞报出来，补齐仍走 `compute-rps --full`。
+    """
+    if not db.table_has_rows(conn, "rps_daily"):
+        return []
+    row = conn.execute("SELECT MIN(date) AS dmin FROM rps_daily").fetchone()
+    first = row["dmin"] if row and row["dmin"] else None
+    if not first:
+        return []
+    rows = conn.execute(
+        "SELECT d.date AS date, COUNT(*) AS n FROM daily_bar d "
+        "WHERE d.date > ? "
+        "  AND NOT EXISTS (SELECT 1 FROM rps_daily r WHERE r.date = d.date) "
+        "GROUP BY d.date HAVING n >= ? ORDER BY d.date",
+        (first, min_symbols),
+    ).fetchall()
+    return [r["date"] for r in rows]
+
+
 def window_start_for(
     conn: sqlite3.Connection, first_target: str, periods: tuple[int, ...] = config.PERIODS
 ) -> str:

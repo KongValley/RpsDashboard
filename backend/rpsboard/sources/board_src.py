@@ -37,13 +37,20 @@ def _is_concept(board_name: str) -> bool:
     return bool(n) and not n.startswith(NON_CONCEPT_PREFIX)
 
 
-def fetch_boards(src: TdxSource | None = None) -> pd.DataFrame:
-    """拉取全量板块清单。返回列：board_code / full_code / board_name / is_concept。"""
+def fetch_boards(src: TdxSource | None = None, category: str = "概念") -> pd.DataFrame:
+    """拉取板块清单。返回列：board_code / full_code / board_name / is_concept。
+
+    `category` 直接透传给 eltdx（概念 / 地区 / 风格 / 一级行业 / 二级行业 /
+    三级行业 / 880行业 / 全部）。`is_concept` 是按名字猜的启发式，只对概念分类
+    有意义，其它分类请忽略该列（行业采集只取 full_code / board_name）。
+    """
     own = src is None
     src = src or TdxSource()
     try:
-        table = src._client.helpers.board_quotes()  # noqa: SLF001
-        rows = list(getattr(table, "rows", None) or table or [])
+        table = src._client.helpers.board_quotes(category=category)  # noqa: SLF001
+        # 空选择时 rows 是空 tuple：原来写成 `rows or table` 会在空选择上
+        # 变成 list(BoardQuoteTable) → TypeError，把「这个分类没数据」伪装成崩溃
+        rows = list(getattr(table, "rows", ()) or ())
     finally:
         if own:
             src.close()

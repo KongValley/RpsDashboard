@@ -99,6 +99,11 @@ def cmd_compute_rps(args: argparse.Namespace) -> int:
             # 必须显式 --full 重算。
             pending = rps_engine.pending_dates(conn)
             force_full = bool(getattr(args, "full", False))
+            # 中间空洞（daily_bar 有、rps_daily 没有）增量永远补不上，先报出来
+            gaps = rps_engine.suspect_gaps(conn)
+            if gaps:
+                print(f"[rps] 疑似缺口 {len(gaps)} 天（最早 {gaps[0]}）：增量补不上，"
+                      f"若确认数据已补齐请加 --full 重算")
             if force_full or len(pending) > 200:      # 200 天以上基本等于没算过
                 mode, targets, start = "full", None, None
                 if pending and not force_full:
@@ -184,6 +189,27 @@ def cmd_price_limits(args: argparse.Namespace) -> int:
               f" | 已用 {done/60:.1f} 分钟 | 预计剩余 {eta/60:.1f} 分钟",
               flush=True)
     return 0
+
+
+# ── industry-map（行业分类）─────────────────────────────────────────
+def cmd_industry_map(args: argparse.Namespace) -> int:
+    """用 eltdx 的一级行业分类写入 industry_map。"""
+    from .sources import industry_src
+
+    db.init_db()
+    with db.session() as conn:
+        run_id = db.start_run(conn, task="industry-map", source=config.DATA_SOURCE)
+        try:
+            n_sym = industry_src.sync_industry_map(
+                replace=bool(getattr(args, "replace", False)),
+                from_csv=getattr(args, "from_csv", None),
+            )
+            db.finish_run(conn, run_id, "success", n_sym, f"覆盖 {n_sym} 只股票")
+            return 0
+        except Exception as exc:  # noqa: BLE001
+            db.finish_run(conn, run_id, "failed", 0, str(exc))
+            print(f"[industry] 采集失败: {exc}", file=sys.stderr)
+            return 2
 
 
 # ── concept（概念/题材板块）─────────────────────────────────────────
@@ -312,6 +338,20 @@ def cmd_status(_: argparse.Namespace) -> int:
         print(f"RPS         {rps_n} 行")
         print(f"板块RPS     {ind} 行")
         print(f"涨跌停      {lim} 行")
+        # 缺口与涨跌停覆盖都要能看见：两者都只会「静默地让回测/筛选失效」
+        gaps = rps_engine.suspect_gaps(conn)
+        if gaps:
+            print(f"RPS 缺口    {len(gaps)} 天，最早 {gaps[0]}"
+                  f"（中间空洞增量补不上，用 compute-rps --full 重算）")
+        else:
+            print("RPS 缺口    无")
+        lim_rows = conn.execute(
+            "SELECT MIN(date) AS lo, MAX(date) AS hi FROM price_limit_daily"
+        ).fetchone()
+        if lim_rows and lim_rows["lo"]:
+            print(f"涨跌停覆盖  {lim_rows['lo']} ~ {lim_rows['hi']}")
+        else:
+            print("涨跌停覆盖  无（回测不会剔除涨停，可 cli price-limits --days N 回补）")
     finally:
         conn.close()
     return 0
@@ -368,6 +408,18 @@ def run_update_pipeline(progress=None) -> dict:
     say("limits")
     from .sources import limit_src
     n_lim = limit_src.sync_price_limits()
+
+    # 行业分类只补空表：作者机器上已有证监会口径的数据不能被悄悄换掉
+    with db.session() as conn:
+        has_industry = db.table_has_rows(conn, "industry_map")
+    if has_industry:
+        print("[industry] industry_map 已有数据，跳过（要换口径用 cli industry-map --replace）")
+    else:
+        say("industry")
+        rc = cmd_industry_map(_ns())
+        if rc != 0:
+            raise RuntimeError(f"行业分类采集失败（退出码 {rc}）")
+
     say("rps")
     rc = cmd_compute_rps(_ns())
     if rc != 0:
@@ -417,6 +469,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("update", help="完整更新：日K + 涨跌停 + RPS").set_defaults(
         func=lambda _ns: (run_update_pipeline(), 0)[1]
     )
+
+    sp = sub.add_parser("industry-map", help="写入 industry_map（eltdx 行业分类或自带 CSV）")
+    sp.add_argument("--replace", action="store_true",
+                    help="整表重建（默认已有数据则跳过，避免覆盖已有口径）")
+    sp.add_argument("--from-csv", dest="from_csv", default=None,
+                    help="从 CSV 导入（列：symbol,industry[,industry_cls]）")
+    sp.set_defaults(func=cmd_industry_map)
 
     sp = sub.add_parser("price-limits", help="采集涨跌停价")
     sp.add_argument("--days", type=int, default=0,

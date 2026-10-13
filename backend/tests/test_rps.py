@@ -201,3 +201,32 @@ def test_empty_input_returns_empty():
     close = build_close_matrix(empty)
     assert close.empty
     assert rps.compute_rps_frames(close) == {}
+
+
+def test_suspect_gaps_finds_interior_hole():
+    """中间空洞（daily_bar 有、rps_daily 没有）必须被报出来。
+
+    区间前那批「前置 K 线不足」的日期不算缺口，所以判据要从 rps_daily 首日之后算。
+    """
+    import sqlite3
+
+    from rpsboard import db as dbmod
+
+    df = make_long(n_symbols=30, n_days=280, seed=7)
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(dbmod.SCHEMA)
+    df[["symbol", "date", "close", "pct_chg", "tradestatus", "is_st"]].to_sql(
+        "daily_bar", conn, if_exists="append", index=False)
+
+    dates = sorted(df["date"].unique())
+    covered, hole = dates[20], dates[40]
+    conn.executemany(
+        "INSERT INTO rps_daily(date, symbol, rps60) VALUES (?,?,?)",
+        [(d, "000001", 50.0) for d in dates[20:] if d != hole],
+    )
+    conn.commit()
+
+    gaps = rps.suspect_gaps(conn)
+    assert gaps == [hole], f"应只报中间那一天，实际 {gaps[:5]}"
+    conn.close()

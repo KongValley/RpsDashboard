@@ -230,6 +230,21 @@ def test_backtest_param_clamping(seeded):
     assert body["params"]["hold"] == 250
 
 
+def test_backtest_warns_on_missing_benchmark_and_limits(seeded):
+    """基准与涨跌停缺失都必须在 warnings 里说出来。
+
+    合成库既没有 benchmark_bar 也没有 price_limit_daily：
+    - 基准缺失原来会静默产出空基准线（用户只看到「基准没画出来」）
+    - 涨跌停缺失原来只在一行为都没有时才提，部分覆盖则完全沉默
+    """
+    client, *_ = seeded
+    body = client.get("/api/backtest/run",
+                      params={"period": 20, "threshold": 80, "hold": 20}).json()
+    text = " ".join(body["warnings"])
+    assert "基准指数" in text
+    assert "price_limit_daily" in text or "涨跌停数据仅覆盖" in text
+
+
 def test_admin_update_rejects_unknown(seeded):
     """只允许触发 update 这一个白名单任务，不接受任意命令执行。"""
     client, *_ = seeded

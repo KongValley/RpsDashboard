@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, Query
 
 from .. import config, db
 from . import latest_bar_date, read_sql
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/meta", tags=["meta"])
 
@@ -23,15 +27,17 @@ def status() -> dict:
 
         # 没有行业分类的股票：这些票会被排除在板块 RPS 之外，个股页显示「未分类」。
         # 实测 5580 只里有 356 只没有映射，是个值得摆在台面上的缺口而不是沉默。
-        unmapped = 0
+        # 统计失败时返回 None（不是 0）：谎报「0 只无分类」会让前端的缺口提示消失。
+        unmapped: int | None = 0
         try:
             row = conn.execute(
                 "SELECT COUNT(*) AS c FROM security_master m "
                 "WHERE NOT EXISTS (SELECT 1 FROM industry_map i WHERE i.symbol = m.symbol)"
             ).fetchone()
             unmapped = int(row["c"]) if row else 0
-        except Exception:  # noqa: BLE001
-            unmapped = 0
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("统计无行业分类的股票失败: %s", exc)
+            unmapped = None
 
         last = db.last_log(conn)
         return {
