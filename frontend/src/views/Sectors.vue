@@ -31,6 +31,7 @@
           >{{ p }}日</button>
         </div>
       </div>
+      <div v-if="errMsg" class="warnbar soft inset">{{ errMsg }}</div>
       <VChart class="chart" :style="{ height: chartHeight + 'px' }" :option="heatmapOption" autoresize />
     </div>
 
@@ -95,6 +96,8 @@ const date = ref('')
 const availableDates = ref([])
 const matrixData = ref([])
 const sectorRows = ref([])
+/** 接口错误提示：失败时不能只是图表空白（用户会以为「没数据」） */
+const errMsg = ref('')
 
 async function loadHeatmap() {
   try {
@@ -109,7 +112,10 @@ async function loadHeatmap() {
       industry: isConcept ? r.concept : r.industry,
       rps20: r.rps20, rps60: r.rps60, rps120: r.rps120, rps250: r.rps250,
     }))
-  } catch (e) { console.error(e) }
+  } catch (e) {
+    console.error(e)
+    errMsg.value = `热力图加载失败：${e?.message || e}`
+  }
 }
 
 async function loadSector() {
@@ -122,18 +128,28 @@ async function loadSector() {
     // 概念接口列名是 concept
     sectorRows.value = (d.rows || []).map((r) =>
       isConcept ? { ...r, industry: r.concept } : r)
-  } catch (e) { console.error(e) }
+  } catch (e) {
+    console.error(e)
+    errMsg.value = `板块排行加载失败：${e?.message || e}`
+  }
 }
 
 /** 证监会行业 / 概念题材切换。两套数据共用同一套渲染与排序逻辑。 */
 function setMode(m) {
   if (mode.value === m) return
   mode.value = m
+  reloadAll()
+}
+
+/** 一次加载批次开始时清错误提示：不放在各 loader 的成功分支里，
+ *  否则 A 失败、B 成功会把 A 的失败消息抹掉。 */
+function reloadAll() {
+  errMsg.value = ''
   loadHeatmap()
   loadSector()
 }
 
-watch(date, () => { loadHeatmap(); loadSector() })
+watch(date, reloadAll)
 
 /** 去掉证监会行业分类代码前缀，让行业名在轴上放得下 */
 function shortName(s) {
@@ -256,13 +272,21 @@ function goIndustry(name) {
 }
 
 onMounted(() => {
-  loadHeatmap(); loadSector()
-  metaApi.dates(400)
+  reloadAll()
+  metaApi.dates()
     .then((ds) => { availableDates.value = ds || [] })
-    .catch((e) => console.error('交易日历加载失败', e))
+    .catch((e) => {
+      console.error('交易日历加载失败', e)
+      errMsg.value = `交易日历加载失败：${e?.message || e}`
+    })
   rpsApi.concepts()
     .then((c) => { hasConcepts.value = (c || []).length > 0 })
-    .catch(() => { hasConcepts.value = false })
+    .catch((e) => {
+      // 静默禁用「概念题材」按钮会让人以为本来就没有概念数据
+      console.error('概念清单加载失败', e)
+      hasConcepts.value = false
+      errMsg.value = `概念清单加载失败：${e?.message || e}`
+    })
   if (route.query.date) date.value = String(route.query.date)
 })
 </script>

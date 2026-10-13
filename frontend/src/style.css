@@ -146,3 +146,22 @@ table.rps-table tbody tr { cursor: pointer; }
 .gap-2 { gap: 8px; }
 .gap-3 { gap: 12px; }
 .muted { color: var(--text-dim); }
+
+/* 告警条。放在全局样式里：顶栏（App.vue）与各视图（Sectors 等）都要用，
+   写在某个组件的 scoped 样式里其它组件拿不到。 */
+.warnbar {
+  background: rgba(240, 160, 32, .12); color: var(--warn);
+  border-bottom: 1px solid rgba(240, 160, 32, .3);
+  padding: 7px 20px; font-size: 12px; flex-shrink: 0;
+}
+/* 数据缺口提示：不是故障，用中性色，别跟真正的采集告警混淆 */
+.warnbar.soft {
+  background: rgba(120, 132, 150, .12); color: var(--text-dim);
+  border-bottom-color: rgba(120, 132, 150, .3);
+}
+/* 面板内用法（不是整条通栏）：四边描边 + 圆角 */
+.warnbar.inset {
+  border: 1px solid rgba(120, 132, 150, .3);
+  border-radius: 6px;
+  margin-bottom: 12px;
+}

@@ -1,13 +1,14 @@
 import { createApp } from 'vue'
 import { createRouter, createWebHistory } from 'vue-router'
 import VChart from 'vue-echarts'
-import * as echarts from 'echarts'
-import { use } from 'echarts/core'
+// 必须按需引入：整包 `import * as echarts from 'echarts'` 会让 tree-shaking 失效
+// （实测主 chunk 1120 KB）。这里只注册实际用到的图表与组件。
+import { use, registerTheme } from 'echarts/core'
 import { CanvasRenderer } from 'echarts/renderers'
-import { LineChart, BarChart, HeatmapChart, ScatterChart } from 'echarts/charts'
+import { LineChart, BarChart, HeatmapChart } from 'echarts/charts'
 import {
-  GridComponent, TooltipComponent, LegendComponent, DataZoomComponent,
-  TitleComponent, MarkLineComponent, MarkAreaComponent, VisualMapComponent,
+  GridComponent, TooltipComponent, LegendComponent,
+  MarkLineComponent, MarkAreaComponent, VisualMapComponent,
 } from 'echarts/components'
 
 import App from './App.vue'
@@ -16,11 +17,11 @@ import { install as installPerf } from './perf'
 
 // heatmap 的着色依赖 VisualMapComponent，必须显式注册；
 // Backtest 的空仓区间底色依赖 MarkAreaComponent（漏注册时不会报错，只是不渲染）
-use([CanvasRenderer, LineChart, BarChart, HeatmapChart, ScatterChart,
-  GridComponent, TooltipComponent, LegendComponent, DataZoomComponent,
-  TitleComponent, MarkLineComponent, MarkAreaComponent, VisualMapComponent])
+use([CanvasRenderer, LineChart, BarChart, HeatmapChart,
+  GridComponent, TooltipComponent, LegendComponent,
+  MarkLineComponent, MarkAreaComponent, VisualMapComponent])
 
-echarts.registerTheme('dark', {
+registerTheme('dark', {
   backgroundColor: 'transparent',
   textStyle: { color: '#e6edf3' },
 })

@@ -34,6 +34,8 @@
         </div>
       </div>
 
+      <div v-if="errMsg" class="warnbar soft inset">{{ errMsg }}</div>
+
       <div v-if="pattern && pattern.current" class="panel pat-now">
         <div class="flex items-center gap-3">
           <span class="badge pat big">三升底成立</span>
@@ -149,6 +151,8 @@ const curve = ref({ dates: [], close: [], rps20: [], rps60: [], rps120: [], rps2
 const pattern = ref(null)
 const days = ref(250)
 const dataDate = ref(null)
+/** 接口错误提示：失败不能再伪装成「形态数据尚未计算」 */
+const errMsg = ref('')
 
 async function loadDetail() {
   try {
@@ -158,21 +162,31 @@ async function loadDetail() {
     pct.value = d.market_percentile || {}
     industryRps.value = d.industry_rps
     dataDate.value = cur.value?.date
-  } catch (e) { alert(e.message) }
+  } catch (e) {
+    console.error(e)
+    errMsg.value = `个股信息加载失败：${e?.message || e}`
+  }
 }
 
 async function loadCurve() {
   try {
     curve.value = await stockApi.curve(symbol.value, days.value)
-  } catch (e) { console.error(e) }
+  } catch (e) {
+    console.error(e)
+    errMsg.value = `曲线加载失败：${e?.message || e}`
+  }
 }
 
 async function loadPatterns() {
   try {
     pattern.value = await stockApi.patterns(symbol.value, days.value)
   } catch (e) {
+    // 网络/500 是「加载失败」，与后端明确告知的「形态还没算」是两回事：
+    // 以前这里把两者都写成 pattern_missing ，用户看到「形态数据尚未计算」会去重算，
+    // 但真正的原因是接口挂了。
     console.error(e)
-    pattern.value = { patterns: [], current: null, pattern_missing: true }
+    errMsg.value = `形态加载失败：${e?.message || e}`
+    pattern.value = { patterns: [], current: null, pattern_missing: false }
   }
 }
 
@@ -262,6 +276,9 @@ function rpsColor(v) {
 }
 
 function reloadAll() {
+  // 错误提示按「一次加载批次」清理：不放在各 loader 的成功分支里，
+  // 否则 A 失败、B 成功会把 A 的失败消息抹掉。
+  errMsg.value = ''
   loadDetail(); loadCurve(); loadPatterns()
 }
 watch(symbol, reloadAll)

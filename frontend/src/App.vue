@@ -222,16 +222,7 @@ onUnmounted(() => {
 .dot.warn { background: var(--warn); }
 .dot.bad { background: var(--up); }
 
-.warnbar {
-  background: rgba(240, 160, 32, .12); color: var(--warn);
-  border-bottom: 1px solid rgba(240, 160, 32, .3);
-  padding: 7px 20px; font-size: 12px; flex-shrink: 0;
-}
-/* 数据缺口提示：不是故障，用中性色，别跟真正的采集告警混淆 */
-.warnbar.soft {
-  background: rgba(120, 132, 150, .12); color: var(--text-dim);
-  border-bottom-color: rgba(120, 132, 150, .3);
-}
+/* .warnbar / .warnbar.soft 已移到 src/style.css（Sectors 等视图也要用） */
 
 .content { flex: 1; overflow: auto; padding: 18px 20px; }
 

@@ -18,7 +18,7 @@
 
         <div class="group">
           <label>RPS ≥ <b class="mono">{{ rpsMin }}</b></label>
-          <input type="range" min="0" max="99" step="1" v-model.number="rpsMin" />
+          <input type="range" min="0" max="100" step="1" v-model.number="rpsMin" />
           <button class="btn" @click="rpsMin = 80">80</button>
           <button class="btn" @click="rpsMin = 90">90</button>
         </div>
@@ -221,7 +221,8 @@ watch(sanxingdi, () => { page.value = 1; load() })
 //   一旦元数据请求挂起，整个排行榜就永远停在「加载中」。）
 onMounted(() => {
   load()
-  Promise.all([metaApi.periods(), metaApi.industries(), metaApi.dates(400)])
+  // 不传 limit：后端默认 2000，覆盖全部 rps 历史（此前写死 400 会把日期下拉截断）
+  Promise.all([metaApi.periods(), metaApi.industries(), metaApi.dates()])
     .then(([ps, inds, dates]) => {
       periods.value = ps
       industries.value = inds
