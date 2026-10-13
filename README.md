@@ -19,9 +19,9 @@ RPS 把全市场个股按区间涨幅做**横截面百分位排名**：RPS=90 �
 
 ## 技术栈
 
-- **后端**：Python 3.12 · FastAPI · pandas · SQLite
+- **后端**：Python 3.12 · FastAPI · pandas · SQLite · eltdx（通达信行情协议，唯一数据源）
 - **前端**：Vue 3 · Vite · ECharts · vue-router
-- **数据源**：eltdx（通达信行情协议，TCP 直连，全市场 209 秒）+ 备选 baostock / 腾讯
+- **数据源**：eltdx（通达信行情协议，TCP 直连，全市场 209 秒）——其余候选源已评估后删除
 
 ## 快速开始
 
@@ -74,6 +74,23 @@ npm run dev
 - 前端：http://localhost:5173
 - 接口文档：http://localhost:8000/docs
 
+#### 非 Windows（Linux / macOS）
+
+命令相同，只是解释器路径与脚本后缀不同：
+
+```bash
+# 终端 1：后端
+.venv/bin/python -m uvicorn rpsboard.api:app --app-dir backend --port 8000
+
+# 终端 2：前端
+cd frontend && npm install && npm run dev
+```
+
+或 `./start.sh`（一键启动）、`./update.sh`（一键更新数据）。
+
+> 想让后端单端口托管前端（不必再起 vite dev）：`cd frontend && npm run build`，
+> 之后只开后端，直接访问 http://127.0.0.1:8000/ 即可。
+
 ## RPS 计算口径
 
 ```
@@ -81,7 +98,7 @@ ret_N(t) = close(t) / close(t - N) - 1
 rps_N(t) = ret_N 在 t 日全部有效股票中的百分位排名 × 100     # 榜首 = 100
 ```
 
-- **后复权价**计算（`adjustflag="1"`），规避除权除息造成的假跌幅
+- **后复权价**计算（eltdx `bars.get(..., adjust="hfq")`），规避除权除息造成的假跌幅
 - 周期：20 / 60 / 120 / 250 日（250 日即欧奈尔原定义的 52 周）
 - **新股自动排除**：上市不足 N 日 → `shift(N)` 为 NaN → RPS 为 NaN
 - **停牌不参与排名**，价格用前值填充
@@ -99,14 +116,24 @@ RPS 只使用 ≤ t 的收盘价，由 `shift(N)` 的结构保证。测试用**�
 
 ## 重要限制
 
+- **采集需要联网**：唯一数据源 eltdx 走通达信行情协议 TCP 直连（不走网页接口），
+  离线时只能看已有数据。
+- **首次初始化较慢**：`cli backfill` 拉全市场约 5200 只 × 800 根日 K，实测约 12~20 分钟；
+  之后日常 `update` 是增量，约 4~5 分钟。
+- **本机单人工具、无鉴权**：接口不校验身份，默认只监听 `127.0.0.1`，**不要暴露到公网**。
+- **一键脚本分平台**：Windows 用 `start.bat` / `update.bat`，Linux / macOS 用
+  `./start.sh` / `./update.sh`。
+
 ## 数据源
 
 ### 唯一数据源：eltdx（通达信行情协议）—— TCP 直连，不走网页
 
 ```bash
-uv pip install eltdx          # 已装 3.2.3
 .venv\Scripts\python.exe -m rpsboard.cli update     # 日K + 涨跌停 + RPS
 ```
+
+> eltdx 已声明在依赖里（`eltdx>=3.2.3`，见 `pyproject.toml`），
+> `uv pip install -e ".[dev]"` 会一起装上，无需单独安装。
 
 2026-10-12 实测曾评估五个源，最终**只保留 eltdx**：
 
@@ -141,24 +168,24 @@ uv pip install eltdx          # 已装 3.2.3
 | 板块成分股 | `board_member_quotes(code)` | 3.7 秒 / 板块 |
 
 
-数据源可通过环境变量切换：`RPSBOARD_SOURCE=tdxnet|baostock|tencent`
+数据源在 `backend/rpsboard/config.py` 的 `DATA_SOURCE` 指定；当前唯一实现是 eltdx
+（其余适配器已删除，可从 git 历史取回）。
 
 ### 各源实测对比（本机，2026-10）
 
 | 方案 | 全市场耗时 | 复权 | 数据新鲜度 | 状态 |
 |---|---|---|---|---|
 | **eltdx（通达信协议）** | **209 秒** | ✅ 后复权 | 2026-10-12 ✅ | 主源 |
-| 腾讯财经日 K | ~2 分钟 | ✅ 后复权 | 2026-10-12 | 备选，**高并发触发 WAF 封禁** |
-| baostock | ~70 分钟 | ✅ 后复权 | 2026-10-09 | 备选，**多进程并发登录会返回 10001001「用户未登录」** |
-| 本地通达信 `D:\tdx` `.day` | 22 秒 | ❌ 不复权 | 2026-09-04 ⚠️ | 仅用于补成交额 |
-| akshare / 东方财富 | — | — | — | ❌ **网络阻断**（ProxyError / RemoteDisconnected） |
+| 腾讯财经日 K | ~2 分钟 | ✅ 后复权 | 2026-10-12 | 已删除：**高并发触发 WAF 封禁** |
+| baostock | ~70 分钟 | ✅ 后复权 | 2026-10-09 | 已删除：**多进程并发登录返回 10001001「用户未登录」** |
+| 本地通达信（`RPSBOARD_TDX_DIR`，默认 `D:\tdx`）`.day` | 22 秒 | ❌ 不复权 | 2026-09-04 ⚠️ | 仅用于补成交额 |
+| akshare / 东方财富 | — | — | — | 已删除：本机 **网络阻断**（ProxyError / RemoteDisconnected） |
 
 ### 成交额从哪来
 
 eltdx 的日 K 自带成交额（`amount`），无需额外处理。
-腾讯源不提供时，才用**本地通达信 `.day` 文件**补全（`tdx_local_src.fill_amount`，
-22 秒扫完 9639 只）。注意本地数据滞后约一个月，补全逻辑只 UPDATE `amount`，
-**绝不写价格**。
+（早期版本曾用**本地通达信 `.day` 文件**给不提供成交额的源补全，那条路径随
+`tdx_local_src` 适配器一起删除了，可从 git 历史取回。）
 
 ### 数据规模（本机实测）
 
@@ -334,6 +361,19 @@ RPS        4,009,287 行（20/60/120/250 四周期）
 
 全部测试离线运行，使用合成数据，不触网。
 
+### 开发脚本
+
+`backend/tests/` 下除 `test_*.py`（pytest 收集）外，还有一批**一次性调研与诊断脚本**
+（`probe_*` / `debug_*` / `diag_*` / `verify_*` / `bench_api.py` / `inspect_*.mjs`），
+保留下来是为了让当时的结论可复现。约定：
+
+- 必须**从仓库根目录**运行（脚本里 `sys.path.insert(0, "backend")`，相对路径也按根解析）。
+- 依赖装在 optional extra 里：`uv pip install -e ".[dev,probe]"`（`requests` / `akshare` / `baostock`）。
+- 多数需要联网；`verify_*` 还需要已 `backfill` 过的库；`verify_api.py` / `verify_sector_sort.py` /
+  `bench_api.py` / `build_sort_check.mjs` 需要后端已在 8000 端口运行。
+- 读本机通达信安装目录的脚本用 `RPSBOARD_TDX_DIR`（默认 `D:\tdx`）指定，例如
+  `set RPSBOARD_TDX_DIR=E:\new_tdx && .venv\Scripts\python.exe backend\tests\probe_tdx.py`。
+
 ## 热力图分周期独立排序 · 验证页
 
 板块强弱页的热力图**行按当前选中周期独立排序**，四个周期各维护一套强弱次序
@@ -345,6 +385,7 @@ node backend/tests/build_sort_check.mjs
 
 产物在 `docs/sector-sort-rps{20,60,120,250}.html`（echarts 已内联，双击即可打开），
 脚本同时会断言四个周期确实给出**四种不同排序**，否则直接退出码 1。
+这几个 HTML 每个约 1 MB 且会随行情过期，已加进 `.gitignore`（不入库，随时可重新生成）。
 
 2026-10-12 实测：83 个证监会行业，RPS20 与 RPS250 的名次几乎不相关
 （Spearman ≈ 0.05）。典型例子——`科技推广和应用服务业` RPS20 排第 3 但 RPS250 只有 17；
@@ -374,7 +415,7 @@ node backend/tests/build_sort_check.mjs
 ```powershell
 .venv\Scripts\python.exe -m rpsboard.cli compute-rps          # 默认增量
 .venv\Scripts\python.exe -m rpsboard.cli compute-rps --full    # 历史被订正时全量重算
-node backend\tests\verify_incremental.py                       # 验证增量==全量
+.venv\Scripts\python.exe -m backend.tests.verify_incremental    # 验证增量==全量（合成数据，离线）
 ```
 
 > 增量路径只补「晚于最后一个已算出的交易日」的日子。某个日期算不出任何行时
@@ -419,7 +460,7 @@ node backend\tests\verify_incremental.py                       # 验证增量==�
 （`frontend/src/api/index.js`）计时并批量上报，两端在同一个接口里对照。
 
 ```powershell
-curl.exe -s http://127.0.0.1:8000/api/meta/perf      # 前后端耗时快照
+curl -s http://127.0.0.1:8000/api/meta/perf      # 前后端耗时快照
 ```
 
 响应里 `server.paths[].p50_ms / p95_ms` 是**最近 N 条请求**（默认 1000 条）的移动窗口值，
@@ -450,19 +491,24 @@ curl.exe -s http://127.0.0.1:8000/api/meta/perf      # 前后端耗时快照
 backend/rpsboard/
   config.py              周期、路径、数据源选择、涨跌停阈值、交易所判定
   db.py                  SQLite schema 与幂等写入
-  cli.py                 init / backfill / sync / spot / compute-rps / backtest
+  cli.py                 init / status / backfill(=sync) / update / price-limits
+                         / concept / patterns / compute-rps / backtest
   sources/
-    tdxnet_src.py        【主源】eltdx 通达信协议，TCP 直连，209 秒全市场
-    baostock_src.py      备选：分块短生命周期子进程（非线程安全 + 会话退化）
-    tencent_src.py       备选：腾讯日K（高并发会触发 WAF，workers 须 <=3）
-    tdx_local_src.py     本地通达信 .day 二进制解析（补成交额，22 秒）
-    akshare_src.py       当日快照（限速、永不抛异常、可降级）
+    tdxnet_src.py        【唯一数据源】eltdx 通达信协议，TCP 直连，209 秒全市场
+    board_src.py         概念/题材板块清单与成分股
+    limit_src.py         涨跌停价（eltdx daily_price_limits）
+    base.py              SourceError 等公共定义
   analytics/
     matrix.py            daily_bar → 日期×股票 宽矩阵
     rps.py               RPS 引擎 + 板块 RPS
     backtest.py          横截面动量回测
-  api/                   FastAPI 路由（只读 SQLite，不联网）
+    costs.py             交易成本模型
+    limits.py            涨跌停规则
+    patterns.py          三升底等形态
+  api/                   FastAPI 路由（只读 SQLite，不联网）+ perf.py 性能监测
 frontend/src/views/      Rankings / Sectors / StockDetail / Backtest
+start.bat / update.bat   Windows 一键启动 / 更新
+start.sh  / update.sh    Linux / macOS 一键启动 / 更新
 ```
 
 ## 许可证
