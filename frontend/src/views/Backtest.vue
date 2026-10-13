@@ -29,7 +29,13 @@
         </div>
         <div class="group">
           <label class="chk"><input type="checkbox" v-model="excludeSt" @change="run" /> 剔除ST</label>
-          <label class="chk"><input type="checkbox" v-model="excludeLimitUp" @change="run" /> 剔除涨停（买不进）</label>
+          <label class="chk" :title="'涨停买不进。用 eltdx 的真实 limit_ratio 判定：' +
+            '注意必须比收益率而非价格——库内存的是后复权价，涨停价基于不复权价。'">
+            <input type="checkbox" v-model="excludeLimitUp" @change="run" /> 剔除涨停（买不进）
+          </label>
+          <label class="chk" :title="'佣金/印花税/过户费/滑点。分档前瞻收益不受此项影响。'">
+            <input type="checkbox" v-model="useCost" @change="run" /> 计入交易成本
+          </label>
           <label class="chk"><input type="checkbox" v-model="resonance" @change="run" /> 多周期共振</label>
         </div>
         <div class="spacer" />
@@ -78,6 +84,16 @@
           策略：每 {{ result.params.rebalance }} 个交易日调仓，持有当日 RPS{{ result.params.period }} ≥
           {{ result.params.threshold }} 的股票，等权持仓。
           <span v-if="result.params.resonance">（已开启多周期共振，要求 20/60/120 日同时达标）</span>
+          <span v-if="result.params.cost && result.params.cost.enabled">
+            <br />已计入交易成本：单次调仓往返约
+            {{ (result.params.cost.round_trip_after * 100).toFixed(3) }}%
+            （佣金含 {{ result.params.cost.commission_min }} 元起收、
+            印花税 {{ (result.params.cost.stamp_after * 100).toFixed(2) }}%、
+            滑点 {{ (result.params.cost.slippage_rate * 100).toFixed(2) }}%，
+            按 {{ (result.params.cost.portfolio_notional / 10000).toFixed(0) }} 万本金 /
+            假设 {{ result.params.cost.assume_positions }} 只测算）
+          </span>
+          <span v-else><br /><b>未计入交易成本</b>，净值偏乐观。</span>
         </div>
       </div>
 
@@ -86,6 +102,9 @@
         <p class="muted note" style="margin-top:0">
           按信号日 RPS 把全市场股票分档，统计各档在接下来 {{ result.params.hold }}
           个交易日内的平均收益与上涨概率。样本量在百万级，可直接看出是否存在单调关系。
+          <span v-if="result.buckets_note" style="display:block;margin-top:4px">
+            ⚠ {{ result.buckets_note }}
+          </span>
         </p>
         <div class="finding" :class="findingClass">
           <div class="finding-title">{{ findingTitle }}</div>
@@ -130,6 +149,8 @@ const hold = ref(20)
 const excludeSt = ref(true)
 const excludeLimitUp = ref(true)
 const resonance = ref(false)
+/** 是否计入交易成本。默认开启——零摩擦回测会系统性高估可执行结果。 */
+const useCost = ref(true)
 const loading = ref(false)
 const result = ref(null)
 const warnings = ref([])
@@ -154,6 +175,7 @@ async function run() {
       period: period.value, threshold: threshold.value, hold: hold.value,
       exclude_st: excludeSt.value, exclude_limit_up: excludeLimitUp.value,
       resonance: resonance.value, market_filter: marketFilter.value,
+      use_cost: useCost.value,
     })
     result.value = d
     warnings.value = d.warnings || []

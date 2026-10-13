@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import threading
+import time
+
 from fastapi import APIRouter, Body
 from pydantic import BaseModel
 
 from .. import config, db
 from ..analytics import backtest as engine
+from ..analytics.costs import default_cost_model as engine_cost_model
+from ..cli import run_update_pipeline as cli_run_update_pipeline
+from . import latest_bar_date
 
 router = APIRouter(prefix="/api", tags=["backtest"])
 
@@ -33,11 +39,13 @@ def run(
     exclude_limit_up: bool = True,
     benchmark: str = "000300",
     market_filter: str = "none",
+    use_cost: bool = True,
+    use_price_limits: bool = True,
     lookback_days: int | None = None,
 ) -> dict:
     """执行 RPS 策略回测。
 
-    计算量在秒级，同参数请求走进程内缓存直接返回；返回值中始终携带幸存者偏差警示。
+    同参数请求走进程内缓存直接返回；返回值中始终携带幸存者偏差警示。
     """
     if period not in config.PERIODS:
         period = config.DEFAULT_PERIOD
@@ -48,7 +56,8 @@ def run(
 
     key = (
         period, round(threshold, 4), hold, rebalance, resonance,
-        exclude_st, exclude_limit_up, benchmark, market_filter, lookback_days,
+        exclude_st, exclude_limit_up, benchmark, market_filter,
+        use_cost, use_price_limits, lookback_days,
     )
 
     conn = db.connect()
@@ -69,6 +78,8 @@ def run(
             exclude_limit_up=exclude_limit_up,
             benchmark_symbol=benchmark,
             market_filter=market_filter,
+            use_price_limits=use_price_limits,
+            cost_model=engine_cost_model(use_cost),
             lookback_days=lookback_days,
         )
         payload = {
@@ -77,6 +88,7 @@ def run(
             "market_curve": res.market_curve,
             "metrics": res.metrics,
             "buckets": res.buckets,
+            "buckets_note": res.buckets_note,
             "params": res.params,
             "warnings": res.warnings,
             "cached": False,
@@ -90,20 +102,77 @@ def run(
 
 
 class CollectRequest(BaseModel):
-    task: str
+    task: str = "update"
 
 
-@router.post("/admin/collect")
-def collect(req: CollectRequest = Body(...)) -> dict:
-    """手动触发采集任务（离线执行，接口只负责派发与返回状态）。
+# ── 一键更新（后台线程 + 状态轮询）─────────────────────────────────
+# 早期实现是**同步**跑完整流程：eltdx 拉全市场日K 约 209 秒 + RPS 增量 10 秒。
+# 同步 HTTP 必然超时，而且 run_task 跑在请求线程里会阻塞整个服务。
+_update_lock = threading.Lock()
+_update_state: dict = {"running": False, "phase": None, "run_id": None,
+                      "error": None, "started_at": None, "finished_at": None}
 
-    **注意**：这是本地单人使用的看板，不做鉴权，因此只允许触发**只读/幂等**
-    的数据同步，不接受任意命令执行。
+
+def _run_update_bg() -> None:
+    """后台线程体。异常必须自己吞掉并写状态，否则前端会永远轮询到 running。"""
+    t0 = time.time()
+    try:
+        def progress(phase: str) -> None:
+            _update_state["phase"] = phase
+        with db.session() as conn:
+            run_id = db.start_run(conn, task="update", source="internal")
+            _update_state["run_id"] = run_id
+        res = cli_run_update_pipeline(progress)
+        _update_state.update(phase="done", error=None,
+                             result=res, elapsed=round(time.time() - t0, 1))
+    except Exception as exc:  # noqa: BLE001
+        _update_state.update(phase="failed", error=str(exc),
+                             elapsed=round(time.time() - t0, 1))
+    finally:
+        _update_state["running"] = False
+        _update_state["finished_at"] = db.now()
+
+
+@router.post("/admin/update")
+def start_update(req: CollectRequest = Body(default=CollectRequest())) -> dict:
+    """启动完整更新流程：日K → 涨跌停 → RPS。
+
+    **立即返回** run_id，不阻塞请求；进度用 GET /admin/update/status 轮询。
+    这是本地单人使用的看板、不做鉴权，因此只允许触发白名单内的幂等更新，
+    不接受任意命令执行。
     """
-    allowed = {"backfill", "sync", "spot", "compute-rps"}
-    if req.task not in allowed:
-        return {"ok": False, "error": f"不支持的任务: {req.task}，可选 {sorted(allowed)}"}
+    if req.task != "update":
+        return {"ok": False, "error": f"不支持的任务: {req.task}，仅支持 update"}
+    if not _update_lock.acquire(blocking=False):
+        return {"ok": False, "error": "已有更新任务在执行中，请等待完成",
+                "phase": _update_state.get("phase"), "running": True}
+    try:
+        _update_state.update(running=True, phase="starting", error=None,
+                             run_id=None, started_at=db.now(),
+                             finished_at=None, elapsed=None)
+        threading.Thread(target=_run_update_bg, daemon=True).start()
+        return {"ok": True, "run_id": _update_state["run_id"], "running": True}
+    finally:
+        # 锁只在启动瞬间持有，线程本身不持锁；真正的互斥靠 running 标记
+        _update_lock.release()
 
-    from ..cli import run_task
 
-    return run_task(req.task)
+@router.get("/admin/update/status")
+def update_status() -> dict:
+    """轮询更新进度。"""
+    conn = db.connect()
+    try:
+        last = db.last_log(conn)
+    finally:
+        conn.close()
+    return {
+        "running": _update_state["running"],
+        "phase": _update_state["phase"],
+        "error": _update_state["error"],
+        "run_id": _update_state["run_id"],
+        "started_at": _update_state["started_at"],
+        "finished_at": _update_state["finished_at"],
+        "elapsed": _update_state.get("elapsed"),
+        "last_bar_date": latest_bar_date(db.connect()),
+        "last_collect_log": last,
+    }
