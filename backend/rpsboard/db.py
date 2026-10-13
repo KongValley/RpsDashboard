@@ -61,19 +61,6 @@ CREATE TABLE IF NOT EXISTS daily_bar (
 );
 CREATE INDEX IF NOT EXISTS idx_bar_date ON daily_bar(date);
 
-CREATE TABLE IF NOT EXISTS spot_snapshot (
-  date          TEXT NOT NULL,
-  symbol        TEXT NOT NULL,
-  price         REAL,
-  pct_chg       REAL,
-  amount        REAL,
-  turnover_rate REAL,
-  volume_ratio  REAL,
-  total_mv      REAL,
-  float_mv      REAL,
-  PRIMARY KEY (symbol, date)
-);
-
 CREATE TABLE IF NOT EXISTS rps_daily (
   date   TEXT NOT NULL,
   symbol TEXT NOT NULL,
@@ -107,6 +94,45 @@ CREATE TABLE IF NOT EXISTS benchmark_bar (
   close  REAL,
   PRIMARY KEY (symbol, date)
 );
+
+-- 当日涨跌停信息（eltdx daily_price_limits）
+-- limit_ratio 是**百分数**（10.0 / 20.0 / 30.0），不是小数；
+-- limit_up/limit_down 是**不复权**价位，与 daily_bar 的后复权收盘价
+-- 不在同一基准，**不可直接比较**——判定请用 analytics/limits.py 的收益率比法。
+CREATE TABLE IF NOT EXISTS price_limit_daily (
+  date        TEXT NOT NULL,
+  symbol      TEXT NOT NULL,
+  limit_ratio REAL,
+  limit_up    REAL,
+  limit_down  REAL,
+  rule        TEXT,
+  status      TEXT,
+  PRIMARY KEY (symbol, date)
+);
+CREATE INDEX IF NOT EXISTS idx_limit_date ON price_limit_daily(date);
+
+-- 概念/题材成分股（一只股票可属于多个概念，成分高度重叠）
+CREATE TABLE IF NOT EXISTS concept_map (
+  symbol    TEXT NOT NULL,
+  concept   TEXT NOT NULL,
+  board_code TEXT,
+  updated_at TEXT,
+  PRIMARY KEY (symbol, concept)
+);
+CREATE INDEX IF NOT EXISTS idx_concept_name ON concept_map(concept);
+
+-- 概念板块 RPS，结构与 industry_rps_daily 完全对称
+CREATE TABLE IF NOT EXISTS concept_rps_daily (
+  date          TEXT NOT NULL,
+  concept       TEXT NOT NULL,
+  rps20  REAL, rps60 REAL, rps120 REAL, rps250 REAL,
+  ret20  REAL, ret60 REAL, ret120 REAL, ret250 REAL,
+  member_count  INTEGER,
+  leader_symbol TEXT,
+  leader_name   TEXT,
+  PRIMARY KEY (concept, date)
+);
+CREATE INDEX IF NOT EXISTS idx_concept_rps_date ON concept_rps_daily(date);
 
 CREATE TABLE IF NOT EXISTS collect_log (
   run_id        TEXT PRIMARY KEY,
