@@ -1,28 +1,23 @@
 <template>
   <div class="rps-table-wrap">
-    <table class="rps-table">
+    <table class="rps-table resizable" :class="{ dragging }">
       <thead>
         <tr>
-          <th style="width:52px">#</th>
-          <th style="width:70px">代码</th>
-          <th>名称</th>
-          <th style="width:110px">行业</th>
-          <th style="width:130px">RPS</th>
-          <th style="width:90px" class="num">区间涨幅</th>
-          <th style="width:90px" class="num">当日涨跌</th>
-          <th style="width:100px" class="num">成交额</th>
-          <th v-if="showDelta" style="width:96px" class="num">Δ名次</th>
-          <th v-if="showPattern" style="width:104px">三升底</th>
-          <th style="width:90px" class="num">全市场</th>
-          <th style="width:90px" class="num">行业内</th>
+          <th v-for="c in columns" :key="c.key" :style="colStyle(c.key)"
+              :class="{ num: c.num }" :title="c.tip || ''">
+            <span class="th-label">{{ c.label }}</span>
+            <span class="rz" @mousedown="onResize(c.key, $event)"></span>
+          </th>
         </tr>
       </thead>
       <tbody>
         <tr v-if="loading">
-          <td :colspan="colSpan" class="empty muted">加载中…</td>
+          <td :colspan="columns.length" class="empty muted">加载中…</td>
         </tr>
         <tr v-else-if="!rows.length">
-          <td :colspan="colSpan" class="empty muted">没有符合条件的股票，试试放宽 RPS 阈值</td>
+          <td :colspan="columns.length" class="empty muted">
+            没有符合条件的股票，试试放宽 RPS 阈值
+          </td>
         </tr>
         <tr v-for="(r, i) in rows" :key="r.symbol" @click="$emit('select', r.symbol)">
           <td class="muted mono">{{ (page - 1) * pageSize + i + 1 }}</td>
@@ -42,8 +37,8 @@
             {{ fmtDelta(r.rank_delta) }}
           </td>
           <td v-if="showPattern">
-            <span v-if="r.sanxingdi_hit" class="badge"
-                  :class="r.sanxingdi_active ? 'pat ok' : 'pat stale'"
+            <span v-if="r.sanxingdi_hit" class="badge pat"
+                  :class="r.sanxingdi_active ? 'ok' : 'stale'"
                   :title="patternTitle(r)">
               {{ r.sanxingdi_active ? '三升底·有效' : '三升底·已失效' }}
             </span>
@@ -58,7 +53,8 @@
 </template>
 
 <script setup>
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
+import { useResizableColumns } from '../composables/useResizableColumns'
 
 const props = defineProps({
   rows: { type: Array, default: () => [] },
@@ -73,6 +69,47 @@ const props = defineProps({
 defineEmits(['select'])
 
 const colSpan = computed(() => 9 + (props.showDelta ? 1 : 0) + (props.showPattern ? 1 : 0))
+
+/**
+ * 表头定义。列宽拖拽按 key 记住，所以每列必须有稳定的 key
+ * （不能用 label：两个列表头文字可能相同，且改名会丢用户的列宽设置）。
+ */
+const columns = computed(() => [
+  { key: 'no', label: '#', width: 52 },
+  { key: 'symbol', label: '代码', width: 76 },
+  { key: 'name', label: '名称', width: 168 },
+  { key: 'industry', label: '行业', width: 150 },
+  { key: 'rps', label: 'RPS', width: 132 },
+  { key: 'ret', label: '区间涨幅', width: 96, num: true },
+  { key: 'pct', label: '当日涨跌', width: 96, num: true },
+  { key: 'amount', label: '成交额', width: 100, num: true },
+  { key: 'delta', label: 'Δ名次', width: 96, num: true,
+    tip: '相对所选交易日的名次变化，正数=名次前进' },
+  { key: 'pattern', label: '三升底', width: 116,
+    tip: '标准三升底：连续三根阳线、收盘逐根抬高、第一根实体不超过第三根一半、第三根收盘突破第一根最高价' },
+  { key: 'rank', label: '全市场', width: 84, num: true },
+  { key: 'rankIn', label: '行业内', width: 84, num: true },
+].filter((c) => (c.key !== 'delta' || props.showDelta)
+              && (c.key !== 'pattern' || props.showPattern)))
+
+const DEFAULTS = Object.fromEntries(
+  [['no', 52], ['symbol', 76], ['name', 168], ['industry', 150], ['rps', 132],
+   ['ret', 96], ['pct', 96], ['amount', 100], ['delta', 96], ['pattern', 116],
+   ['rank', 84], ['rankIn', 84]],
+)
+const { colStyle, startResize } = useResizableColumns('ranking', DEFAULTS)
+const dragging = ref(false)
+
+function onResize(key, ev) {
+  dragging.value = true
+  startResize(key, ev)
+  // 拖完再解除 body 上的 col-resize 光标，这里借 mouseup 的副作用收尾
+  const clear = () => {
+    dragging.value = false
+    window.removeEventListener('mouseup', clear)
+  }
+  window.addEventListener('mouseup', clear)
+}
 
 /** 形态列的悬浮说明：形态确认日 + 当前是否仍有效 */
 function patternTitle(r) {

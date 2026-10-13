@@ -41,16 +41,14 @@
         </span>
       </h3>
       <div class="scroll-y">
-      <table class="rps-table">
+      <table class="rps-table resizable">
         <thead>
           <tr>
-            <th style="width:52px">#</th>
-            <th>行业</th>
-            <th style="width:140px">RPS</th>
-            <th style="width:100px" class="num">区间涨幅</th>
-            <th style="width:90px" class="num">成分数</th>
-            <th style="width:90px">领涨股代码</th>
-            <th>领涨股</th>
+            <th v-for="c in sectorCols" :key="c.key" :style="sectorColStyle(c.key)"
+                :class="{ num: c.num }">
+              <span class="th-label">{{ c.label }}</span>
+              <span class="rz" @mousedown="onSectorResize(c.key, $event)"></span>
+            </th>
           </tr>
         </thead>
         <tbody>
@@ -82,6 +80,7 @@
 import { ref, computed, onMounted, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { rpsApi, metaApi } from '../api'
+import { useResizableColumns } from '../composables/useResizableColumns'
 
 const router = useRouter()
 const route = useRoute()
@@ -226,6 +225,22 @@ const heatmapOption = computed(() => {
 
 // 行数随排序结果变化，高度跟着走
 const chartHeight = computed(() => Math.max(420, sortedByPeriod.value.length * 19 + 70))
+
+/** 板块排行表：列宽同样可拖拽，与排行榜各自记住（不同 storageKey） */
+const sectorCols = [
+  { key: 'no', label: '#' },
+  { key: 'name', label: '行业' },
+  { key: 'rps', label: 'RPS' },
+  { key: 'ret', label: '区间涨幅', num: true },
+  { key: 'cnt', label: '成分数', num: true },
+  { key: 'leadSym', label: '领涨股代码' },
+  { key: 'leadName', label: '领涨股' },
+]
+const { colStyle: sectorColStyle, startResize: startSectorResize } = useResizableColumns(
+  'sector',
+  { no: 52, name: 210, rps: 140, ret: 100, cnt: 90, leadSym: 110, leadName: 180 },
+)
+function onSectorResize(key, ev) { startSectorResize(key, ev) }
 
 function rpsColor(v) {
   if (v == null) return '#2a323d'

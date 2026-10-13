@@ -74,6 +74,9 @@ table.rps-table {
   border-collapse: collapse;
   font-size: 13px;
 }
+/* 固定布局：列宽拖拽必须靠它才生效。
+   auto 布局下浏览器会按内容重新分配列宽，刚拖好的像素值会被立刻冲掉。 */
+table.rps-table.resizable { table-layout: fixed; }
 table.rps-table th {
   position: sticky;
   top: 0;
@@ -89,6 +92,29 @@ table.rps-table th {
   z-index: 1;
 }
 table.rps-table th:hover { color: var(--text); }
+/* 列宽拖拽把手：贴在单元格右缘，hover 才显形，避免平时干扰阅读 */
+table.rps-table th .rz {
+  position: absolute;
+  top: 0;
+  right: -3px;
+  width: 7px;
+  height: 100%;
+  cursor: col-resize;
+  z-index: 2;
+}
+table.rps-table th .rz::after {
+  content: '';
+  position: absolute;
+  left: 3px;
+  top: 25%;
+  bottom: 25%;
+  width: 1px;
+  background: transparent;
+  transition: background .12s;
+}
+table.rps-table th .rz:hover::after,
+table.rps-table.dragging th .rz::after { background: var(--accent); }
+table.rps-table.dragging { cursor: col-resize; }
 table.rps-table td {
   padding: 8px 10px;
   border-bottom: 1px solid rgba(42, 50, 61, .5);
