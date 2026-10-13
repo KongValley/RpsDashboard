@@ -390,7 +390,10 @@ def cmd_alert(args: argparse.Namespace) -> int:
             print(f"[alert] 已新增规则 #{cur.lastrowid} {args.name}（{kind} {raw}）")
             return 0
         if action == "rm":
+            # 与 API 的 DELETE /api/alerts/rules/{id} 保持一致：连带命中记录一起删，
+            # 否则 alert_hit 里会留下 rule_name 为空的孤儿行，页面/接口都会显示它们。
             cur = conn.execute("DELETE FROM alert_rule WHERE id = ?", (int(args.id),))
+            conn.execute("DELETE FROM alert_hit WHERE rule_id = ?", (int(args.id),))
             conn.commit()
             print(f"[alert] 已删除规则 #{args.id}" if cur.rowcount
                   else f"[alert] 规则 #{args.id} 不存在")

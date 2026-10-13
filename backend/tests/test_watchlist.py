@@ -211,3 +211,32 @@ def test_update_pipeline_runs_industry_and_alerts(tmp_path, monkeypatch):
     phases2: list[str] = []
     cli.run_update_pipeline(progress=phases2.append)
     assert "industry" not in phases2, "已有行业数据时必须跳过，不能悄悄换口径"
+
+
+def test_cli_alert_rm_removes_hits(tmp_path, monkeypatch):
+    """CLI 删规则要连带删命中记录（与 API 的 DELETE 行为一致）。
+
+    否则 alert_hit 里留下 rule_name 为空的孤儿行，页面与 /api/alerts/hits 都会显示它们。
+    """
+    from rpsboard import cli
+    from rpsboard import config as cfg
+    from rpsboard import db as dbmod
+
+    path = tmp_path / "alerts_cli.db"
+    dbmod.init_db(path)
+    monkeypatch.setattr(cfg, "DB_PATH", path)
+
+    class _Ns:
+        action, name, kind, params, id = "add", "RPS90", "rps_threshold", "{}", None
+
+    assert cli.cmd_alert(_Ns()) == 0
+    with dbmod.session() as conn:
+        conn.execute("INSERT INTO alert_hit(rule_id, date, symbol, detail) "
+                     "VALUES (1, '2026-01-05', '600519', 'RPS60=95.0')")
+        conn.commit()
+
+    _Ns.action, _Ns.id = "rm", "1"
+    assert cli.cmd_alert(_Ns()) == 0
+    with dbmod.session() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM alert_rule").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM alert_hit").fetchone()[0] == 0
