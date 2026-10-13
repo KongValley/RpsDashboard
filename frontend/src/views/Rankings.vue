@@ -72,7 +72,9 @@
         <button class="btn" :disabled="page === 1" @click="page--; load()">上一页</button>
         <span class="muted">第 {{ page }} 页</span>
         <button class="btn" :disabled="rows.length < pageSize" @click="page++; load()">下一页</button>
-        <button class="btn" @click="exportCsv">导出 CSV</button>
+        <button class="btn" :disabled="exporting" @click="exportCsv">
+          {{ exporting ? '导出中…' : '导出筛选结果' }}
+        </button>
       </div>
     </div>
 
@@ -111,6 +113,7 @@ const rows = ref([])
 const total = ref(0)
 const dataDate = ref(null)
 const loading = ref(false)
+const exporting = ref(false)
 const errMsg = ref('')
 
 async function load() {
@@ -155,20 +158,29 @@ function goDetail(symbol) {
   router.push(`/stock/${symbol}`)
 }
 
-function exportCsv() {
-  const header = ['代码', '名称', '行业', 'RPS', '区间涨幅%', '当日涨跌%', '成交额', '换手率%']
-  const lines = rows.value.map((r) => [
-    r.symbol, r.name, r.industry ?? '', r.rps ?? '',
-    r.period_return?.toFixed(2) ?? '', r.pct_chg?.toFixed(2) ?? '',
-    r.amount ?? '', r.turnover_rate?.toFixed(2) ?? '',
-  ].join(','))
-  const csv = '\uFEFF' + [header.join(','), ...lines].join('\n')
-  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' })
-  const a = document.createElement('a')
-  a.href = URL.createObjectURL(blob)
-  a.download = `rps${period.value}_${dataDate.value || 'latest'}.csv`
-  a.click()
-  URL.revokeObjectURL(a.href)
+/**
+ * 导出**当前筛选条件下的全量** CSV。
+ * 早期版本导的是 `rows.value`（当前页 100 行），按钮却写「导出 CSV」，
+ * 用户会以为拿到了全市场 —— 现在由服务端按同一套筛选条件出全量。
+ */
+async function exportCsv() {
+  exporting.value = true
+  try {
+    await rpsApi.exportRanking({
+      date: date.value || undefined,
+      period: period.value,
+      rps_min: rpsMin.value,
+      rps_max: 100,
+      industries: industry.value || undefined,
+      exclude_st: excludeSt.value,
+      min_amount: minAmount.value || undefined,
+      sort: 'rps',
+    }, `rps${period.value}_${dataDate.value || 'latest'}.csv`)
+  } catch (e) {
+    alert(`导出失败：${e.message}`)
+  } finally {
+    exporting.value = false
+  }
 }
 
 watch([industry, minAmount, excludeSt], () => { page.value = 1; load() })

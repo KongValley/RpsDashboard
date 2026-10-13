@@ -5,7 +5,6 @@ from __future__ import annotations
 from fastapi import APIRouter
 
 from .. import config, db
-from ..sources import akshare_src
 from . import latest_bar_date, read_sql
 
 router = APIRouter(prefix="/api/meta", tags=["meta"])
@@ -21,11 +20,6 @@ def status() -> dict:
         rps_rows = db.count_rows_cached(conn, "rps_daily")
         ind_rows = db.count_rows_cached(conn, "industry_rps_daily")
         last_bar = latest_bar_date(conn)
-        spot_date = akshare_src.latest_spot_date(conn)
-        stale = akshare_src.is_spot_stale(conn, last_bar)
-        # eltdx 主源的日 K 自带成交额，快照列（量比/市值）本就不是必需项，
-        # 因此主源为 eltdx 时不再提示快照缺失，避免无意义的黄色告警。
-        warn_spot = stale and config.DATA_SOURCE != "tdxnet"
 
         # 没有行业分类的股票：这些票会被排除在板块 RPS 之外，个股页显示「未分类」。
         # 实测 5580 只里有 356 只没有映射，是个值得摆在台面上的缺口而不是沉默。
@@ -46,8 +40,6 @@ def status() -> dict:
             "rps_rows": rps_rows,
             "industry_rows": ind_rows,
             "last_bar_date": last_bar,
-            "last_spot_date": spot_date,
-            "spot_stale": warn_spot,
             "unmapped_symbols": unmapped,
             "source": config.DATA_SOURCE,
             "periods": list(config.PERIODS),

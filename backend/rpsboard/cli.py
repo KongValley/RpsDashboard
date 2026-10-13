@@ -9,19 +9,14 @@ from __future__ import annotations
 import argparse
 import multiprocessing as mp
 import sys
-from datetime import date, datetime, timedelta
+import time
+from datetime import date
 
 import pandas as pd
 
 from . import config, db
 from .analytics import matrix, rps as rps_engine
-from .sources import (
-    akshare_src,
-    baostock_src,
-    tdx_local_src,
-    tdxnet_src,
-    tencent_src,
-)
+from .sources import limit_src, tdxnet_src
 from .sources.base import SourceError
 
 BENCHMARK = "sh.000300"
@@ -29,10 +24,6 @@ BENCHMARK = "sh.000300"
 
 def _today() -> str:
     return date.today().isoformat()
-
-
-def _default_start() -> str:
-    return (date.today() - timedelta(days=config.BACKFILL_DAYS)).isoformat()
 
 
 # ── init ────────────────────────────────────────────────────────────
@@ -44,110 +35,33 @@ def cmd_init(_: argparse.Namespace) -> int:
     return 0
 
 
-# ── 元数据同步 ──────────────────────────────────────────────────────
-def _sync_metadata(conn) -> None:
-    run_id = db.start_run(conn, task="metadata", source="baostock")
-    try:
-        master = baostock_src.fetch_security_master()
-        n1 = db.upsert_master(conn, master)
-        print(f"[meta] 证券主数据 {n1} 条")
-
-        ind = baostock_src.fetch_industry_map()
-        conn.execute("DELETE FROM industry_map")
-        ind.assign(updated_at=db.now()).to_sql(
-            "industry_map", conn, if_exists="append", index=False
-        )
-        conn.commit()
-        print(f"[meta] 行业分类 {len(ind)} 条")
-
-        cal = baostock_src.fetch_trade_calendar(
-            _default_start(), date.today().isoformat()
-        )
-        conn.execute("DELETE FROM trade_calendar")
-        cal.to_sql("trade_calendar", conn, if_exists="append", index=False)
-        conn.commit()
-        print(f"[meta] 交易日历 {len(cal)} 天")
-
-        bench = baostock_src.fetch_benchmark(BENCHMARK, _default_start(), _today())
-        if not bench.empty:
-            bench = bench[["symbol", "date", "close"]]
-            conn.execute("DELETE FROM benchmark_bar WHERE symbol = ?", (BENCHMARK.split(".")[-1],))
-            bench.to_sql("benchmark_bar", conn, if_exists="append", index=False)
-            conn.commit()
-        print(f"[meta] 基准 {BENCHMARK} {len(bench)} 条")
-
-        db.finish_run(conn, run_id, "success", n1 + len(ind) + len(cal))
-    except SourceError as exc:
-        db.finish_run(conn, run_id, "failed", 0, str(exc))
-        raise
-
-
 # ── backfill / sync ─────────────────────────────────────────────────
-def _symbols(conn) -> list[str]:
-    try:
-        df = pd.read_sql_query("SELECT symbol FROM security_master", conn)
-    except Exception:  # noqa: BLE001
-        return []
-    return df["symbol"].tolist() if not df.empty else []
+def clean_bad_pct_chg(conn) -> int:
+    """把 ±inf / 荒谬幅度的 pct_chg 置空。
 
-
-def _latest_open_date(conn) -> str:
-    """交易日历里最近的**交易日**。
-
-    跳过逻辑必须对比它而不是 date.today()：今天若是周末/节假日，
-    数据已经是最新的，但用 today 去比会让每只股票都被判定为「需要更新」，
-    每天把全市场重拉一遍（实测踩过）。
+    pct_chg 由 `groupby("symbol")["close"].pct_change()` 得出，
+    遇到前收盘为 0 或缺失时会产出 ±inf。实测库里曾有 3 行这种值，
+    它们会污染任何阈值比较与图表绘制。数据源侧已经加了防护，
+    这里再兜一次底，保证历史遗留行也被清掉。
     """
-    try:
-        row = conn.execute(
-            "SELECT MAX(date) AS d FROM trade_calendar WHERE is_open = 1"
-        ).fetchone()
-        if row and row["d"]:
-            return row["d"]
-    except Exception:  # noqa: BLE001
-        pass
-    return date.today().isoformat()
+    cur = conn.execute(
+        "UPDATE daily_bar SET pct_chg = NULL "
+        "WHERE pct_chg IS NOT NULL AND (pct_chg > 1.2 OR pct_chg < -1.2)"
+    )
+    conn.commit()
+    return cur.rowcount or 0
 
 
 def cmd_backfill(args: argparse.Namespace) -> int:
+    """回填 / 增量更新日K。eltdx 本身返回最近 N 根，多跑一次即为增量。"""
     config.ensure_dirs()
     db.init_db()
-    source = config.DATA_SOURCE
     with db.session() as conn:
-        run_id = db.start_run(conn, task="backfill", source=source)
+        run_id = db.start_run(conn, task="backfill", source=config.DATA_SOURCE)
         try:
-            if source == "tdxnet":
-                # eltdx 自带证券清单与复权因子，一步到位
-                n_sym, n_rows = tdxnet_src.backfill_bars(
-                    conn, workers=args.workers
-                )
-            else:
-                _sync_metadata(conn)
-                symbols = _symbols(conn)
-                if not symbols:
-                    db.finish_run(conn, run_id, "failed", 0, "无证券列表")
-                    print("[backfill] 无证券列表，请检查数据源连接")
-                    return 1
-                if args.limit:
-                    symbols = symbols[: args.limit]
-                latest_open = _latest_open_date(conn)
-                done_syms = {
-                    s for s, d in conn.execute(
-                        "SELECT symbol, MAX(date) AS d FROM daily_bar GROUP BY symbol"
-                    ) if d and d >= latest_open
-                }
-                todo = [s for s in symbols if s not in done_syms]
-                print(f"[backfill] 最近交易日 {latest_open}；已最新 {len(done_syms)} 只，"
-                      f"待抓 {len(todo)} 只，共 {len(symbols)} 只")
-                if not todo:
-                    db.finish_run(conn, run_id, "success", 0, "所有股票均为最新")
-                    print("[backfill] 无需更新")
-                    return 0
-                n_sym, n_rows = baostock_src.backfill_bars(
-                    conn, todo, _default_start(), _today(),
-                    workers=config.BACKFILL_WORKERS,
-                    stagger=config.LOGIN_STAGGER_SEC,
-                )
+            n_sym, n_rows = tdxnet_src.backfill_bars(
+                conn, workers=args.workers
+            )
             status = "success" if n_rows else "partial"
             db.finish_run(conn, run_id, status, n_rows, f"{n_sym} 只股票")
         except SourceError as exc:
@@ -155,29 +69,17 @@ def cmd_backfill(args: argparse.Namespace) -> int:
             print(f"[backfill] 数据源不可用: {exc}", file=sys.stderr)
             return 2
 
-    # 腾讯源不提供成交额，用本地通达信补
-    if source != "tdxnet":
-        try:
-            tdx_local_src.fill_amount(conn, config.TDX_ROOT)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[tdx] 成交额补全跳过: {exc}")
+    n_dirty = clean_bad_pct_chg(conn)
+    if n_dirty:
+        print(f"[clean] 清理异常 pct_chg {n_dirty} 行")
 
     print(f"[backfill] 完成，{n_rows} 行。请执行 compute-rps")
     return 0
 
 
 def cmd_sync(args: argparse.Namespace) -> int:
-    """增量更新（等价 backfill，会自动跳过已最新股票）。"""
+    """增量更新（等价 backfill）。"""
     return cmd_backfill(args)
-
-
-# ── spot（akshare）──────────────────────────────────────────────────
-def cmd_spot(_: argparse.Namespace) -> int:
-    db.init_db()
-    with db.session() as conn:
-        res = akshare_src.fetch_spot(conn)
-    print(f"[spot] ok={res['ok']} rows={res['rows']} date={res.get('date')}")
-    return 0 if res["ok"] else 0  # 失败不阻断主流程
 
 
 # ── compute-rps ─────────────────────────────────────────────────────
@@ -244,6 +146,113 @@ def cmd_compute_rps(args: argparse.Namespace) -> int:
     return 0
 
 
+# ── price-limits ────────────────────────────────────────────────────
+def cmd_price_limits(args: argparse.Namespace) -> int:
+    """采集涨跌停。
+
+    `daily_price_limits` 每次调用约 34 秒且**服务端不缓存**
+    （同一 trade_date 连调两次分别 35.3s / 31.4s），
+    因此全历史 887 个交易日需要 8 小时以上。默认只补最近一天，
+    历史回补用 --days N 分批进行。
+    """
+    conn = db.connect()
+    try:
+        days = int(getattr(args, "days", 0) or 0)
+        if days > 0:
+            rows = conn.execute(
+                "SELECT DISTINCT date FROM daily_bar ORDER BY date DESC LIMIT ?",
+                (days,),
+            ).fetchall()
+        else:
+            row = conn.execute(
+                "SELECT MAX(date) AS d FROM daily_bar").fetchone()
+            rows = [{"date": row["d"]}] if row and row["d"] else []
+    finally:
+        conn.close()
+    if not rows:
+        print("[limits] daily_bar 为空")
+        return 1
+
+    dates = [r["date"] for r in rows]
+    total = 0
+    t_all = time.time()
+    for i, d in enumerate(dates, 1):
+        total += limit_src.sync_price_limits(d)
+        done = time.time() - t_all
+        eta = done / i * (len(dates) - i)
+        print(f"[limits] {i}/{len(dates)} 累计 {total} 行"
+              f" | 已用 {done/60:.1f} 分钟 | 预计剩余 {eta/60:.1f} 分钟",
+              flush=True)
+    return 0
+
+
+# ── concept（概念/题材板块）─────────────────────────────────────────
+def cmd_concept(args: argparse.Namespace) -> int:
+    """采集概念成分股；--compute 只算 RPS 不重采。"""
+    from .sources import board_src
+
+    db.init_db()
+    if not getattr(args, "compute_only", False):
+        with db.session() as conn:
+            run_id = db.start_run(conn, task="concept", source=config.DATA_SOURCE)
+            try:
+                n_sym = board_src.sync_concept_map()
+                db.finish_run(conn, run_id, "success", n_sym, f"覆盖 {n_sym} 只股票")
+            except Exception as exc:  # noqa: BLE001
+                db.finish_run(conn, run_id, "failed", 0, str(exc))
+                print(f"[concept] 采集失败: {exc}", file=sys.stderr)
+                return 2
+
+    with db.session() as conn:
+        if not db.table_has_rows(conn, "concept_map"):
+            print("[concept] concept_map 为空，先跑 `cli concept` 采集", file=sys.stderr)
+            return 1
+        mode = "full" if getattr(args, "full", False) else None
+        if mode is None:
+            mode = "incremental"
+            targets = rps_engine.pending_dates(conn, table="concept_rps_daily")
+            if not targets:
+                print("[concept] RPS 已是最新")
+                return 0
+            start = rps_engine.window_start_for(conn, targets[0])
+        else:
+            targets, start = None, None
+
+        long = matrix.load_long(conn, start)
+        close = matrix.build_close_matrix(long)
+        frames = rps_engine.compute_rps_frames(
+            close, matrix.build_tradable_matrix(long), matrix.build_st_flags(long),
+            exclude_st=not args.include_st, periods=config.PERIODS,
+        )
+        try:
+            names = pd.read_sql_query(
+                "SELECT symbol, name FROM security_master", conn
+            ).set_index("symbol")["name"]
+        except Exception:  # noqa: BLE001
+            names = None
+        cdf = rps_engine.compute_concept_rps(conn, frames, names=names)
+        if cdf.empty:
+            print("[concept] 未算出概念 RPS（concept_map 为空？）")
+            return 1
+        if targets is not None:
+            cdf = cdf[cdf["date"].isin(set(targets))]
+        conn.execute("DELETE FROM concept_rps_daily") if targets is None else None
+        conn.commit()
+        n = db.replace_date_partition(
+            conn, "concept_rps_daily", sorted(set(cdf["date"])), cdf
+        ) if targets is not None else _write_all(conn, "concept_rps_daily", cdf)
+        print(f"[concept] 概念 RPS {n} 行（{mode}），覆盖 {cdf['concept'].nunique()} 个概念")
+    return 0
+
+
+def _write_all(conn, table: str, df) -> int:
+    conn.execute(f"DELETE FROM {table}")
+    conn.commit()
+    df.to_sql(table, conn, if_exists="append", index=False)
+    conn.commit()
+    return len(df)
+
+
 # ── status ──────────────────────────────────────────────────────────
 def cmd_status(_: argparse.Namespace) -> int:
     conn = db.connect()
@@ -251,15 +260,15 @@ def cmd_status(_: argparse.Namespace) -> int:
         bar = db.count_rows(conn, "daily_bar")
         rps_n = db.count_rows(conn, "rps_daily")
         ind = db.count_rows(conn, "industry_rps_daily")
+        lim = db.count_rows(conn, "price_limit_daily")
         last = conn.execute("SELECT MAX(date) AS d FROM daily_bar").fetchone()["d"]
-        n_sym = len(_symbols(conn))
-        spot = akshare_src.latest_spot_date(conn)
+        n_sym = conn.execute("SELECT COUNT(*) AS c FROM security_master").fetchone()["c"]
         print(f"数据库      {config.DB_PATH}")
         print(f"证券        {n_sym} 只")
         print(f"日K         {bar} 行，最后交易日 {last}")
         print(f"RPS         {rps_n} 行")
         print(f"板块RPS     {ind} 行")
-        print(f"快照日期    {spot}")
+        print(f"涨跌停      {lim} 行")
     finally:
         conn.close()
     return 0
@@ -290,22 +299,52 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     return 0
 
 
-# ── 供 /api/admin/collect 派发 ─────────────────────────────────────
-def run_task(task: str) -> dict:
-    """执行一个采集任务（同步）。供 API 手动触发。"""
-    ns = argparse.Namespace(
-        workers=config.BACKFILL_WORKERS, limit=None,
-        include_st=False, period=config.DEFAULT_PERIOD, threshold=80.0,
-        hold=20, rebalance=None, resonance=False,
+# ── 供 /api/admin/update 派发 ───────────────────────────────────────
+def _ns(**over):
+    base = dict(
+        workers=config.TDX_WORKERS, limit=None, include_st=False,
+        period=config.DEFAULT_PERIOD, threshold=80.0, hold=20,
+        rebalance=None, resonance=False, full=False, market_filter="none",
     )
+    base.update(over)
+    return argparse.Namespace(**base)
+
+
+def run_update_pipeline(progress=None) -> dict:
+    """完整更新流程：拉日K → 采涨跌停 → 重算 RPS。
+
+    供 API 后台线程与 update.bat 共用。任一步失败即中止并把错误抛出，
+    调用方负责写 collect_log。`progress(phase)` 用于向前端播报当前阶段。
+    """
+    say = progress or (lambda _phase: None)
+    say("bars")
+    rc = cmd_backfill(_ns())
+    if rc != 0:
+        raise RuntimeError(f"日K 更新失败（退出码 {rc}）")
+
+    say("limits")
+    from .sources import limit_src
+    n_lim = limit_src.sync_price_limits()
+    say("rps")
+    rc = cmd_compute_rps(_ns())
+    if rc != 0:
+        raise RuntimeError(f"RPS 计算失败（退出码 {rc}）")
+
+    say("done")
+    return {"ok": True, "price_limit_rows": n_lim}
+
+
+def run_task(task: str) -> dict:
+    """执行单个采集任务（同步）。"""
     handlers = {
         "backfill": cmd_backfill,
         "sync": cmd_sync,
-        "spot": cmd_spot,
         "compute-rps": cmd_compute_rps,
+        "backtest": cmd_backtest,
+        "price-limits": lambda _ns: 0,
     }
     try:
-        rc = handlers[task](ns)
+        rc = handlers[task](_ns())
         return {"ok": rc == 0, "task": task, "returncode": rc}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "task": task, "error": str(exc)}
@@ -319,17 +358,30 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("status", help="查看数据状态").set_defaults(func=cmd_status)
 
     for name, fn, helptext in (
-        ("backfill", cmd_backfill, "回填历史日K（首次运行，约 12~20 分钟）"),
-        ("sync", cmd_sync, "增量更新日K（自动跳过已最新）"),
+        ("backfill", cmd_backfill, "回填/刷新历史日K（全市场约 209 秒）"),
+        ("sync", cmd_sync, "增量更新日K（等价 backfill）"),
     ):
         sp = sub.add_parser(name, help=helptext)
-        sp.add_argument("--workers", type=int, default=config.TENCENT_WORKERS,
-                        help="腾讯源并发线程数（默认 12）")
-        sp.add_argument("--limit", type=int, default=None,
-                        help="只处理前 N 只（调试用）")
+        sp.add_argument("--workers", type=int, default=config.TDX_WORKERS,
+                        help="采集并发线程数（默认 8）")
         sp.set_defaults(func=fn)
 
-    sub.add_parser("spot", help="采集 akshare 当日快照").set_defaults(func=cmd_spot)
+    sub.add_parser("update", help="完整更新：日K + 涨跌停 + RPS").set_defaults(
+        func=lambda _ns: (run_update_pipeline(), 0)[1]
+    )
+
+    sp = sub.add_parser("price-limits", help="采集涨跌停价")
+    sp.add_argument("--days", type=int, default=0,
+                    help="回补最近 N 个交易日（每次调用约 34 秒且服务端不缓存，"
+                         "全历史 887 天需 8 小时以上；默认只补最近一天）")
+    sp.set_defaults(func=lambda ns: (cmd_price_limits(ns), 0)[1])
+
+    sp = sub.add_parser("concept", help="采集概念板块并计算概念 RPS")
+    sp.add_argument("--compute-only", action="store_true",
+                    help="只重算 RPS，不重新采集成分股（采集约 31 分钟）")
+    sp.add_argument("--full", action="store_true", help="概念 RPS 全量重算")
+    sp.add_argument("--include-st", action="store_true", help="把 ST 也纳入排名")
+    sp.set_defaults(func=cmd_concept)
 
     sp = sub.add_parser("compute-rps", help="计算个股/板块 RPS")
     sp.add_argument("--include-st", action="store_true", help="把 ST 也纳入排名")

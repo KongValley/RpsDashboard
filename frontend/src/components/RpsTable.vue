@@ -11,7 +11,6 @@
           <th style="width:90px" class="num">区间涨幅</th>
           <th style="width:90px" class="num">当日涨跌</th>
           <th style="width:100px" class="num">成交额</th>
-          <th style="width:90px" class="num">换手率</th>
           <th v-if="showDelta" style="width:96px" class="num">Δ名次</th>
           <th style="width:90px" class="num">全市场</th>
           <th style="width:90px" class="num">行业内</th>
@@ -19,10 +18,10 @@
       </thead>
       <tbody>
         <tr v-if="loading">
-          <td :colspan="showDelta ? 11 : 10" class="empty muted">加载中…</td>
+          <td :colspan="showDelta ? 10 : 9" class="empty muted">加载中…</td>
         </tr>
         <tr v-else-if="!rows.length">
-          <td :colspan="showDelta ? 11 : 10" class="empty muted">没有符合条件的股票，试试放宽 RPS 阈值</td>
+          <td :colspan="showDelta ? 10 : 9" class="empty muted">没有符合条件的股票，试试放宽 RPS 阈值</td>
         </tr>
         <tr v-for="(r, i) in rows" :key="r.symbol" @click="$emit('select', r.symbol)">
           <td class="muted mono">{{ (page - 1) * pageSize + i + 1 }}</td>
@@ -38,7 +37,6 @@
           <td class="num" :class="cls(r.period_return)">{{ fmtPct(r.period_return) }}</td>
           <td class="num" :class="cls(r.pct_chg)">{{ fmtPct(r.pct_chg) }}</td>
           <td class="num muted">{{ fmtAmount(r.amount) }}</td>
-          <td class="num muted">{{ fmtPct(r.turnover_rate) }}</td>
           <td v-if="showDelta" class="num" :class="deltaCls(r.rank_delta)">
             {{ fmtDelta(r.rank_delta) }}
           </td>

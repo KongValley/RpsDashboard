@@ -80,11 +80,10 @@ def test_status_ok(seeded):
     assert body["rps_rows"] > 0
     assert body["last_bar_date"]
     assert body["periods"] == list(PERIODS)
-    # 默认主源是 eltdx（自带成交额），此时不应因缺快照而告警；
-    # 若切到其它数据源，快照缺失才需要提示。
     assert body["source"] == config.DATA_SOURCE
-    expected_stale = config.DATA_SOURCE != "tdxnet"
-    assert body["spot_stale"] is expected_stale
+    # 快照相关字段已随 akshare 数据源一起移除（量比/市值在本机根本拿不到）
+    assert "spot_stale" not in body
+    assert "last_spot_date" not in body
 
 
 def test_periods(seeded):
@@ -231,10 +230,28 @@ def test_backtest_param_clamping(seeded):
     assert body["params"]["hold"] == 250
 
 
-def test_admin_collect_rejects_unknown(seeded):
+def test_admin_update_rejects_unknown(seeded):
+    """只允许触发 update 这一个白名单任务，不接受任意命令执行。"""
     client, *_ = seeded
-    body = client.post("/api/admin/collect", json={"task": "rm -rf"}).json()
+    body = client.post("/api/admin/update", json={"task": "rm -rf"}).json()
     assert body["ok"] is False
+    assert "不支持的任务" in body["error"]
+    # 旧的同步接口必须已经不存在（现在只匹配 SPA 兜底路由 → 405/404），
+    # 避免有人继续走那条会阻塞服务的路径
+    assert client.post(
+        "/api/admin/collect", json={"task": "compute-rps"}
+    ).status_code in (404, 405)
+
+
+def test_admin_update_status_shape(seeded):
+    """轮询接口必须给出运行状态与阶段，即使当前没有任务在跑。"""
+    client, *_ = seeded
+    r = client.get("/api/admin/update/status")
+    assert r.status_code == 200
+    body = r.json()
+    for k in ("running", "phase", "error", "started_at", "finished_at"):
+        assert k in body
+    assert isinstance(body["running"], bool)
 
 
 # ── 降级：空库 ──────────────────────────────────────────────────────
@@ -263,16 +280,48 @@ def test_empty_db_graceful(tmp_path, monkeypatch):
     assert client.get("/api/meta/dates").json() == []
 
 
-def test_ranking_without_spot_snapshot(seeded):
-    """没有 akshare 快照时，排行仍应完整返回核心列（降级验证）。
-
-    成交额/换手率来自 baostock 日K 的 amount/turn，不依赖 akshare；
-    只有量比/市值会是 None。
-    """
+def test_ranking_core_columns_present(seeded):
+    """排行榜必须返回核心列。"""
     client, *_ = seeded
     rows = client.get("/api/rps/ranking").json()["rows"]
     assert rows
+    for k in ("symbol", "name", "industry", "rps", "period_return",
+              "pct_chg", "amount", "close", "rank_overall"):
+        assert k in rows[0], f"缺少核心列 {k}"
     assert all(x["amount"] is not None for x in rows), "成交额应来自 daily_bar"
-    assert all(x["turnover_rate"] is not None for x in rows), "换手率应来自 daily_bar"
-    assert all(x["volume_ratio"] is None for x in rows), "量比只能来自 akshare 快照"
-    assert all(x["total_mv"] is None for x in rows), "总市值只能来自 akshare 快照"
+
+
+def test_ranking_dropped_columns_absent(seeded):
+    """换手率与快照四列必须**不存在**，而不是恒为 None。
+
+    这几个字段在本机都没有可靠来源（实测 daily_bar.turn 非空行数为 0；
+    akshare 快照被网络阻断）。留一列恒为 `—` 的假数据只会误导用户，
+    所以直接从接口移除——这个测试防止它们被悄悄加回来。
+    """
+    client, *_ = seeded
+    row = client.get("/api/rps/ranking").json()["rows"][0]
+    for k in ("turnover_rate", "volume_ratio", "total_mv", "float_mv", "price"):
+        assert k not in row, f"{k} 已确认无数据来源，不应再出现在响应里"
+
+
+def test_ranking_limit_is_capped(seeded):
+    """limit 必须被夹到上限，不能一次性把全市场拉出来。"""
+    from rpsboard.api.rps import MAX_PAGE_LIMIT
+
+    client, *_ = seeded
+    body = client.get("/api/rps/ranking", params={"limit": 100000}).json()
+    assert body["limit"] == MAX_PAGE_LIMIT
+    assert len(body["rows"]) <= MAX_PAGE_LIMIT
+
+
+def test_ranking_export_full_result(seeded):
+    """导出必须覆盖**全量**筛选结果，而不是当前页。"""
+    client, *_ = seeded
+    r = client.get("/api/rps/ranking/export")
+    assert r.status_code == 200
+    assert "text/csv" in r.headers["content-type"]
+    body = r.content.decode("utf-8-sig")
+    lines = [ln for ln in body.splitlines() if ln.strip()]
+    total = client.get("/api/rps/ranking", params={"limit": 500}).json()["total"]
+    # 表头 1 行 + 数据行；导出的是全量，行数应等于 total
+    assert len(lines) - 1 == total, f"导出 {len(lines)-1} 行，应为全量 {total} 行"

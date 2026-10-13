@@ -25,6 +25,19 @@ async function request(path, params) {
 
 const get = (path, params) => request(path, params)
 
+/** 触发浏览器下载（导出 CSV 等） */
+async function download(path, params, fallbackName = 'export.csv') {
+  const url = `/api${path}${qs(params)}`
+  const res = await fetch(url, { headers: { Accept: 'text/csv' } })
+  if (!res.ok) throw new Error(`HTTP ${res.status} ${url}`)
+  const blob = await res.blob()
+  const a = document.createElement('a')
+  a.href = URL.createObjectURL(blob)
+  a.download = fallbackName
+  a.click()
+  URL.revokeObjectURL(a.href)
+}
+
 async function post(path, body) {
   const res = await fetch(`/api${path}`, {
     method: 'POST',
@@ -44,8 +57,12 @@ export const metaApi = {
 
 export const rpsApi = {
   ranking: (params) => get('/rps/ranking', params),
+  exportRanking: (params, name) => download('/rps/ranking/export', params, name),
   sector: (params) => get('/rps/sector', params),
   heatmap: (params) => get('/rps/heatmap', params),
+  concepts: () => get('/rps/concepts'),
+  conceptRanking: (params) => get('/rps/concept-ranking', params),
+  conceptHeatmap: (params) => get('/rps/concept-heatmap', params),
 }
 export const stockApi = {
   detail: (symbol) => get(`/stock/${symbol}`),
@@ -57,7 +74,8 @@ export const backtestApi = {
 }
 
 export const adminApi = {
-  collect: (task) => post('/admin/collect', { task }),
+  update: () => post('/admin/update', {}),
+  updateStatus: () => get('/admin/update/status'),
 }
 
-export default { get, post }
+export default { get, post, download }
