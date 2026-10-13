@@ -594,6 +594,31 @@ start.sh  / update.sh    Linux / macOS 一键启动 / 更新
 - 已有库升级后需要跑一次 `cli init` 建这三张表（脚本全是 `CREATE TABLE IF NOT
   EXISTS`，幂等、不动数据）。
 
+### 推送到微信（ShowDoc 推送服务）
+
+命中可以推到手机：用 [ShowDoc 推送服务](https://www.showdoc.com.cn/push)（免费、不限请求数，
+POST `title`/`content` 到你的专属地址，消息进微信）。**只手动触发**——`cli update`
+与页面「更新数据」不会自动推送。
+
+```powershell
+# 1) 打开 https://push.showdoc.com.cn（建议电脑端）→ 右上角「推送」→ 复制专属推送地址
+# 2) 写进仓库根的 .env.local（已在 .gitignore 里；环境变量优先，不会覆盖）：
+#    SHOWDOC_PUSH_URL=https://push.showdoc.com.cn/server/api/push/<你的token>
+
+.venv\Scripts\python.exe -m rpsboard.cli notify test          # 自检：发一条测试消息
+.venv\Scripts\python.exe -m rpsboard.cli alert push --run      # 先评估规则，再推当天命中汇总
+.venv\Scripts\python.exe -m rpsboard.cli alert push --dry-run  # 只看消息内容，不发送
+```
+
+- 推送内容是一条 **Markdown 汇总**（标题 `RPS 预警命中 N 条（日期）`，正文按规则分组、
+  每条规则最多列 30 条明细，超出折叠成「还有 M 条」）。
+- 专属地址里的 token 属凭据：只从 `.env.local` / 环境变量读，**代码与输出都不回显**
+  （`cli notify test` 打印成功/失败但不打印 URL；失败只给 ShowDoc 的 `error_code` 与原因）。
+- 推送失败**不影响任何数据链路**：`alert push` / `notify test` 以退出码 2 报错，
+  `alert run` 与 `cli update` 照常完成。
+- `.env.local` 由 `backend/rpsboard/config.py` 在导入时读取（已存在的环境变量优先），
+  其它 `RPSBOARD_*` 变量也可以放这个文件里。
+
 ## 许可证
 
 [GPL-3.0-or-later](LICENSE) · Copyright (C) 2026 KongValley

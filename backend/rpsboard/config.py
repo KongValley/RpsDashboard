@@ -10,6 +10,31 @@ from pathlib import Path
 
 # ── 路径 ────────────────────────────────────────────────────────────
 ROOT_DIR = Path(__file__).resolve().parents[2]          # 项目根（含 backend/）
+
+
+def _load_env_file() -> None:
+    """把仓库根的 `.env.local` 读进环境变量（**不覆盖已有的**）。
+
+    本机凭据（例如 ShowDoc 推送地址里的 token）放在这个文件里：
+    gitignored、不进日志、不进仓库。已存在的环境变量优先，
+    因此 `set SHOWDOC_PUSH_URL=...` 或 CI 注入的变量不会被文件里的值盖掉。
+    """
+    path = ROOT_DIR / ".env.local"
+    if not path.is_file():
+        return
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_env_file()
+
 DATA_DIR = Path(os.environ.get("RPSBOARD_DATA_DIR", ROOT_DIR / "data"))
 DB_PATH = Path(os.environ.get("RPSBOARD_DB_PATH", DATA_DIR / "rpsboard.db"))
 
@@ -42,6 +67,14 @@ PERF_SLOW_MS = float(os.environ.get("RPSBOARD_PERF_SLOW_MS", "300"))
 #: 内存环形缓冲条数：服务端请求与浏览器上报分开计
 PERF_RING_SERVER = int(os.environ.get("RPSBOARD_PERF_RING_SERVER", "1000"))
 PERF_RING_CLIENT = int(os.environ.get("RPSBOARD_PERF_RING_CLIENT", "500"))
+
+# ── 推送（ShowDoc 推送服务 → 微信）──────────────────────────────────
+#: 你的专属推送地址，形如 https://push.showdoc.com.cn/server/api/push/<token>。
+#: **这是凭据**：放仓库根 `.env.local`（gitignored）或环境变量，空 = 不推送。
+#: 代码与日志都不回显它（只报成功/失败），避免 token 泄漏到终端与 issue 里。
+SHOWDOC_PUSH_URL = os.environ.get("SHOWDOC_PUSH_URL", "").strip()
+#: 推送请求超时（秒）。手动命令，超时就报错退出，不重试。
+SHOWDOC_PUSH_TIMEOUT = float(os.environ.get("SHOWDOC_PUSH_TIMEOUT", "10"))
 
 # ── 采集 ────────────────────────────────────────────────────────────
 #: **唯一数据源**：eltdx（通达信行情协议，TCP 直连）。

@@ -406,6 +406,9 @@ def cmd_alert(args: argparse.Namespace) -> int:
                       f"{h['rule_name']}  {h['detail']}")
             return 0
 
+        if action == "push":
+            return _alert_push(args, conn)
+
         rows = conn.execute(
             "SELECT id, name, kind, params, enabled, created_at FROM alert_rule ORDER BY id"
         ).fetchall()
@@ -420,6 +423,79 @@ def cmd_alert(args: argparse.Namespace) -> int:
             ).fetchone()["c"]
             print(f"#{r['id']:<3}{r['name']:<16}{r['kind']:<14}{r['params']}"
                   f"  累计命中 {hits}{flag}")
+    return 0
+
+
+# ── alert push（把命中推到手机）─────────────────────────────────────
+def _alert_push(args: argparse.Namespace, conn) -> int:
+    """把某一天的命中汇总推到 ShowDoc 推送服务（微信）。**只手动触发**。"""
+    from . import notify
+
+    if getattr(args, "run", False):
+        from .analytics import alerts as alerts_engine
+        n = len(alerts_engine.run_rules(conn, getattr(args, "date", None)))
+        print(f"[alert] 先评估了一次，命中 {n} 条")
+
+    date = getattr(args, "date", None)
+    if not date:
+        row = conn.execute("SELECT MAX(date) AS d FROM alert_hit").fetchone()
+        date = row["d"] if row and row["d"] else None
+    if not date:
+        print("[alert] alert_hit 里没有任何命中记录：先跑 `cli alert run`", file=sys.stderr)
+        return 1
+
+    rows = conn.execute(
+        "SELECT h.date, h.symbol, h.rule_id, h.detail, r.name AS rule_name, "
+        "       s.name AS name "
+        "FROM alert_hit h "
+        "LEFT JOIN alert_rule r ON r.id = h.rule_id "
+        "LEFT JOIN security_master s ON s.symbol = h.symbol "
+        "WHERE h.date = ? ORDER BY h.rule_id, h.symbol",
+        (date,),
+    ).fetchall()
+    hits = [dict(r) for r in rows]
+    if not hits:
+        print(f"[alert] {date} 没有命中记录，不推送")
+        return 0
+
+    title, content = notify.format_summary(date, hits)
+    if getattr(args, "dry_run", False):
+        print(f"[alert] --dry-run：不会真的推送。消息如下（{len(hits)} 条命中）\n")
+        print(f"标题：{title}\n\n{content}")
+        return 0
+
+    try:
+        notify.push(title, content)
+    except notify.NotifyError as exc:
+        print(f"[alert] {exc}", file=sys.stderr)
+        return 2
+    print(f"[alert] 已推送 {len(hits)} 条命中（{date}）到 ShowDoc 推送服务")
+    return 0
+
+
+# ── notify（推送通道自检）──────────────────────────────────────────
+def cmd_notify(args: argparse.Namespace) -> int:
+    """推送通道自检：发一条测试消息，或只打印将要发送的内容。"""
+    from . import notify
+
+    action = getattr(args, "action", None)
+    if action != "test":
+        print("[notify] 用法：cli notify test [--dry-run]", file=sys.stderr)
+        return 2
+    if getattr(args, "dry_run", False):
+        print("[notify] --dry-run：不会真的联网。将要发送：标题「RpsDashboard 推送测试」"
+              " + 一行正文")
+        return 0
+    if not notify.configured():
+        print("[notify] 未配置 SHOWDOC_PUSH_URL：把 ShowDoc 推送服务的专属地址写进 "
+              "仓库根 `.env.local`（gitignored）或设为环境变量", file=sys.stderr)
+        return 2
+    try:
+        notify.push_test()
+    except notify.NotifyError as exc:
+        print(f"[notify] {exc}", file=sys.stderr)
+        return 2
+    print("[notify] 测试消息已发送，请查看微信")
     return 0
 
 
@@ -619,7 +695,17 @@ def build_parser() -> argparse.ArgumentParser:
     asub.add_parser("ls", help="列出规则与累计命中数")
     a_run = asub.add_parser("run", help="评估全部规则并写入命中记录")
     a_run.add_argument("--date", default=None, help="评估哪一天（默认最新交易日）")
+    a_push = asub.add_parser("push", help="把某天的命中汇总推到手机（ShowDoc 推送服务）")
+    a_push.add_argument("--date", default=None, help="推哪一天（默认 alert_hit 里最新的一天）")
+    a_push.add_argument("--run", action="store_true", help="推送前先评估一次规则")
+    a_push.add_argument("--dry-run", action="store_true", help="只打印消息，不发送")
     asp.set_defaults(func=cmd_alert)
+
+    nsp = sub.add_parser("notify", help="推送通道：test")
+    nsub = nsp.add_subparsers(dest="action", required=True)
+    n_test = nsub.add_parser("test", help="发一条测试消息确认配置可用")
+    n_test.add_argument("--dry-run", action="store_true", help="只打印，不发送")
+    nsp.set_defaults(func=cmd_notify)
 
     sp = sub.add_parser("compute-rps", help="计算个股/板块 RPS")
     sp.add_argument("--include-st", action="store_true", help="把 ST 也纳入排名")
