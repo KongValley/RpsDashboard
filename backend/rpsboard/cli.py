@@ -253,6 +253,43 @@ def _write_all(conn, table: str, df) -> int:
     return len(df)
 
 
+# ── patterns（技术形态）─────────────────────────────────────────────
+def cmd_patterns(_: argparse.Namespace) -> int:
+    """计算三升底等形态。
+
+    只读 daily_bar 的 OHLC，不需要重新算 RPS，因此可以随时单独跑。
+    """
+    from .analytics import patterns
+
+    db.init_db()
+    conn = db.connect()
+    try:
+        ohlc = pd.read_sql_query(
+            "SELECT symbol, date, open, high, low, close FROM daily_bar "
+            "ORDER BY symbol, date", conn
+        )
+        if ohlc.empty:
+            print("[pattern] daily_bar 为空", file=sys.stderr)
+            return 1
+        run_id = db.start_run(conn, task="patterns", source="internal")
+        try:
+            n = patterns.materialize(conn, ohlc)
+        except Exception as exc:  # noqa: BLE001
+            db.finish_run(conn, run_id, "failed", 0, str(exc))
+            print(f"[pattern] 计算失败: {exc}", file=sys.stderr)
+            return 2
+        latest = conn.execute(
+            "SELECT MAX(date) d FROM pattern_daily").fetchone()["d"]
+        today_n = conn.execute(
+            "SELECT COUNT(*) n FROM pattern_daily WHERE date = ?", (latest,)
+        ).fetchone()["n"]
+        db.finish_run(conn, run_id, "success", n, f"{n} 个形态")
+    finally:
+        conn.close()
+    print(f"[pattern] 三升底 {n} 个（最新 {latest} 当日 {today_n} 个）")
+    return 0
+
+
 # ── status ──────────────────────────────────────────────────────────
 def cmd_status(_: argparse.Namespace) -> int:
     conn = db.connect()
@@ -330,6 +367,11 @@ def run_update_pipeline(progress=None) -> dict:
     if rc != 0:
         raise RuntimeError(f"RPS 计算失败（退出码 {rc}）")
 
+    say("patterns")
+    rc = cmd_patterns(_ns())
+    if rc != 0:
+        raise RuntimeError(f"形态计算失败（退出码 {rc}）")
+
     say("done")
     return {"ok": True, "price_limit_rows": n_lim}
 
@@ -382,6 +424,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--full", action="store_true", help="概念 RPS 全量重算")
     sp.add_argument("--include-st", action="store_true", help="把 ST 也纳入排名")
     sp.set_defaults(func=cmd_concept)
+
+    sub.add_parser("patterns", help="计算三升底形态").set_defaults(func=cmd_patterns)
 
     sp = sub.add_parser("compute-rps", help="计算个股/板块 RPS")
     sp.add_argument("--include-st", action="store_true", help="把 ST 也纳入排名")

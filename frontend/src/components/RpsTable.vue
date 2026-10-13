@@ -12,16 +12,17 @@
           <th style="width:90px" class="num">当日涨跌</th>
           <th style="width:100px" class="num">成交额</th>
           <th v-if="showDelta" style="width:96px" class="num">Δ名次</th>
+          <th v-if="showPattern" style="width:104px">三升底</th>
           <th style="width:90px" class="num">全市场</th>
           <th style="width:90px" class="num">行业内</th>
         </tr>
       </thead>
       <tbody>
         <tr v-if="loading">
-          <td :colspan="showDelta ? 10 : 9" class="empty muted">加载中…</td>
+          <td :colspan="colSpan" class="empty muted">加载中…</td>
         </tr>
         <tr v-else-if="!rows.length">
-          <td :colspan="showDelta ? 10 : 9" class="empty muted">没有符合条件的股票，试试放宽 RPS 阈值</td>
+          <td :colspan="colSpan" class="empty muted">没有符合条件的股票，试试放宽 RPS 阈值</td>
         </tr>
         <tr v-for="(r, i) in rows" :key="r.symbol" @click="$emit('select', r.symbol)">
           <td class="muted mono">{{ (page - 1) * pageSize + i + 1 }}</td>
@@ -40,6 +41,14 @@
           <td v-if="showDelta" class="num" :class="deltaCls(r.rank_delta)">
             {{ fmtDelta(r.rank_delta) }}
           </td>
+          <td v-if="showPattern">
+            <span v-if="r.sanxingdi_hit" class="badge"
+                  :class="r.sanxingdi_active ? 'pat ok' : 'pat stale'"
+                  :title="patternTitle(r)">
+              {{ r.sanxingdi_active ? '三升底·有效' : '三升底·已失效' }}
+            </span>
+            <span v-else class="muted">—</span>
+          </td>
           <td class="num muted">{{ r.rank_overall ?? '—' }}</td>
           <td class="num muted">{{ r.rank_in_industry ?? '—' }}</td>
         </tr>
@@ -49,6 +58,8 @@
 </template>
 
 <script setup>
+import { computed } from 'vue'
+
 const props = defineProps({
   rows: { type: Array, default: () => [] },
   page: { type: Number, default: 1 },
@@ -56,8 +67,21 @@ const props = defineProps({
   loading: { type: Boolean, default: false },
   /** 是否展示「Δ名次」列（由 Rankings 的对比周期选择决定） */
   showDelta: { type: Boolean, default: false },
+  /** 是否展示「三升底」列（由 Rankings 的形态筛选决定） */
+  showPattern: { type: Boolean, default: false },
 })
 defineEmits(['select'])
+
+const colSpan = computed(() => 9 + (props.showDelta ? 1 : 0) + (props.showPattern ? 1 : 0))
+
+/** 形态列的悬浮说明：形态确认日 + 当前是否仍有效 */
+function patternTitle(r) {
+  if (!r.sanxingdi_hit) return ''
+  const head = `形态确认日 ${r.sanxingdi_date || '—'}`
+  return r.sanxingdi_active
+    ? `${head}｜形态仍有效（未跌破第一根最低价）`
+    : `${head}｜已跌破第一根最低价，形态失效`
+}
 
 /** Δ名次：正数=名次前进（红涨），负数=名次后退（绿跌），与 A 股涨跌配色一致 */
 function fmtDelta(v) {
@@ -117,5 +141,12 @@ td.empty { text-align: center; padding: 40px; }
 .badge.st {
   background: rgba(246, 70, 93, .2); color: var(--up);
   margin-right: 5px; font-size: 10px; padding: 1px 5px;
+}
+/* 三升底标记：有效=红（多头发力），失效=灰（形态已破坏） */
+.badge.pat { font-size: 10px; padding: 1px 5px; white-space: nowrap; }
+.badge.pat.ok { background: rgba(246, 70, 93, .18); color: var(--up); }
+.badge.pat.stale {
+  background: rgba(120, 132, 150, .16); color: var(--text-dim);
+  text-decoration: line-through;
 }
 </style>

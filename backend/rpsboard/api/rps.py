@@ -1,4 +1,4 @@
-"""RPS 接口：排行榜、板块排行、热力图。"""
+﻿"""RPS 接口：排行榜、板块排行、热力图。"""
 
 from __future__ import annotations
 
@@ -38,6 +38,88 @@ _ASC_SORTS = {"pct_chg", "close"}
 _NULLABLE_SORTS = {"pct_chg", "amount", "close"}
 
 
+#: 三升底筛选可选窗口（交易日）。0 = 不筛选。
+SANXINGDI_WINDOWS = (1, 5, 10, 20)
+
+
+def _patterns_ready(conn) -> bool:
+    """pattern_daily 是否已经算过。表不存在或为空都算没算好。
+
+    没算好时前端要能区分「筛出来 0 只」和「还没算形态所以筛不出来」，
+    否则用户会以为市场里根本没有三升底。
+    """
+    if not db.table_exists(conn, "pattern_daily"):
+        return False
+    return db.table_has_rows(conn, "pattern_daily")
+
+
+def sanxingdi_filter_sql(
+    conn, d: str, window: int, alias: str = "r"
+) -> tuple[str, list]:
+    """构造「近 N 个交易日内出现过三升底」的过滤子句。
+
+    返回 (sql 片段, 参数)。window <= 0 时返回空串、无参数。
+    窗口按**交易日**回退而不是日历日：周末与节假日会让两者越偏越远。
+    """
+    if window <= 0:
+        return "", []
+    from ..analytics import patterns as pat
+
+    start = pat.window_start(conn, d, window)
+    if not start:
+        return "", []
+    frag = (f" AND {alias}.symbol IN ("
+            f"SELECT symbol FROM pattern_daily WHERE date >= ?)")
+    return frag, [start]
+
+
+def pattern_state(
+    conn, symbols: list[str], date: str, window: int
+) -> dict[str, dict]:
+    """查这些股票在窗口内的形态命中情况，以及形态是否**仍然有效**。
+
+    「有效」= 形态确认日之后，最低价没有跌破第一根阳线的最低价 base_low。
+    只对当页返回的股票做计算（最多 MAX_PAGE_LIMIT 行），避免全市场扫描。
+    """
+    out: dict[str, dict] = {}
+    if not symbols or window <= 0:
+        return out
+    from ..analytics import patterns as pat
+
+    start = pat.window_start(conn, date, window)
+    if not start:
+        return out
+    ph = ",".join("?" * len(symbols))
+    rows = read_sql(
+        conn,
+        f"SELECT p.symbol, p.date, p.base_date, p.base_low, p.base_high, "
+        f"       p.strength, p.body_ratio, MIN(b.low) AS min_low_after "
+        f"FROM pattern_daily p "
+        f"LEFT JOIN daily_bar b ON b.symbol = p.symbol AND b.date > p.date "
+        f"WHERE p.symbol IN ({ph}) AND p.date >= ? AND p.date <= ? "
+        f"GROUP BY p.symbol, p.date",
+        tuple(symbols) + (start, date),
+    )
+    if rows.empty:
+        return out
+    # 同一只股票窗口内可能多次成立，取最近一次
+    rows = rows.sort_values("date").drop_duplicates("symbol", keep="last")
+    for _, r in rows.iterrows():
+        after = r["min_low_after"]
+        active = True if after is None or pd.isna(after) else bool(after >= r["base_low"])
+        out[r["symbol"]] = {
+            "hit": True,
+            "date": r["date"],
+            "base_date": r["base_date"],
+            "base_low": r["base_low"],
+            "base_high": r["base_high"],
+            "strength": r["strength"],
+            "body_ratio": r["body_ratio"],
+            "active": active,
+        }
+    return out
+
+
 def market_ranks(
     conn, date: str, period: int, compare_date: str | None = None
 ) -> pd.DataFrame:
@@ -69,7 +151,7 @@ def market_ranks(
 def _ranking_fast(
     conn, d: str, period: int, sort: str,
     rps_min: float, rps_max: float,
-    exclude_st: bool, limit: int, page: int,
+    exclude_st: bool, limit: int, page: int, sanxingdi: int = 0,
 ) -> tuple[pd.DataFrame, int]:
     """快路径：先在 rps_daily 上取 Top-N，再只对这 N 行做 JOIN。
 
@@ -97,6 +179,12 @@ def _ranking_fast(
             "NOT EXISTS (SELECT 1 FROM security_master s "
             "WHERE s.symbol = r.symbol AND s.is_st IS NOT NULL AND s.is_st <> 0)"
         )
+    # 三升底筛选可以直接放进内层：它只依赖 rps_daily.symbol，
+    # 不需要 JOIN 之后才能判断，因此不影响延迟连接的优化。
+    frag, frag_params = sanxingdi_filter_sql(conn, d, sanxingdi)
+    if frag:
+        where.append(frag[5:])            # 去掉前导的 " AND "
+        params += frag_params
 
     # 排序：能在 rps_daily 单表上排的（rps / ret）放内层，让 LIMIT 先取 Top-N；
     # 其余列必须 JOIN 之后才能拿到，只能排在外层。
@@ -161,7 +249,7 @@ def _ranking_filtered(
     conn, d: str, period: int, sort: str,
     rps_min: float, rps_max: float,
     exclude_st: bool, industries: str | None, min_amount: float,
-    limit: int, page: int,
+    limit: int, page: int, sanxingdi: int = 0,
 ) -> tuple[pd.DataFrame, int]:
     """慢路径：行业 / 成交额过滤必须先 JOIN 再排序分页。"""
     where = [f"r.date = ?"]
@@ -179,6 +267,10 @@ def _ranking_filtered(
     if min_amount > 0:
         where.append("b.amount >= ?")
         params.append(min_amount)
+    frag, frag_params = sanxingdi_filter_sql(conn, d, sanxingdi)
+    if frag:
+        where.append(frag[5:])
+        params += frag_params
 
     sort_col = _SORTS.get(sort, _SORTS["rps"])
     base = (
@@ -221,15 +313,22 @@ def ranking(
     limit: int = DEFAULT_PAGE_LIMIT,
     page: int = 1,
     delta_days: int = 0,
+    sanxingdi: int = Query(
+        0, description="三升底筛选窗口（交易日）：0 不筛选，可选 1/5/10/20",
+    ),
 ) -> dict:
     """RPS 排行榜（多周期筛选 + 排序 + 分页）。
 
     delta_days > 0 时额外返回 rank_prev / rank_delta（相对 N 个交易日前的名次变化）。
+    sanxingdi > 0 时只返回近 N 个交易日内出现过三升底的股票，
+    并在每行附 sanxingdi_hit / sanxingdi_active 标记。
     """
     conn = db.connect()
     try:
         if period not in config.PERIODS:
             period = config.DEFAULT_PERIOD
+        if sanxingdi and sanxingdi not in SANXINGDI_WINDOWS:
+            sanxingdi = 0
         # 单页上限保护：不设限时 limit=100000 会把全市场一次性返回
         limit = max(1, min(int(limit), MAX_PAGE_LIMIT))
         page = max(1, int(page))
@@ -246,17 +345,28 @@ def ranking(
         if heavy_filter:
             df, total_n = _ranking_filtered(
                 conn, d, period, sort, rps_min, rps_max,
-                exclude_st, industries, min_amount, limit, page,
+                exclude_st, industries, min_amount, limit, page, sanxingdi,
             )
         else:
             df, total_n = _ranking_fast(
                 conn, d, period, sort, rps_min, rps_max,
-                exclude_st, limit, page,
+                exclude_st, limit, page, sanxingdi,
             )
 
         if df.empty:
             return {"total": total_n, "rows": [], "data_date": d, "period": period,
-                    "rank_delta_days": 0}
+                    "rank_delta_days": 0, "sanxingdi": sanxingdi,
+                    "pattern_missing": sanxingdi > 0 and not _patterns_ready(conn)}
+
+        # 形态标记：命中 / 是否仍有效（未跌破第一根最低价）。
+        # 只在启用筛选时才加这几列 —— 不筛选时返回三个全 False 的字段
+        # 既没信息量又让响应变胖。
+        if sanxingdi > 0:
+            st = pattern_state(conn, df["symbol"].tolist(), d, sanxingdi)
+            df["sanxingdi_hit"] = df["symbol"].isin(st.keys())
+            df["sanxingdi_active"] = [bool(st.get(s, {}).get("active", False))
+                                     for s in df["symbol"]]
+            df["sanxingdi_date"] = [st.get(s, {}).get("date") for s in df["symbol"]]
 
         # 全市场名次（不是本页内名次）；delta_days > 0 时带上对比日
         prev_date = None
@@ -278,6 +388,8 @@ def ranking(
             "limit": limit,
             "delta_days": delta_days,
             "rank_delta_base_date": prev_date,
+            "sanxingdi": sanxingdi,
+            "pattern_missing": not _patterns_ready(conn),
         }
     finally:
         conn.close()

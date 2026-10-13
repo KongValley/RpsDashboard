@@ -67,6 +67,7 @@ export const rpsApi = {
 export const stockApi = {
   detail: (symbol) => get(`/stock/${symbol}`),
   curve: (symbol, days = 250) => get(`/stock/${symbol}/curve`, { days }),
+  patterns: (symbol, days = 250) => get(`/stock/${symbol}/patterns`, { days }),
 }
 
 export const backtestApi = {

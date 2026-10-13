@@ -79,6 +79,55 @@ def detail(symbol: str) -> dict:
         conn.close()
 
 
+@router.get("/{symbol}/patterns")
+def patterns(symbol: str, days: int = 250) -> dict:
+    """该股最近的三升底形态记录（用于详情页标注形态位置与状态）。
+
+    每条包含：形态确认日、第一根阳线日期、失效位（第一根最低价）、
+    形态确认日之后的最低价，据此判定形态是否仍然有效。
+    """
+    from .rps import _patterns_ready
+
+    conn = db.connect()
+    try:
+        if not _patterns_ready(conn):
+            return {"symbol": symbol, "patterns": [], "current": None,
+                    "pattern_missing": True}
+        rows = read_sql(
+            conn,
+            "SELECT date, base_date, base_low, base_high, strength, body_ratio "
+            "FROM pattern_daily WHERE symbol = ? ORDER BY date DESC LIMIT ?",
+            (symbol, max(1, min(int(days), 2000))),
+        )
+        if rows.empty:
+            return {"symbol": symbol, "patterns": [], "current": None,
+                    "pattern_missing": False}
+        pats = jsonable(rows)
+        # 用形态确认日之后的最低价判断是否失效
+        for p in pats:
+            lo = read_sql(
+                conn,
+                "SELECT MIN(low) AS m FROM daily_bar WHERE symbol = ? AND date > ?",
+                (symbol, p["date"]),
+            )
+            after = lo["m"].iloc[0] if not lo.empty else None
+            after = None if after is None or pd.isna(after) else float(after)
+            p["min_low_after"] = after
+            p["active"] = True if after is None else bool(after >= p["base_low"])
+        latest = conn.execute("SELECT MAX(date) AS d FROM rps_daily").fetchone()["d"]
+        current = None
+        if pats and pats[0]["active"]:
+            # 最近一次形态是否就在当前交易日（或很近）
+            from ..analytics.patterns import window_start
+            near = window_start(conn, latest, 3)
+            if pats[0]["date"] >= (near or pats[0]["date"]):
+                current = pats[0]
+        return {"symbol": symbol, "patterns": pats, "current": current,
+                "pattern_missing": False}
+    finally:
+        conn.close()
+
+
 @router.get("/{symbol}/curve")
 def curve(symbol: str, days: int = 250) -> dict:
     """RPS 多周期曲线 + 后复权价格 + 涨跌幅（日期轴严格对齐）。"""

@@ -1,6 +1,10 @@
 <template>
   <div class="rankings">
     <div v-if="errMsg" class="errbar">接口错误：{{ errMsg }}</div>
+    <div v-if="patternMissing && sanxingdi" class="errbar warn">
+      形态数据尚未计算，三升底筛选结果不可用。请先执行
+      <code>python -m rpsboard.cli patterns</code>
+    </div>
     <div class="panel filters">
       <div class="row">
         <div class="group">
@@ -49,6 +53,19 @@
         </div>
 
         <div class="group">
+          <label title="三升底：连续三根阳线、收盘逐根抬高、第一根实体不超过第三根一半、且第三根收盘突破第一根最高价">
+            三升底
+          </label>
+          <select v-model.number="sanxingdi" style="min-width:118px">
+            <option :value="0">不筛选</option>
+            <option :value="1">仅最新日</option>
+            <option :value="5">近 5 日</option>
+            <option :value="10">近 10 日</option>
+            <option :value="20">近 20 日</option>
+          </select>
+        </div>
+
+        <div class="group">
           <label>数据日期</label>
           <select v-model="date" style="min-width:118px">
             <option value="">最新（{{ dataDate || '—' }}）</option>
@@ -80,7 +97,8 @@
 
     <div class="panel" style="margin-top:12px;padding:0">
       <RpsTable :rows="rows" :page="page" :page-size="pageSize"
-                :loading="loading" :show-delta="deltaDays > 0" @select="goDetail" />
+                :loading="loading" :show-delta="deltaDays > 0"
+                :show-pattern="sanxingdi > 0" @select="goDetail" />
     </div>
   </div>
 </template>
@@ -107,6 +125,8 @@ const date = ref('')
 const availableDates = ref([])
 /** 0 = 不对比名次；>0 = 与 N 个交易日前的名次比较 */
 const deltaDays = ref(0)
+/** 0 = 不筛选三升底；>0 = 近 N 个交易日（含当日）内出现过三升底 */
+const sanxingdi = ref(0)
 
 const industries = ref([])
 const rows = ref([])
@@ -114,6 +134,7 @@ const total = ref(0)
 const dataDate = ref(null)
 const loading = ref(false)
 const exporting = ref(false)
+const patternMissing = ref(false)
 const errMsg = ref('')
 
 async function load() {
@@ -131,6 +152,7 @@ async function load() {
       limit: pageSize,
       page: page.value,
       delta_days: deltaDays.value || undefined,
+      sanxingdi: sanxingdi.value || undefined,
     })
     if (!data || typeof data !== 'object' || !('rows' in data)) {
       throw new Error(`响应结构异常: ${JSON.stringify(data).slice(0, 120)}`)
@@ -140,6 +162,9 @@ async function load() {
     // 后端会把非交易日回退到最近的有数据日期，这里只展示实际生效的日期，
     // **不写回 date.value**——否则会触发 watch(date) 形成重复请求。
     dataDate.value = data.data_date
+    // 形态表还没算过时，后端会带 pattern_missing，必须提示，
+    // 否则用户会以为「市场里根本没有三升底」。
+    patternMissing.value = !!data.pattern_missing
   } catch (e) {
     console.error(e)
     errMsg.value = e?.message || String(e)
@@ -187,6 +212,7 @@ watch([industry, minAmount, excludeSt], () => { page.value = 1; load() })
 watch(rpsMin, () => { page.value = 1; load() })
 watch(date, () => { page.value = 1; load() })
 watch(deltaDays, () => { page.value = 1; load() })
+watch(sanxingdi, () => { page.value = 1; load() })
 
 // 主数据与元数据**并行独立**加载：筛选项没就绪不该阻塞排行榜。
 // （早期写成 `await Promise.all([periods, industries])` 再 load()，

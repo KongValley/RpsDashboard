@@ -134,6 +134,21 @@ CREATE TABLE IF NOT EXISTS concept_rps_daily (
 );
 CREATE INDEX IF NOT EXISTS idx_concept_rps_date ON concept_rps_daily(date);
 
+-- 技术形态命中表（三升底）。**稀疏表**：只存成立的形态，不存未成立的日子。
+-- base_low 是第一根阳线的最低价，跌破即形态失效。
+CREATE TABLE IF NOT EXISTS pattern_daily (
+  symbol     TEXT NOT NULL,
+  date       TEXT NOT NULL,      -- 第三根阳线（形态确认日）
+  base_date  TEXT,               -- 第一根阳线日期
+  base_low   REAL,               -- 第一根最低价：跌破即失效
+  base_high  REAL,
+  strength   REAL,               -- 三根合计涨幅
+  body_ratio REAL,               -- 第一根实体 / 第三根实体
+  PRIMARY KEY (symbol, date)
+);
+CREATE INDEX IF NOT EXISTS idx_pattern_date ON pattern_daily(date);
+CREATE INDEX IF NOT EXISTS idx_pattern_symbol ON pattern_daily(symbol, date);
+
 CREATE TABLE IF NOT EXISTS collect_log (
   run_id        TEXT PRIMARY KEY,
   task          TEXT NOT NULL,
