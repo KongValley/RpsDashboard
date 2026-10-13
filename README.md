@@ -15,6 +15,8 @@ RPS 把全市场个股按区间涨幅做**横截面百分位排名**：RPS=90 �
 | **板块强弱** | **证监会行业 / 概念题材**两套口径，等权涨幅的横截面 RPS + 领涨股 + 行业×周期热力图（**行按当前周期独立排序**） |
 | **个股详情** | 单只股票的多周期 RPS 曲线 vs 后复权价格双轴图、跑赢全市场分位、所属行业强弱 |
 | **策略回测** | 净值 vs 沪深300、风险指标、**RPS 分档前瞻收益**（自动解读单调方向）、**大盘择时**、**交易成本**、**涨跌停可交易性** |
+| **自选预警** | 自选股池（行首 ☆ 即加入）+ 条件预警规则（RPS 阈值 / 三升底 / 涨停）与命中记录；命中可**手动**推送到微信 |
+| **性能监测** | 后端 ASGI 中间件逐请求计时（`x-perf-ms`）+ 前端上报，两端在同一接口里对照；详见「性能监测点」 |
 | **一键更新** | 页面按钮触发后台线程串起「日K → 涨跌停 → 行业分类（仅空表）→ RPS → 形态 → 预警」，实时显示阶段与失败原因；命令行入口 `update.bat` |
 
 ## 技术栈
@@ -50,6 +52,21 @@ uv sync --extra dev            # 按 uv.lock 装出可复现的环境（推荐�
 
 # 查看数据状态
 .venv\Scripts\python.exe -m rpsboard.cli status
+```
+
+下列步骤按需执行（`cli update` 会自动接上后面几步；概念板块需单独采集一次）：
+
+```powershell
+# 概念/题材板块：采集成分股（约 31 分钟，只需一次）+ 概念 RPS
+.venv\Scripts\python.exe -m rpsboard.cli concept
+.venv\Scripts\python.exe -m rpsboard.cli concept --compute-only   # 之后只重算 RPS
+
+# 三升底形态
+.venv\Scripts\python.exe -m rpsboard.cli patterns
+
+# 自选与预警（详见「自选股池与条件预警」一节）
+.venv\Scripts\python.exe -m rpsboard.cli watch ls
+.venv\Scripts\python.exe -m rpsboard.cli alert run
 ```
 
 命令行回测：
@@ -92,6 +109,24 @@ cd frontend && npm install && npm run dev
 > 想让后端单端口托管前端（不必再起 vite dev）：`cd frontend && npm run build`，
 > 之后只开后端，直接访问 http://127.0.0.1:8000/ 即可。
 
+### 4. 已有库升级（拉取新版本后跑一次）
+
+**只跑 `cli init` 不会补出新周期列**：三张表的 DDL 都是 `CREATE TABLE IF NOT EXISTS`，
+对已存在的表什么都不做。因此 `init_db()` 里挂了一个幂等迁移
+（`db.ensure_period_columns()`）：按 `config.PERIODS` 缺哪列补哪列，并重建
+`rps_daily` 的覆盖索引（`CREATE INDEX IF NOT EXISTS` 不会更新同名旧索引，必须
+先 drop），**只做 `ALTER TABLE ADD COLUMN`，不重建表、不动数据**。实测 1.45 GB 的库
+**7 秒**完成。
+
+```powershell
+.venv\Scripts\python.exe -m rpsboard.cli init                  # 补列 + 重建索引，会打印新增了哪些列
+.venv\Scripts\python.exe -m rpsboard.cli compute-rps --full     # 给新列填值（必须全量，增量只补新交易日）
+.venv\Scripts\python.exe -m rpsboard.cli concept --compute-only --full   # 概念表同理
+```
+
+跑之前在迁移/重算前**停掉 8000 端口上的服务**：API 持有只读连接，迁移时容易被
+`database is locked` 挡住。
+
 ## RPS 计算口径
 
 ```
@@ -105,6 +140,7 @@ rps_N(t) = ret_N 在 t 日全部有效股票中的百分位排名 × 100     # �
   （15 日周期是其中门槛最低的一档：上市满 16 个交易日的股票就会**首次进榜**，
   此前四周期全为 NaN 被丢弃）
 - **停牌不参与排名**，价格用前值填充
+  （注意数据源把**长假后第一个交易日**整日标成停牌 → 那 21 天没有 RPS，见「未完成项」）
 - **ST 默认剔除**，可在界面放开
 
 ### 无未来函数
@@ -244,6 +280,10 @@ RPS        3,937,515 行（15/20/60/120/250 五周期，851 个交易日）
 - 因此正确结论是：**60 日 RPS 在 20 日持有期上表现为反转，不宜单独作为买入信号**，
   而不是「RPS 无效」。想复现欧奈尔的思路，应改用 RPS250 窗口、
   加入市场择时（如仅在指数站上均线时开仓）与基本面过滤。
+
+> 本节数字在四周期（20/60/120/250）口径下测得。2026-10-13 加入 15 日周期**不需要重测**：
+> 周期百分位是按列独立算的，`rps20/60/120/250` 的取值逐值不变（见「数据规模」的比对），
+> 而共振之外的判定只用到所选那一列。
 
 **多周期共振口径**：回测页勾选「多周期共振」后，入池条件是「除所选周期外的
 **全部**周期同时 ≥ 阈值」。周期清单直接取自 `config.PERIODS`，因此 **15 日短线
@@ -403,8 +443,8 @@ cd frontend; npm run lint; npm run build             # 前端 lint + 构建
 全部测试离线运行，使用合成数据，不触网。
 
 - **覆盖率**：`pytest` 默认带 `--cov=rpsboard --cov-report=term-missing`；**门槛
-  `--cov-fail-under=50` 只写在 CI 命令里**（全套实测 TOTAL **54%**，按实测值向下取整）——
-  放进 `addopts` 会让「只跑一个测试文件」也因总覆盖率不足而失败。`cli.py` 与
+  `--cov-fail-under=50` 只写在 CI 命令里**（全套 **166 项测试、实测 TOTAL 57%**，门槛按实测值
+  向下取整）——放进 `addopts` 会让「只跑一个测试文件」也因总覆盖率不足而失败。`cli.py` 与
   `sources/*` 目前接近零覆盖，门槛按实测值设，不虚设高线。
 - **lint**：ruff（`select = E,F,W,I,UP,B`，`ignore` 里三条都在 pyproject 注明理由）；
   一次性调研脚本（`probe_*` / `debug_*` / `diag_*` / `verify_*`）用
@@ -454,9 +494,12 @@ node backend/tests/build_sort_check.mjs
 判断办法是看后端 access log——如果 `/api/...` 全都返回 200，
 说明请求已正常往返，卡的是浏览器侧。用自己的 Chrome / Edge 打开即可。
 
-## 性能基线（本机实测，2026-10-12）
+## 性能基线（本机实测）
 
-427 万行日K / 401 万行 RPS / 5573 只股票 / 83 个行业。
+428 万行日K / 394 万行 RPS / 5574 只股票 / 83 个行业。
+
+> 下面的耗时是四周期（20/60/120/250）时代（2026-10-12）的基线。2026-10-13 加入
+> 15 日周期后**全量重算**从 67 s 涨到 **124 s / 149 s**（两次实测），见「compute-rps」一节的注。
 
 ### compute-rps
 
@@ -473,8 +516,22 @@ node backend/tests/build_sort_check.mjs
 ```
 
 > 增量路径只补「晚于最后一个已算出的交易日」的日子。某个日期算不出任何行时
-> （如当天 K 线只有 13 只股票、都不足 21 根前置 K 线）不会推进水位线，因此
-> 数据不全的新交易日会在次日自动重试。**中间出现真正的空洞增量补不上，用 `--full`。**
+> （如窗口起点那几天只有 1 只股票、都不足 16 根前置 K 线，或长假后首日全市场被标成
+> 停牌）不会推进水位线，因此数据不全的新交易日会在次日自动重试。
+> **中间出现真正的空洞增量补不上，用 `--full`。**
+
+**15 日周期加入后的全量重算（2026-10-13 实测两次：124 s / 149 s）**，`cProfile`
+显示代价几乎全在写库，不在算周期：
+
+| 阶段 | 耗时 |
+|---|---|
+| `executemany` 写入 394 万行（`to_sql` 合计） | **91.0 s**（98.7 s） |
+| 读 daily_bar（`fetchall`）+ commit | 7.5 s + 4.3 s |
+| 周期数学：`rank`（百分位）+ 转 DataFrame | ~3 s |
+
+多一个周期的数学成本只有约 2 秒；真正变慢的是**每行多两列、覆盖索引每行多一项维护**。
+上表其余数字都是四周期（2026-10-12）时代的，做性能对比时注意口径 —— 15 日周期后
+只重测了全量重算。
 
 ### 接口耗时（直接调用处理函数，剔除 ASGI 开销）
 
@@ -541,7 +598,19 @@ curl -s http://127.0.0.1:8000/api/meta/perf      # 前后端耗时快照
   （`analytics/patterns.py`）、排行榜的形态失效价（`api/rps.py` 的 `MIN(b.low)`）、
   个股页失效判定（`api/stock.py`）都在用；`volume` 被个股曲线用。
   继续瘦身只能走「历史裁剪」这类有损方案，本轮不动。
-- **F5**：自选股池与条件预警 —— 见「自选股池与条件预警」一节。
+- **P2 · 21 个交易日没有 RPS**（最早 2023-06-26；占「窗口起点之后、`daily_bar` 有行情」
+  的 872 个交易日里的 2.4%）：这批日期
+  `daily_bar` 里行情**是完整的**（5000+ 只、成交量与涨跌幅都正常），但数据源把**全市场
+  都标成 `tradestatus=0`（停牌）** —— 全库 113,268 行 `tradestatus=0` 里有 112,379 行
+  属于这 21 天，剩下只有 891 行是真正的个股停牌。共同规律是**长假后第一个交易日**
+  （国庆/春节/清明/劳动/端午/中秋/元旦之后那天的标记问题）。
+  而 RPS 的口径是「停牌不参与排名」（`analytics/matrix.py` 把 `tradestatus != 1`
+  掩成无效），于是这些日期算不出任何一行，`cli status` 把它们报成「缺口」，
+  `/api/meta/dates` 也就不包含它们（日期下拉里看不到）。
+  **不是抓取失败**，增量与 `--full` 都补不出来。修法是在建矩阵时把「全市场都标停牌、
+  但当日成交量正常」的日期翻转标记；本轮不做——它会改写这 21 天的历史名次，属于改口径，
+  要先单独验证。（另有 15 天窗口起点日期每天只有 1 只股票、不足 16 根前置 K 线，
+  同样算不出 RPS，见 `analytics/rps.py` 的 `pending_dates` 注释。）
 - **涨跌停历史覆盖**：接口 31~35 秒/天且服务端无缓存，全历史 887 天需 8 小时；
   目前靠 `cli price-limits --days N` 分批回补。**覆盖不足现在会明确报出来**：
   `cli status` 打印「涨跌停覆盖 <起> ~ <止>」，回测的 `warnings` 里给出
@@ -551,10 +620,10 @@ curl -s http://127.0.0.1:8000/api/meta/perf      # 前后端耗时快照
 
 ```
 backend/rpsboard/
-  config.py              周期、路径、数据源选择、涨跌停阈值、交易所判定
-  db.py                  SQLite schema 与幂等写入
-  cli.py                 init / status / backfill(=sync) / update / price-limits
-                         / concept / patterns / compute-rps / backtest
+  config.py              周期（PERIODS / period_columns）、路径、数据源选择、交易所判定
+  db.py                  SQLite schema、旧库迁移（ensure_period_columns）与幂等写入
+  cli.py                 init / status / backfill(=sync) / update / price-limits / concept
+                         / patterns / compute-rps / backtest / watch / alert / notify
   sources/
     tdxnet_src.py        【唯一数据源】eltdx 通达信协议，TCP 直连，209 秒全市场
     board_src.py         概念/题材板块清单与成分股
@@ -562,13 +631,19 @@ backend/rpsboard/
     base.py              SourceError 等公共定义
   analytics/
     matrix.py            daily_bar → 日期×股票 宽矩阵
-    rps.py               RPS 引擎 + 板块 RPS
-    backtest.py          横截面动量回测
+    rps.py               RPS 引擎 + 板块/概念 RPS
+    backtest.py          横截面动量回测（共振掩码 resonance_mask）
     costs.py             交易成本模型
     limits.py            涨跌停规则
+    alerts.py            预警规则评估
     patterns.py          三升底等形态
-  api/                   FastAPI 路由（只读 SQLite，不联网）+ perf.py 性能监测
-frontend/src/views/      Rankings / Sectors / StockDetail / Backtest
+  api/                   FastAPI 路由（除 watchlist.py 外只读 SQLite，不联网）+ perf.py 性能监测
+    watchlist.py         **全 API 唯一的写入口**（watchlist / alert_rule / alert_hit）
+frontend/src/
+  api/index.js           唯一网络出口（顺带计时上报）
+  views/                 Rankings / Sectors / StockDetail / Backtest / Watchlist
+  components/RpsTable.vue  排行榜表格（RPS 列随 period 参数变化）
+  composables/           usePeriods.js（周期清单唯一来源，模块级缓存）/ useResizableColumns.js
 start.bat / update.bat   Windows 一键启动 / 更新
 start.sh  / update.sh    Linux / macOS 一键启动 / 更新
 ```
@@ -631,6 +706,28 @@ POST `title`/`content` 到你的专属地址，消息进微信）。**只手动�
   `alert run` 与 `cli update` 照常完成。
 - `.env.local` 由 `backend/rpsboard/config.py` 在导入时读取（已存在的环境变量优先），
   其它 `RPSBOARD_*` 变量也可以放这个文件里。
+
+## 接口一览
+
+全部挂在 FastAPI 上，`http://127.0.0.1:8000/docs` 有可调试的 Swagger。除
+`/api/watchlist*`、`/api/alerts/rules*`（`api/watchlist.py`）与 `/api/admin/update`
+（触发后台采集）外都是**只读**。
+
+| 端点 | 说明 |
+|---|---|
+| `GET /api/meta/status` | 数据状态：行数、最后交易日、周期清单、未分类股票数 |
+| `GET /api/meta/dates` · `/industries` · `/periods` | 可选交易日 / 行业清单 / 周期清单（前端周期按钮的唯一来源） |
+| `GET /api/meta/perf` · `POST /api/meta/perf/client` | 前后端耗时快照 / 前端批量上报 |
+| `GET /api/rps/ranking` | 排行榜：`period`、`rps_min`/`rps_max`、`industries`、`exclude_st`、`min_amount`、`sort`、`delta_days`、`sanxingdi`、`page`/`limit` |
+| `GET /api/rps/ranking/export` | 同一组筛选条件的**全量 CSV** |
+| `GET /api/rps/sector` · `/heatmap` | 行业排行+领涨股 / 行业 × 周期矩阵 |
+| `GET /api/rps/concepts` · `/concept-ranking` · `/concept-heatmap` | 概念口径的同三件套 |
+| `GET /api/stock/{symbol}` | 个股详情：多周期 RPS、全市场分位、所属行业 RPS |
+| `GET /api/stock/{symbol}/curve` · `/patterns` | 多周期曲线 + 后复权价 / 三升底历史 |
+| `GET /api/backtest/run` | 回测：`period`、`threshold`、`hold`、`resonance`、`market_filter`、涨跌停与成本开关 |
+| `POST /api/admin/update` · `GET /api/admin/update/status` | 页面「更新数据」：后台线程 + 轮询阶段 |
+| `GET/POST/DELETE /api/watchlist[/{symbol}]` | 自选股（写库） |
+| `GET/POST/DELETE /api/alerts/rules[/{id}]`、`GET /api/alerts/hits`、`/kinds` | 预警规则与命中（写库） |
 
 ## 许可证
 
