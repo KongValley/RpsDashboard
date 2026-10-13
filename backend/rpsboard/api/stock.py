@@ -131,6 +131,9 @@ def patterns(symbol: str, days: int = 250) -> dict:
 @router.get("/{symbol}/curve")
 def curve(symbol: str, days: int = 250) -> dict:
     """RPS 多周期曲线 + 后复权价格 + 涨跌幅（日期轴严格对齐）。"""
+    # 夹紧：days=-1 时 SQLite 的 LIMIT -1 表示「无上限」，一次会把该股全部历史
+    # 拉出来（同文件 patterns() 已经有同样的保护）
+    days = max(1, min(int(days), 2000))
     conn = db.connect()
     try:
         df = read_sql(

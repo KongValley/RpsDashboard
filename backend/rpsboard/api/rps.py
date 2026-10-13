@@ -42,6 +42,16 @@ _NULLABLE_SORTS = {"pct_chg", "amount", "close"}
 #: 三升底筛选可选窗口（交易日）。0 = 不筛选。
 SANXINGDI_WINDOWS = (1, 5, 10, 20)
 
+#: 行业过滤最多接受多少个名字。行业名会展开成 SQL 的 IN (?,?,…)，SQLite 的
+#: 变量上限是 999；超过就截断而不是让请求 500。
+MAX_INDUSTRY_FILTER = 200
+
+
+def _clamp_rps_range(rps_min: float, rps_max: float) -> tuple[float, float]:
+    """把 RPS 区间归一化到 [0, 100] 且 min ≤ max（传反了就交换）。"""
+    lo, hi = sorted((float(rps_min), float(rps_max)))
+    return max(0.0, min(lo, 100.0)), min(100.0, max(hi, 0.0))
+
 
 def _patterns_ready(conn) -> bool:
     """pattern_daily 是否已经算过。表不存在或为空都算没算好。
@@ -330,6 +340,8 @@ def ranking(
             period = config.DEFAULT_PERIOD
         if sanxingdi and sanxingdi not in SANXINGDI_WINDOWS:
             sanxingdi = 0
+        # 归一化 RPS 区间：min > max 时原来会静默返回空结果，用户以为「今天没有强势股」
+        rps_min, rps_max = _clamp_rps_range(rps_min, rps_max)
         # 单页上限保护：不设限时 limit=100000 会把全市场一次性返回
         limit = max(1, min(int(limit), MAX_PAGE_LIMIT))
         page = max(1, int(page))
@@ -342,6 +354,7 @@ def ranking(
         # 拿到的仍是 Query 对象，这里做一次归一化。
         industries = industries if isinstance(industries, str) else None
         names_filter = [x.strip() for x in (industries or "").split(",") if x.strip()]
+        names_filter = names_filter[:MAX_INDUSTRY_FILTER]
         heavy_filter = bool(names_filter) or min_amount > 0
         if heavy_filter:
             df, total_n = _ranking_filtered(
@@ -406,6 +419,9 @@ def ranking_export(
     exclude_st: bool = True,
     min_amount: float = 0.0,
     sort: str = "rps",
+    sanxingdi: int = Query(
+        0, description="三升底筛选窗口（交易日）：0 不筛选，可选 1/5/10/20",
+    ),
 ) -> StreamingResponse:
     """按当前筛选条件导出**全量** CSV。
 
@@ -415,22 +431,27 @@ def ranking_export(
     industries = industries if isinstance(industries, str) else None
     if period not in config.PERIODS:
         period = config.DEFAULT_PERIOD
+    if sanxingdi and sanxingdi not in SANXINGDI_WINDOWS:
+        sanxingdi = 0
+    rps_min, rps_max = _clamp_rps_range(rps_min, rps_max)
     conn = db.connect()
     try:
         d = resolve_date(conn, date)
         if not d:
             return StreamingResponse(iter([_csv_bytes([], None)], ), media_type="text/csv")
         names_filter = [x.strip() for x in (industries or "").split(",") if x.strip()]
+        names_filter = names_filter[:MAX_INDUSTRY_FILTER]
         # 导出没有分页，limit 用一个足够大的值；单次上限 200000 防止误用
         limit = 200_000
         if names_filter or min_amount > 0:
             df, _ = _ranking_filtered(
                 conn, d, period, sort, rps_min, rps_max,
-                exclude_st, industries, min_amount, limit, 1,
+                exclude_st, industries, min_amount, limit, 1, sanxingdi,
             )
         else:
             df, _ = _ranking_fast(
                 conn, d, period, sort, rps_min, rps_max, exclude_st, limit, 1,
+                sanxingdi,
             )
         if not df.empty:
             ranks = market_ranks(conn, d, period)

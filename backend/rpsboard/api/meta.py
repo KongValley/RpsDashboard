@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 
 from .. import config, db
 from . import latest_bar_date, read_sql
@@ -50,8 +50,12 @@ def status() -> dict:
 
 
 @router.get("/dates")
-def dates(limit: int = 400) -> list[str]:
-    """可用交易日（倒序）。"""
+def dates(limit: int = Query(2000, ge=1, le=5000)) -> list[str]:
+    """可用交易日（倒序）。
+
+    默认 2000 覆盖全部 rps 历史（当前约 1000 天）；原来的 400 会把日期下拉
+    截断，用户选不到更早的交易日。limit=-1 会被 Query 的 ge=1 直接拒掉。
+    """
     conn = db.connect()
     try:
         df = read_sql(

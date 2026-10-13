@@ -7,17 +7,18 @@ import { CanvasRenderer } from 'echarts/renderers'
 import { LineChart, BarChart, HeatmapChart, ScatterChart } from 'echarts/charts'
 import {
   GridComponent, TooltipComponent, LegendComponent, DataZoomComponent,
-  TitleComponent, MarkLineComponent, VisualMapComponent,
+  TitleComponent, MarkLineComponent, MarkAreaComponent, VisualMapComponent,
 } from 'echarts/components'
 
 import App from './App.vue'
 import './style.css'
 import { install as installPerf } from './perf'
 
-// heatmap 的着色依赖 VisualMapComponent，必须显式注册
+// heatmap 的着色依赖 VisualMapComponent，必须显式注册；
+// Backtest 的空仓区间底色依赖 MarkAreaComponent（漏注册时不会报错，只是不渲染）
 use([CanvasRenderer, LineChart, BarChart, HeatmapChart, ScatterChart,
   GridComponent, TooltipComponent, LegendComponent, DataZoomComponent,
-  TitleComponent, MarkLineComponent, VisualMapComponent])
+  TitleComponent, MarkLineComponent, MarkAreaComponent, VisualMapComponent])
 
 echarts.registerTheme('dark', {
   backgroundColor: 'transparent',

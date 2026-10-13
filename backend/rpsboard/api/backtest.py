@@ -32,6 +32,11 @@ def _cache_token(conn) -> str:
     return str(row["d"]) if row and row["d"] else ""
 
 
+#: 允许的基准指数。给了白名单外的字符串时 benchmark_bar 查不到 → 基准线全空
+#: 且无提示，因此与 market_filter 一样做白名单回落。
+BENCHMARKS = ("000300", "000001", "399001")
+
+
 @router.get("/backtest/run")
 def run(
     period: int = config.DEFAULT_PERIOD,
@@ -57,6 +62,11 @@ def run(
     threshold = max(0.0, min(float(threshold), 100.0))
     if market_filter not in engine.MARKET_FILTERS:
         market_filter = "none"
+    if benchmark not in BENCHMARKS:
+        benchmark = "000300"
+    # 负数会算出「未来」的起始日 → 空窗口 + 空曲线，静默返回没有意义的结果
+    if lookback_days is not None:
+        lookback_days = max(1, min(int(lookback_days), 2000))
 
     key = (
         period, round(threshold, 4), hold, rebalance, resonance,
@@ -167,6 +177,9 @@ def update_status() -> dict:
     conn = db.connect()
     try:
         last = db.last_log(conn)
+        # 必须复用同一个连接：原来写成 latest_bar_date(db.connect())，
+        # 每轮询一次就漏一个连接（前端 3 秒一次）。
+        last_bar = latest_bar_date(conn)
     finally:
         conn.close()
     return {
@@ -177,6 +190,6 @@ def update_status() -> dict:
         "started_at": _update_state["started_at"],
         "finished_at": _update_state["finished_at"],
         "elapsed": _update_state.get("elapsed"),
-        "last_bar_date": latest_bar_date(db.connect()),
+        "last_bar_date": last_bar,
         "last_collect_log": last,
     }

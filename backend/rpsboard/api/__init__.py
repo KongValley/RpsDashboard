@@ -154,7 +154,7 @@ def _mount_frontend(app: FastAPI) -> None:
     from fastapi.responses import FileResponse
     from fastapi.staticfiles import StaticFiles
 
-    dist = Path(__file__).resolve().parents[3] / "frontend" / "dist"
+    dist = (Path(__file__).resolve().parents[3] / "frontend" / "dist").resolve()
     index = dist / "index.html"
     if not index.is_file():
         # 新人 clone 下来直接跑 uvicorn 时，/ 会是 404；把原因和两条出路直接说出来
@@ -172,9 +172,11 @@ def _mount_frontend(app: FastAPI) -> None:
 
     @app.get("/{path:path}", include_in_schema=False)
     def _spa(path: str) -> FileResponse:
-        # 静态资源直接命中；其余路径一律回落到 index.html 交给 vue-router
-        candidate = dist / path
-        if candidate.is_file():
+        # 静态资源直接命中；其余路径一律回落到 index.html 交给 vue-router。
+        # **必须**校验归一化后仍落在 dist 内：`Path(dist) / "/C:/Windows/win.ini"`
+        # 会直接替换掉前缀、`../../.git/config` 会往上走，实测两者都能读到真实文件。
+        candidate = (dist / path).resolve()
+        if candidate.is_file() and candidate.is_relative_to(dist):
             return FileResponse(str(candidate))
         return FileResponse(str(index))
 

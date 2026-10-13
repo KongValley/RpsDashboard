@@ -200,6 +200,8 @@ async function exportCsv() {
       exclude_st: excludeSt.value,
       min_amount: minAmount.value || undefined,
       sort: 'rps',
+      // 形态筛选必须一起传：否则用户开着「三升底」点导出，拿到的是未过滤的文件
+      sanxingdi: sanxingdi.value || undefined,
     }, `rps${period.value}_${dataDate.value || 'latest'}.csv`)
   } catch (e) {
     alert(`导出失败：${e.message}`)
