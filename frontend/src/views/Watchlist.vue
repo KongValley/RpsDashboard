@@ -16,8 +16,7 @@
         <thead>
           <tr>
             <th>代码</th><th>名称</th><th>行业</th>
-            <th class="num">RPS20</th><th class="num">RPS60</th>
-            <th class="num">RPS120</th><th class="num">RPS250</th>
+            <th v-for="p in periods" :key="p" class="num">RPS{{ p }}</th>
             <th>备注</th><th></th>
           </tr>
         </thead>
@@ -26,10 +25,7 @@
             <td class="mono">{{ r.symbol }}</td>
             <td><span v-if="r.is_st" class="badge st">ST</span>{{ r.name || '—' }}</td>
             <td class="muted">{{ r.industry || '未分类' }}</td>
-            <td class="num">{{ num(r.rps20) }}</td>
-            <td class="num">{{ num(r.rps60) }}</td>
-            <td class="num">{{ num(r.rps120) }}</td>
-            <td class="num">{{ num(r.rps250) }}</td>
+            <td class="num" v-for="p in periods" :key="p">{{ num(r[`rps${p}`]) }}</td>
             <td class="muted">{{ r.note || '' }}</td>
             <td>
               <button class="btn" @click.stop="remove(r.symbol)">移除</button>
@@ -99,17 +95,20 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { watchApi, alertApi } from '../api'
+import { usePeriods } from '../composables/usePeriods'
 
 const router = useRouter()
+const { periods, error: periodsError } = usePeriods()
 const items = ref([])
 const rules = ref([])
 const hits = ref([])
 const hitDate = ref(null)
 const kinds = ref([])
 const errMsg = ref('')
+watch(periodsError, (v) => { if (v) errMsg.value = v }, { immediate: true })
 const newRule = ref({ name: '', kind: 'rps_threshold', params: '{"period":60,"min":90,"max":100}' })
 
 const num = (v) => (v == null ? '—' : Number(v).toFixed(0))

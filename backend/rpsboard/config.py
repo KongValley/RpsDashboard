@@ -51,9 +51,17 @@ DOWNLOAD_DIR = Path(os.environ.get("RPSBOARD_DOWNLOAD_DIR", ROOT_DIR / "download
 os.environ.setdefault("ELTDX_BOARD_DATA_DIR", str(DOWNLOAD_DIR))
 
 # ── RPS 周期 ────────────────────────────────────────────────────────
-# 欧奈尔原始定义为 250 日（52 周），国内实操常用 20/60/120
-PERIODS: tuple[int, ...] = (20, 60, 120, 250)
+# 欧奈尔原始定义为 250 日（52 周），国内实操常用 20/60/120；15 = 3 周短线。
+# **必须升序**：compute_industry_rps 的 member_count 取「最后一个命中周期」的
+# 成分数（见 analytics/rps.py），250 必须留在末尾；顺序变了口径就变了。
+PERIODS: tuple[int, ...] = (15, 20, 60, 120, 250)
 DEFAULT_PERIOD = 60
+
+
+def period_columns(prefix: str = "rps") -> list[str]:
+    """按 PERIODS 生成列名，例如 period_columns() -> ['rps15', ..., 'rps250']。"""
+    return [f"{prefix}{p}" for p in PERIODS]
+
 
 # ── 性能监测 ────────────────────────────────────────────────────────
 #: 性能日志目录（logs/perf.jsonl，见 api/perf.py）。要留 uvicorn 的 stdout/stderr

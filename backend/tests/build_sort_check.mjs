@@ -1,11 +1,11 @@
 /**
- * 生成「热力图按 20/60/120/250 各周期独立排序」的静态验证页。
+ * 生成「热力图按各周期（15/20/60/120/250）独立排序」的静态验证页。
  *
  * 为什么要单独生成：应用页面靠 fetch 拉数据再赋值，而当前这个内置浏览器
  * （FilePanel / Electron）在页面加载完成后会冻结渲染进程 —— 定时器、
  * Promise 回调、点击事件都不再执行，只有「加载期同步渲染」还能工作。
  * 所以把真实接口数据直接内联进 HTML，用与 Sectors.vue 完全相同的
- * option 构造逻辑同步渲染，四个周期各出一张图，用来肉眼验证排序。
+ * option 构造逻辑同步渲染，每个周期各出一张图，用来肉眼验证排序。
  *
  * 产物自包含（echarts 也内联），双击即可在任意浏览器打开。
  *
@@ -17,7 +17,8 @@ import { fileURLToPath } from 'node:url'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
 const API = process.env.RPS_API ?? 'http://127.0.0.1:8000'
-const PERIODS = [20, 60, 120, 250]
+// 与 config.PERIODS 一致：周期清单的唯一真源在后端，这里是静态页的副本
+const PERIODS = [15, 20, 60, 120, 250]
 const TOP_N = 26
 /** 板块强弱页的行高与 Sectors.vue 的 chartHeight 公式保持一致 */
 const ROW_H = 19
@@ -62,16 +63,17 @@ function sortedBy(p) {
   })
 }
 
-/** 校验：四个周期必须给出四种不同的次序，否则说明排序没生效 */
+/** 校验：每个周期必须给出互不相同的次序，否则说明排序没生效 */
 const orders = PERIODS.map((p) => sortedBy(p).map((r) => r.industry))
 const distinct = new Set(orders.map((o) => o.join('|'))).size
 console.log(`行业数 ${matrix.length}，数据日期 ${payload.data_date}`)
-console.log(`四个周期产生 ${distinct} 种不同排序${distinct === 4 ? '（符合预期）' : '（异常！）'}`)
+console.log(`${PERIODS.length} 个周期产生 ${distinct} 种不同排序`
+  + `${distinct === PERIODS.length ? '（符合预期）' : '（异常！）'}`)
 for (let i = 0; i < PERIODS.length; i += 1) {
   const p = PERIODS[i]
   console.log(`  RPS${p} 前 5：${orders[i].slice(0, 5).map(shortName).join(' / ')}`)
 }
-if (distinct !== 4) process.exit(1)
+if (distinct !== PERIODS.length) process.exit(1)
 
 /** 与 Sectors.vue 的 heatmapOption 完全同构，只是数据内联 */
 function chartOption(p, rows) {
@@ -79,8 +81,8 @@ function chartOption(p, rows) {
   const cols = PERIODS.map((x) => `RPS${x}`)
   const data = []
   rows.forEach((r, y) => {
-    // 注意：x 必须是**类别索引**（0~3），不能拿周期值 20/60/120/250 当索引。
-    // x 轴 data 是 ['RPS20','RPS60','RPS120','RPS250']，只认 0~3；
+    // 注意：x 必须是**类别索引**（0~PERIODS.length-1），不能拿周期值当索引。
+    // x 轴 data 是 ['RPS15','RPS20','RPS60','RPS120','RPS250']，只认这些下标；
     // 一旦写成周期值，所有格子都会越界、一个都画不出来。
     PERIODS.forEach((p, x) => {
       const v = r[`rps${p}`]
@@ -159,7 +161,7 @@ function page(p) {
     数据日期 <b>${payload.data_date}</b> ·
     共 <b>${matrix.length}</b> 个证监会行业，展示按 RPS${p} 排名前 <b>${TOP_N}</b> 名 ·
     榜首 <b>${first}</b>，末位 <b>${last}</b> ·
-    四个周期各自独立排序（RPS20 与 RPS250 名次几乎不相关）
+    各周期各自独立排序（RPS15 与 RPS250 名次几乎不相关）
   </div>
   <div id="c"></div>
   <div class="foot">蓝色 ↓ 标记的列即当前排序依据；同一行业在不同周期下的名次会大幅变化，这正是分周期维护强弱的意义。</div>

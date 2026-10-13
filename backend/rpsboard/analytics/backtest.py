@@ -1,7 +1,7 @@
 """RPS 策略回测：横截面动量。
 
 信号定义：调仓日 T 满足 rps_N(T) >= threshold 的股票等权入池，持有 H 个交易日。
-可选多周期共振（rps20 & rps60 & rps120 同时达标）。
+可选多周期共振（除所选周期外的**全部**周期同时达标，见 resonance_mask）。
 
 **无未来函数**的保证：
 - rps_N(T) 只用 ≤ T 的收盘价（shift(N) 结构）。
@@ -196,8 +196,8 @@ _frames_cache: dict[tuple, dict] = {}
 def get_frames(ctx: dict, exclude_st: bool = True) -> dict:
     """取 RPS 各周期帧（同样进程内缓存）。
 
-    compute_rps_frames 一次算出 4 个周期的 ret+rps 共 8 个矩阵，约 3 秒；
-    缓存后切换周期/阈值就不用重算。
+    compute_rps_frames 一次算出全部周期的 ret+rps 共 2×len(config.PERIODS) 个矩阵，
+    约 3 秒；缓存后切换周期/阈值就不用重算。
     """
     from .rps import compute_rps_frames
 
@@ -209,6 +209,29 @@ def get_frames(ctx: dict, exclude_st: bool = True) -> dict:
         )
         _frames_cache[key] = hit
     return hit
+
+
+def resonance_mask(
+    frames: dict[str, pd.DataFrame],
+    period: int,
+    threshold: float,
+    periods: tuple[int, ...] = config.PERIODS,
+) -> pd.DataFrame:
+    """多周期共振掩码：除 `period` 外的**全部**周期同时 ≥ threshold。
+
+    口径固定为「其余所有周期」而不是写死 20/60/120 —— 往 config.PERIODS 里加周期
+    （例如 15 日短线）会自动进共振，不需要在这里补一行。
+
+    起始项固定取最短周期那一列：所选周期恰好是最短周期（15）时，它会被一并要求。
+    这是改造前的既有行为（起始项与循环跳过合并的效果），这里刻意保持不变，
+    以免静默改变已有回测结论。
+    """
+    mask = frames[f"rps{min(periods)}"] >= threshold
+    for p in periods:
+        if p == period:
+            continue
+        mask = mask & (frames[f"rps{p}"] >= threshold)
+    return mask
 
 
 def run_backtest(
@@ -269,13 +292,7 @@ def run_backtest(
     frames = get_frames(ctx, exclude_st)
     rps_main = frames[f"rps{period}"]
     if resonance:
-        # 多周期共振：20/60/120 同时 ≥ threshold
-        base = frames[f"rps{min(config.PERIODS)}"] >= threshold
-        mask = base
-        for p in config.PERIODS:
-            if p == period:
-                continue
-            mask &= frames[f"rps{p}"] >= threshold
+        mask = resonance_mask(frames, period, threshold)
     else:
         mask = rps_main >= threshold
 

@@ -138,21 +138,28 @@
 import { ref, computed, onMounted, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { stockApi } from '../api'
+import { usePeriods } from '../composables/usePeriods'
 
 const route = useRoute()
-const periods = [20, 60, 120, 250]
+const { periods, error: periodsError } = usePeriods()
 const symbol = computed(() => route.params.symbol)
 
 const info = ref(null)
 const cur = ref({})
 const pct = ref({})
 const industryRps = ref(null)
-const curve = ref({ dates: [], close: [], rps20: [], rps60: [], rps120: [], rps250: [] })
+// 只给日期轴/价格的骨架：各周期数组由接口返回时补进来（键名 rps{p}）
+const curve = ref({ dates: [], close: [] })
 const pattern = ref(null)
 const days = ref(250)
+/** RPS 曲线配色（按系列下标取用，周期数增减都不改写法） */
+const RPS_COLORS = ['#4c9aff', '#f6465d', '#f0a020', '#2ebd85', '#b06cf0', '#38bdf8']
+/** 代表中期强弱的周期：加粗 + 画 80/90 参考线（按周期值判断，不看下标） */
+const EMPHASIS_PERIOD = 60
 const dataDate = ref(null)
 /** 接口错误提示：失败不能再伪装成「形态数据尚未计算」 */
 const errMsg = ref('')
+watch(periodsError, (v) => { if (v) errMsg.value = v }, { immediate: true })
 
 async function loadDetail() {
   try {
@@ -214,7 +221,7 @@ const curveOption = computed(() => {
   const dates = c.dates || []
   return {
     tooltip: { trigger: 'axis' },
-    legend: { data: ['收盘价(后复权)', 'RPS20', 'RPS60', 'RPS120', 'RPS250'],
+    legend: { data: ['收盘价(后复权)', ...periods.value.map((p) => `RPS${p}`)],
       textStyle: { color: '#8b98a9' }, top: 0 },
     grid: [
       { left: 60, right: 60, top: 34, height: '38%' },
@@ -234,19 +241,24 @@ const curveOption = computed(() => {
         splitLine: { lineStyle: { color: 'rgba(42,50,61,.6)' } } },
     ],
     series: [
-      ...periods.map((p, i) => ({
-        name: `RPS${p}`, type: 'line', xAxisIndex: 0, yAxisIndex: 0,
-        data: c[`rps${p}`] || [], showSymbol: false,
-        lineStyle: { width: i === 1 ? 2.2 : 1.1,
-          color: ['#4c9aff', '#f6465d', '#f0a020', '#2ebd85'][i] },
-        itemStyle: { color: ['#4c9aff', '#f6465d', '#f0a020', '#2ebd85'][i] },
-        markLine: i === 1 ? {
-          silent: true, symbol: 'none',
-          data: [{ yAxis: 80 }, { yAxis: 90 }],
-          lineStyle: { color: '#f6465d', type: 'dashed', width: 1, opacity: .5 },
-          label: { formatter: '{c}', color: '#8b98a9', fontSize: 10 },
-        } : undefined,
-      })),
+      ...periods.value.map((p, i) => {
+        // 配色按**系列下标**取，周期增删不改写法；加粗与 markLine 必须按
+        // **周期值**判断——写死 `i === 1` 在 15 日插到最前之后指的是 20 日。
+        const color = RPS_COLORS[i % RPS_COLORS.length]
+        const emphasis = p === EMPHASIS_PERIOD
+        return {
+          name: `RPS${p}`, type: 'line', xAxisIndex: 0, yAxisIndex: 0,
+          data: c[`rps${p}`] || [], showSymbol: false,
+          lineStyle: { width: emphasis ? 2.2 : 1.1, color },
+          itemStyle: { color },
+          markLine: emphasis ? {
+            silent: true, symbol: 'none',
+            data: [{ yAxis: 80 }, { yAxis: 90 }],
+            lineStyle: { color: '#f6465d', type: 'dashed', width: 1, opacity: .5 },
+            label: { formatter: '{c}', color: '#8b98a9', fontSize: 10 },
+          } : undefined,
+        }
+      }),
       {
         name: '收盘价(后复权)', type: 'line', xAxisIndex: 1, yAxisIndex: 1,
         data: c.close || [], showSymbol: false,

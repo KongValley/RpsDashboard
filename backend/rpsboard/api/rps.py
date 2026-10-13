@@ -550,8 +550,8 @@ def concept_heatmap(date: str | None = None) -> dict:
                     "matrix": [], "data_date": d}
         df = read_sql(
             conn,
-            "SELECT concept, rps20, rps60, rps120, rps250 FROM concept_rps_daily "
-            "WHERE date = ?",
+            "SELECT concept, " + ", ".join(config.period_columns())
+            + " FROM concept_rps_daily WHERE date = ?",
             (d,),
         )
         if df.empty:
@@ -562,7 +562,7 @@ def concept_heatmap(date: str | None = None) -> dict:
         return {
             "concepts": df["concept"].tolist(),
             "periods": list(config.PERIODS),
-            "matrix": jsonable(df[["concept", "rps20", "rps60", "rps120", "rps250"]]),
+            "matrix": jsonable(df[["concept", *config.period_columns()]]),
             "data_date": d,
         }
     finally:
@@ -603,8 +603,8 @@ def heatmap(date: str | None = None) -> dict:
                     "matrix": [], "data_date": None}
         df = read_sql(
             conn,
-            "SELECT industry, rps20, rps60, rps120, rps250 FROM industry_rps_daily"
-            " WHERE date = ?",
+            "SELECT industry, " + ", ".join(config.period_columns())
+            + " FROM industry_rps_daily WHERE date = ?",
             (d,),
         )
         if df.empty:
@@ -614,7 +614,7 @@ def heatmap(date: str | None = None) -> dict:
         return {
             "industries": df["industry"].tolist(),
             "periods": list(config.PERIODS),
-            "matrix": jsonable(df[["industry", "rps20", "rps60", "rps120", "rps250"]]),
+            "matrix": jsonable(df[["industry", *config.period_columns()]]),
             "data_date": d,
         }
     finally:

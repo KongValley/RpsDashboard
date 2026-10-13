@@ -14,8 +14,6 @@ from rpsboard.analytics.matrix import (
 
 from .fixtures import make_industry_map_zh, make_long
 
-PERIODS = (20, 60, 120, 250)
-
 
 def test_industry_return_is_equal_weight_mean():
     """行业收益 = 成分股收益的算术平均。"""
@@ -60,6 +58,10 @@ def test_industry_rps_ranking():
 
     for _date, grp in ind.groupby("date"):
         if len(grp) < 2:
+            continue
+        # 15 日周期让「上市 15~19 个交易日」的股票在那几天先进榜，此时 ret20 还全是
+        # NaN（idxmax 会直接抛 ValueError）。断言只针对有长周期数据的日期。
+        if grp["ret20"].isna().all():
             continue
         # 最强的行业，rps 必须显著高于均值
         best = grp.loc[grp["ret20"].idxmax()]

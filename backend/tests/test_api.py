@@ -155,6 +155,15 @@ def test_ranking_sort_by_amount(seeded):
     assert vals == sorted(vals, reverse=True)
 
 
+def test_ranking_shortest_period_has_values(seeded):
+    """新增的 15 日周期必须真的能用：接口接受 period=15 且名次有值。"""
+    client, *_ = seeded
+    body = client.get("/api/rps/ranking", params={"period": 15, "limit": 5}).json()
+    assert body["period"] == 15
+    assert body["total"] > 0
+    assert body["rows"][0]["rps"] == pytest.approx(100.0, abs=0.01)
+
+
 def test_ranking_invalid_period_falls_back(seeded):
     client, *_ = seeded
     r = client.get("/api/rps/ranking", params={"period": 999})

@@ -83,7 +83,10 @@
         <div class="muted note">
           策略：每 {{ result.params.rebalance }} 个交易日调仓，持有当日 RPS{{ result.params.period }} ≥
           {{ result.params.threshold }} 的股票，等权持仓。
-          <span v-if="result.params.resonance">（已开启多周期共振，要求 20/60/120 日同时达标）</span>
+          <span v-if="result.params.resonance">
+            （已开启多周期共振，要求
+            {{ periods.filter((p) => p !== result.params.period).join('/') }} 日同时达标）
+          </span>
           <span v-if="result.params.cost && result.params.cost.enabled">
             <br />已计入交易成本：单次调仓往返约
             {{ (result.params.cost.round_trip_after * 100).toFixed(3) }}%
@@ -139,11 +142,12 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import { backtestApi } from '../api'
+import { DEFAULT_PERIOD, usePeriods } from '../composables/usePeriods'
 
-const periods = [20, 60, 120, 250]
-const period = ref(60)
+const { periods, error: periodsError } = usePeriods()
+const period = ref(DEFAULT_PERIOD)
 const threshold = ref(80)
 const hold = ref(20)
 const excludeSt = ref(true)
@@ -154,6 +158,7 @@ const useCost = ref(true)
 const loading = ref(false)
 const result = ref(null)
 const warnings = ref([])
+watch(periodsError, (v) => { if (v) warnings.value = [...warnings.value, v] })
 
 /**
  * 大盘择时。欧奈尔的原方法是**只在强势市场做多**，而纯价格 RPS 回测

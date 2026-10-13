@@ -9,6 +9,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import pytest
+from rpsboard import config
 from rpsboard.analytics import rps
 from rpsboard.analytics.matrix import (
     build_close_matrix,
@@ -18,7 +19,8 @@ from rpsboard.analytics.matrix import (
 
 from .fixtures import make_long, perturb_after
 
-PERIODS = (20, 60, 120, 250)
+# 周期真源在 config.PERIODS（本文件不再另抄一份清单）
+PERIODS = config.PERIODS
 
 
 def build_frames(df: pd.DataFrame, **kw):
@@ -229,3 +231,32 @@ def test_suspect_gaps_finds_interior_hole():
     gaps = rps.suspect_gaps(conn)
     assert gaps == [hole], f"应只报中间那一天，实际 {gaps[:5]}"
     conn.close()
+
+
+def test_short_history_stock_enters_board_via_rps15(tmp_path):
+    """上市只有 16 个交易日的股票：以前四个周期全 NaN、被 dropna 丢弃，
+    现在 rps15 有值 → 首次进榜（新增 15 日周期带来的可见副作用）。
+    """
+    import sqlite3
+
+    from rpsboard import db as dbmod
+
+    df = make_long(n_symbols=10, n_days=120, seed=9, listed_bars={"000009": 16})
+    conn = sqlite3.connect(str(tmp_path / "mat.db"))
+    conn.row_factory = sqlite3.Row
+    conn.executescript(dbmod.SCHEMA)
+    try:
+        close = build_close_matrix(df)
+        ind = pd.Series({s: "行业A" for s in sorted(df["symbol"].unique())})
+        rps.materialize(
+            conn, close, build_tradable_matrix(df), build_st_flags(df), ind, None
+        )
+        row = conn.execute(
+            "SELECT rps15, rps20 FROM rps_daily WHERE symbol = '000009' "
+            "ORDER BY date DESC LIMIT 1"
+        ).fetchone()
+        assert row is not None, "16 根 K 线的股票应当进榜"
+        assert row["rps15"] is not None and not pd.isna(row["rps15"])
+        assert row["rps20"] is None, "20 日周期的前置 K 线还不够，不该有值"
+    finally:
+        conn.close()

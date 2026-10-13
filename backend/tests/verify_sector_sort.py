@@ -1,4 +1,4 @@
-"""验证四个周期的行业排序确实各自独立（用户需求：各维护强弱进行排序）。"""
+"""验证各周期的行业排序确实各自独立（用户需求：各维护强弱进行排序）。"""
 import sys, json, urllib.request
 
 BASE = "http://127.0.0.1:8000"
@@ -50,5 +50,5 @@ for p in periods[1:]:
 
 print("\n" + "=" * 70)
 distinct = len({tuple(o) for o in orders.values()})
-print(f"四个周期产生 {distinct} 种不同排序 → "
+print(f"{len(periods)} 个周期产生 {distinct} 种不同排序 → "
       f"{'各自独立排序，符合需求' if distinct == len(periods) else '存在重复排序，需检查'}")

@@ -13,6 +13,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import pytest
+from rpsboard import config
 from rpsboard.analytics import backtest, rps
 from rpsboard.analytics.matrix import (
     build_close_matrix,
@@ -22,7 +23,8 @@ from rpsboard.analytics.matrix import (
 
 from .fixtures import make_industry_map, make_industry_map_zh, make_long
 
-PERIODS = (20, 60, 120, 250)
+# 周期真源在 config.PERIODS：参照实现与新实现必须用同一份周期清单，否则比的是两回事
+PERIODS = config.PERIODS
 
 
 # ── 参照实现：改造前的原始代码，逐字保留 ──────────────────────────────

@@ -58,6 +58,21 @@ def compute_rps_frames(
     return out
 
 
+def _leader_frames(
+    frames: dict[str, pd.DataFrame], periods: tuple[int, ...]
+) -> pd.DataFrame | None:
+    """板块领涨股用的代表周期：优先 60 日（中期代表性最好），缺失时退到最长的周期。
+
+    刻意不用 `periods[0]`：最短周期现在是 3 周，用它选领涨股会在短线上频繁换人，
+    与「板块中期强弱」的语义不符。另注意不能用 `a or b` 挑 DataFrame——
+    DataFrame 的真值是未定义的，会抛 ValueError。
+    """
+    leader = frames.get("rps60")
+    if leader is None and periods:
+        leader = frames.get(f"rps{max(periods)}")
+    return leader
+
+
 def compute_industry_rps(
     frames: dict[str, pd.DataFrame],
     industries: pd.Series,
@@ -123,7 +138,8 @@ def compute_industry_rps(
 
     long = pd.concat(parts, axis=1)
     # member_count 沿用旧实现的**覆盖**语义：多个周期都命中同一 (date, industry) 时，
-    # 取最后一个命中周期的成分数（通常是周期最长的 250，样本最少）。
+    # 取**最后一个命中周期**的成分数（样本最少，即最长周期）。这是顺序敏感的口径：
+    # config.PERIODS 必须升序、250 留在末尾，否则 member_count 会静默变成最短周期的成分数。
     cnt_long = pd.concat(cparts, axis=1)
     long["member_count"] = cnt_long.ffill(axis=1).iloc[:, -1]
     # 只保留「至少一个周期有有效成分股」的组 —— 等价于旧实现里
@@ -205,9 +221,7 @@ def compute_concept_rps(
     mapping = load_concept_map(conn)
     if mapping.empty:
         return pd.DataFrame()
-    leader = frames.get("rps60")
-    if leader is None:
-        leader = frames.get(f"rps{periods[0]}")
+    leader = _leader_frames(frames, periods)
     df = compute_industry_rps(
         frames, mapping, leader_rps=leader, names=names, periods=periods
     )
@@ -225,8 +239,8 @@ def pending_dates(
     判据是「晚于目标表里**最后一个已算出的日期**」，而不是朴素的
     「daily_bar 里有、rps_daily 里没有」——后者会永远返回一批算不出结果的日期：
     实测 2023-05-04~09 这四天 daily_bar 有 13~14 只股票的 K 线，但它们当时都还没有
-    满 21 根前置 K 线，四个周期全为 NaN，落库时被 dropna 掉了，于是永远缺失。
-    区间起点之前的 2023-02-13~03-10 同理。
+    满 16 根前置 K 线（最短的 15 日周期门槛），各周期全为 NaN，落库时被 dropna
+    掉了，于是永远缺失。区间起点之前的 2023-02-13~03-10 同理。
 
     取「晚于 dmax」还有一个好处：新交易日如果当天只回补到少量股票（数据不全），
     这天算不出任何行、dmax 不推进，第二天会自动重试，直到算出为止。
@@ -253,7 +267,7 @@ def suspect_gaps(conn: sqlite3.Connection, min_symbols: int = 20) -> list[str]:
     """疑似缺口：daily_bar 里当天股票数 ≥ min_symbols、日期**晚于** rps_daily 首日，
     但 rps_daily 里一行都没有的交易日（升序）。
 
-    刻意不自动补：区间前那批日期（2023-02~05）本来是「前置 K 线不足、四个周期全
+    刻意不自动补：区间前那批日期（2023-02~05）本来是「前置 K 线不足、各周期全
     NaN」而被 dropna 掉的，永远补不出来（见 pending_dates 的说明）。这里只把
     中间真正的空洞报出来，补齐仍走 `compute-rps --full`。
     """
@@ -336,11 +350,8 @@ def materialize(
     rps_df = rps_df.dropna(subset=rps_cols, how="all")
     rps_df = rps_df.replace([np.inf, -np.inf], np.nan)
 
-    # 领涨股以 60 日周期为代表（中期代表性最好）；注意不能用 `a or b`——
-    # DataFrame 的真值是未定义的，会抛 ValueError。
-    leader = frames.get("rps60")
-    if leader is None:
-        leader = frames.get(f"rps{periods[0]}")
+    # 领涨股以 60 日周期为代表（中期代表性最好），见 _leader_frames
+    leader = _leader_frames(frames, periods)
     ind_df = compute_industry_rps(
         frames, industries, leader_rps=leader, names=names, periods=periods,
     )

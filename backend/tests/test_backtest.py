@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import pytest
+from rpsboard import config
 from rpsboard.analytics import backtest as bt
 from rpsboard.analytics.matrix import build_close_matrix
 
@@ -302,3 +303,29 @@ def test_run_backtest_empty_pool_not_crash(tmp_path):
     res = bt.run_backtest(conn, period=20, threshold=99.99, hold=20)
     conn.close()
     assert res.metrics["days"] >= 0
+
+
+# ── 多周期共振 ──────────────────────────────────────────────────────
+def test_resonance_mask_covers_every_other_period():
+    """共振口径 = 除所选周期外的**全部**周期同时达标（15 日也进共振）。"""
+    dates = pd.bdate_range("2024-01-01", periods=3)
+    syms = ["000001", "000002", "000003"]
+
+    def frame(values):
+        return pd.DataFrame([values] * len(dates), index=dates, columns=syms)
+
+    high = 90.0
+    frames = {f"rps{p}": frame([high, high, high]) for p in config.PERIODS}
+    frames["rps15"] = frame([high, high, 10.0])          # 000003 的 15 日不达标
+    frames["rps250"] = frame([10.0, high, high])          # 000001 的 250 日不达标
+
+    by_60 = bt.resonance_mask(frames, period=60, threshold=80)
+    assert bool(by_60.loc[dates[0], "000002"]) is True    # 其余周期（含 15、250）全达标
+    assert bool(by_60.loc[dates[0], "000003"]) is False, "15 日不达标必须排除该股"
+    assert bool(by_60.loc[dates[0], "000001"]) is False, "250 日不达标必须排除该股"
+
+    by_15 = bt.resonance_mask(frames, period=15, threshold=80)
+    # 20/60/120/250 必须全达标；起始项固定是最短周期列，所选周期恰为 15 时它也被要求
+    assert bool(by_15.loc[dates[0], "000002"]) is True
+    assert bool(by_15.loc[dates[0], "000001"]) is False, "250 日不达标必须排除"
+    assert bool(by_15.loc[dates[0], "000003"]) is False, "所选周期恰为最短周期时一并要求"

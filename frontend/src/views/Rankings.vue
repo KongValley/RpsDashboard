@@ -108,6 +108,7 @@
 import { ref, watch, onMounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { rpsApi, metaApi, watchApi } from '../api'
+import { DEFAULT_PERIOD, usePeriods } from '../composables/usePeriods'
 import RpsTable from '../components/RpsTable.vue'
 
 const router = useRouter()
@@ -141,8 +142,8 @@ async function toggleWatch(symbol) {
   }
 }
 
-const periods = ref([20, 60, 120, 250])
-const period = ref(60)
+const { periods, error: periodsError } = usePeriods()
+const period = ref(DEFAULT_PERIOD)
 const rpsMin = ref(80)
 const industry = ref('')
 const minAmount = ref(0)
@@ -165,6 +166,7 @@ const loading = ref(false)
 const exporting = ref(false)
 const patternMissing = ref(false)
 const errMsg = ref('')
+watch(periodsError, (v) => { if (v) errMsg.value = v }, { immediate: true })
 
 async function load() {
   loading.value = true
@@ -248,13 +250,13 @@ watch(sanxingdi, () => { page.value = 1; load() })
 // 主数据与元数据**并行独立**加载：筛选项没就绪不该阻塞排行榜。
 // （早期写成 `await Promise.all([periods, industries])` 再 load()，
 //   一旦元数据请求挂起，整个排行榜就永远停在「加载中」。）
+// 周期清单不走这里：usePeriods() 在模块级缓存，5 个视图共用一次请求。
 onMounted(() => {
   load()
   loadWatchlist()
   // 不传 limit：后端默认 2000，覆盖全部 rps 历史（此前写死 400 会把日期下拉截断）
-  Promise.all([metaApi.periods(), metaApi.industries(), metaApi.dates()])
-    .then(([ps, inds, dates]) => {
-      periods.value = ps
+  Promise.all([metaApi.industries(), metaApi.dates()])
+    .then(([inds, dates]) => {
       industries.value = inds
       availableDates.value = dates || []
     })

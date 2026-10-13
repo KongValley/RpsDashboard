@@ -68,8 +68,8 @@ def detail(symbol: str) -> dict:
         if info.get("industry") and current:
             ind = read_sql(
                 conn,
-                "SELECT rps20, rps60, rps120, rps250 FROM industry_rps_daily"
-                " WHERE date = ? AND industry = ?",
+                "SELECT " + ", ".join(config.period_columns())
+                + " FROM industry_rps_daily WHERE date = ? AND industry = ?",
                 (current["date"], info["industry"]),
             )
             if not ind.empty:

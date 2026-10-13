@@ -12,7 +12,7 @@ import json
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
 
-from .. import db
+from .. import config, db
 from ..analytics.alerts import ALERT_KINDS
 
 router = APIRouter(prefix="/api", tags=["watchlist"])
@@ -47,8 +47,9 @@ def list_watchlist() -> list[dict]:
     try:
         rows = conn.execute(
             "SELECT w.symbol, w.note, w.added_at, s.name, s.is_st, i.industry, "
-            "       r.date AS data_date, r.rps20, r.rps60, r.rps120, r.rps250 "
-            "FROM watchlist w "
+            "       r.date AS data_date, "
+            + ", ".join(f"r.{c}" for c in config.period_columns())
+            + " FROM watchlist w "
             "LEFT JOIN security_master s ON s.symbol = w.symbol "
             "LEFT JOIN industry_map i ON i.symbol = w.symbol "
             "LEFT JOIN rps_daily r ON r.symbol = w.symbol "

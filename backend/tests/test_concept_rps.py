@@ -10,6 +10,7 @@ from __future__ import annotations
 import sqlite3
 
 import pandas as pd
+from rpsboard import config
 from rpsboard.analytics import rps as engine
 from rpsboard.analytics.matrix import (
     build_close_matrix,
@@ -51,12 +52,13 @@ def test_concept_rps_matches_industry_rps_same_implementation(tmp_path):
         by_concept = engine.compute_concept_rps(conn, frames)
 
         assert not by_concept.empty
-        # 列名与 industry_rps_daily 对称，只是 industry → concept
-        assert list(by_concept.columns) == [
-            "date", "concept", "rps20", "ret20", "rps60", "ret60",
-            "rps120", "ret120", "rps250", "ret250", "member_count",
-            "leader_symbol",
-        ]
+        # 列名与 industry_rps_daily 对称，只是 industry → concept；周期列跟随
+        # config.PERIODS（新增周期时这里自动跟上，不必手抄）
+        assert list(by_concept.columns) == (
+            ["date", "concept"]
+            + [c for p in config.PERIODS for c in (f"rps{p}", f"ret{p}")]
+            + ["member_count", "leader_symbol"]
+        )
         a = by_industry.rename(columns={"industry": "concept"}).reset_index(drop=True)
         b = by_concept.reset_index(drop=True)
         assert len(a) == len(b)

@@ -342,10 +342,11 @@ def cmd_watch(args: argparse.Namespace) -> int:
             print(f"[watch] 已移除 {symbol}" if cur.rowcount else f"[watch] {symbol} 不在自选中")
             return 0
 
+        cols = config.period_columns()
         rows = conn.execute(
             "SELECT w.symbol, w.note, w.added_at, s.name, "
-            "       r.rps20, r.rps60, r.rps120, r.rps250 "
-            "FROM watchlist w "
+            + ", ".join(f"r.{c}" for c in cols)
+            + " FROM watchlist w "
             "LEFT JOIN security_master s ON s.symbol = w.symbol "
             "LEFT JOIN rps_daily r ON r.symbol = w.symbol "
             "  AND r.date = (SELECT MAX(date) FROM rps_daily) "
@@ -354,13 +355,14 @@ def cmd_watch(args: argparse.Namespace) -> int:
         if not rows:
             print("[watch] 自选为空：cli watch add 600519 [--note 备注]")
             return 0
-        print(f"{'代码':<8}{'名称':<10}{'RPS20':>7}{'RPS60':>7}{'RPS120':>8}{'RPS250':>8}  备注")
+        head = "".join(f"{'RPS' + str(p):>8}" for p in config.PERIODS)
+        print(f"{'代码':<8}{'名称':<10}{head}  备注")
         for r in rows:
             name = (r["name"] or "")[:8]
             def f(v):
                 return "—" if v is None else f"{v:.0f}"
-            print(f"{r['symbol']:<8}{name:<10}{f(r['rps20']):>7}{f(r['rps60']):>7}"
-                  f"{f(r['rps120']):>8}{f(r['rps250']):>8}  {r['note'] or ''}")
+            vals = "".join(f"{f(r[c]):>8}" for c in cols)
+            print(f"{r['symbol']:<8}{name:<10}{vals}  {r['note'] or ''}")
     return 0
 
 

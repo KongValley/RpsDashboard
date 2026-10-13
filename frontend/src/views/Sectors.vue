@@ -6,7 +6,7 @@
         <span class="muted">
           数据日期 {{ dataDate || '—' }} · 行按
           <b class="sort-hint">RPS{{ period }} 降序</b>独立排列
-          （四个周期各自排序）· 点击格子查看该{{ mode === 'concept' ? '概念' : '行业' }}榜单
+          （{{ periods.length }} 个周期各自排序）· 点击格子查看该{{ mode === 'concept' ? '概念' : '行业' }}榜单
         </span>
         <div class="spacer" />
         <div class="group">
@@ -81,12 +81,13 @@
 import { ref, computed, onMounted, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { rpsApi, metaApi } from '../api'
+import { DEFAULT_PERIOD, usePeriods } from '../composables/usePeriods'
 import { useResizableColumns } from '../composables/useResizableColumns'
 
 const router = useRouter()
 const route = useRoute()
-const periods = [20, 60, 120, 250]
-const period = ref(60)
+const { periods, error: periodsError } = usePeriods()
+const period = ref(DEFAULT_PERIOD)
 const dataDate = ref(null)
 /** 'industry' = 证监会行业（83 个）；'concept' = 概念题材 */
 const mode = ref('industry')
@@ -98,6 +99,7 @@ const matrixData = ref([])
 const sectorRows = ref([])
 /** 接口错误提示：失败时不能只是图表空白（用户会以为「没数据」） */
 const errMsg = ref('')
+watch(periodsError, (v) => { if (v) errMsg.value = v }, { immediate: true })
 
 async function loadHeatmap() {
   try {
@@ -107,10 +109,11 @@ async function loadHeatmap() {
       : await rpsApi.heatmap({ date: date.value || undefined })
     if (d.error) throw new Error(d.error)
     dataDate.value = d.data_date
-    // 概念热力图返回列名是 concept
+    // 概念热力图返回列名是 concept；各周期列整行透传，
+    // 不写白名单（写死 rps20/60/120/250 会把新周期的字段吃掉）
     matrixData.value = (d.matrix || []).map((r) => ({
+      ...r,
       industry: isConcept ? r.concept : r.industry,
-      rps20: r.rps20, rps60: r.rps60, rps120: r.rps120, rps250: r.rps250,
     }))
   } catch (e) {
     console.error(e)
@@ -159,7 +162,7 @@ function shortName(s) {
 /**
  * 按当前选中周期对行业独立排序。
  *
- * 四个周期各自维护一套强弱次序：20 日强的行业未必 250 日也强，
+ * 每个周期各自维护一套强弱次序：15 日强的行业未必 250 日也强，
  * 所以切换周期时热力图要整体重排，而不是固定按某个周期排。
  * 后端 /api/rps/heatmap 返回的是按 rps60 排好的，这里在前端按当前周期重排，
  * 避免每次切换都重新请求。
@@ -177,12 +180,13 @@ const sortedByPeriod = computed(() => {
 })
 
 const heatmapOption = computed(() => {
-  const cols = periods.map((p) => `RPS${p}`)
-  const activeX = periods.indexOf(period.value)
+  const ps = periods.value
+  const cols = ps.map((p) => `RPS${p}`)
+  const activeX = ps.indexOf(period.value)
   const rows = sortedByPeriod.value.map((r) => shortName(r.industry))
   const data = []
   sortedByPeriod.value.forEach((r, y) => {
-    periods.forEach((p, x) => {
+    ps.forEach((p, x) => {
       const v = r[`rps${p}`]
       data.push([x, y, v === null || v === undefined ? '-' : v, r.industry, x === activeX])
     })

@@ -57,23 +57,24 @@ CREATE INDEX IF NOT EXISTS idx_bar_date ON daily_bar(date);
 CREATE TABLE IF NOT EXISTS rps_daily (
   date   TEXT NOT NULL,
   symbol TEXT NOT NULL,
-  rps20  REAL, rps60 REAL, rps120 REAL, rps250 REAL,
-  ret20  REAL, ret60 REAL, ret120 REAL, ret250 REAL,
+  rps15  REAL, rps20 REAL, rps60 REAL, rps120 REAL, rps250 REAL,
+  ret15  REAL, ret20 REAL, ret60 REAL, ret120 REAL, ret250 REAL,
   PRIMARY KEY (symbol, date)
 );
 CREATE INDEX IF NOT EXISTS idx_rps_date ON rps_daily(date);
 -- 覆盖索引：排行榜的核心查询是
 --   WHERE date=? AND rps60 BETWEEN ? AND ? ORDER BY rps60 DESC
 -- 单列的 idx_rps_date 只能定位到日期，再用 TEMP B-TREE 临时排序 5000+ 行。
--- 把四个周期都放进索引后可以直接走有序区间扫描，排序与筛选都在索引里完成。
+-- 把**全部**周期都放进索引后可以直接走有序区间扫描，排序与筛选都在索引里完成。
+-- 列清单必须与 config.PERIODS 一致：ensure_period_columns() 会按真源重建它。
 CREATE INDEX IF NOT EXISTS idx_rps_date_period
-  ON rps_daily(date, rps20, rps60, rps120, rps250);
+  ON rps_daily(date, rps15, rps20, rps60, rps120, rps250);
 
 CREATE TABLE IF NOT EXISTS industry_rps_daily (
   date          TEXT NOT NULL,
   industry      TEXT NOT NULL,
-  rps20  REAL, rps60 REAL, rps120 REAL, rps250 REAL,
-  ret20  REAL, ret60 REAL, ret120 REAL, ret250 REAL,
+  rps15  REAL, rps20 REAL, rps60 REAL, rps120 REAL, rps250 REAL,
+  ret15  REAL, ret20 REAL, ret60 REAL, ret120 REAL, ret250 REAL,
   member_count  INTEGER,
   leader_symbol TEXT,
   leader_name   TEXT,
@@ -118,8 +119,8 @@ CREATE INDEX IF NOT EXISTS idx_concept_name ON concept_map(concept);
 CREATE TABLE IF NOT EXISTS concept_rps_daily (
   date          TEXT NOT NULL,
   concept       TEXT NOT NULL,
-  rps20  REAL, rps60 REAL, rps120 REAL, rps250 REAL,
-  ret20  REAL, ret60 REAL, ret120 REAL, ret250 REAL,
+  rps15  REAL, rps20 REAL, rps60 REAL, rps120 REAL, rps250 REAL,
+  ret15  REAL, ret20 REAL, ret60 REAL, ret120 REAL, ret250 REAL,
   member_count  INTEGER,
   leader_symbol TEXT,
   leader_name   TEXT,
@@ -214,6 +215,43 @@ def init_db(path: Path | str | None = None) -> None:
     with session(path) as conn:
         conn.executescript(SCHEMA)
         conn.commit()
+        # 旧库不会因为 CREATE TABLE IF NOT EXISTS 而获得新增的周期列（如 rps15）
+        added = ensure_period_columns(conn)
+        if added:
+            print(f"[db] 新增周期列 {', '.join(added)}（需 cli compute-rps --full 填值）")
+
+
+#: 带周期列的三张表（列名由 config.PERIODS 决定，见 config.period_columns）
+PERIOD_TABLES = ("rps_daily", "industry_rps_daily", "concept_rps_daily")
+
+
+def ensure_period_columns(conn: sqlite3.Connection) -> list[str]:
+    """给既有库补上 config.PERIODS 里的周期列，并重建 rps_daily 的覆盖索引。
+
+    幂等：列已存在就跳过。返回本次新增的列名（形如 ``rps_daily.rps15``）。
+    只做 ALTER TABLE ADD COLUMN —— 纯元数据操作，不重建表、不动数据。
+
+    索引必须 drop 后重建：``CREATE INDEX IF NOT EXISTS`` 对已存在的同名索引
+    什么都不做，留在库里的是旧的四列版本。
+    """
+    added: list[str] = []
+    wanted = config.period_columns() + config.period_columns("ret")
+    for table in PERIOD_TABLES:
+        if not table_exists(conn, table):
+            continue
+        have = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for col in wanted:
+            if col not in have:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} REAL")
+                added.append(f"{table}.{col}")
+    if any(a.startswith("rps_daily.") for a in added):
+        conn.execute("DROP INDEX IF EXISTS idx_rps_date_period")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rps_date_period"
+            f" ON rps_daily(date, {', '.join(config.period_columns())})"
+        )
+    conn.commit()
+    return added
 
 
 def table_exists(conn: sqlite3.Connection, name: str) -> bool:
