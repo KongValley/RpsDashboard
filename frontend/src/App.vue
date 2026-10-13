@@ -12,20 +12,20 @@
       </nav>
       <div class="status">
         <span class="dot" :class="statusDot"></span>
-        <span class="muted">{{ statusText }}</span>
-        <button class="btn" :disabled="collecting" @click="refresh">
-          {{ collecting ? '更新中…' : '更新数据' }}
+        <span class="muted">
+          {{ statusText }}
+          <span v-if="updating" class="phase"> · {{ phaseLabel }}</span>
+          <span v-else-if="updateError" class="phase err">{{ updateError }}</span>
+          <span v-else-if="lastUpdate" class="phase"> · 上次更新 {{ lastUpdate }}</span>
+        </span>
+        <button class="btn" :disabled="updating" @click="refresh">
+          {{ updating ? '更新中…' : '更新数据' }}
         </button>
       </div>
     </header>
 
     <div v-if="unmapped > 0 && dbReady" class="warnbar soft">
       ℹ {{ unmapped }} 只股票暂无行业分类，已被排除在板块 RPS 之外，个股页显示「未分类」。
-    </div>
-
-    <div v-if="spotStale && dbReady" class="warnbar">
-      ⚠ 当日快照（成交额/换手率/量比/市值）未更新或已过期 —— RPS 数值不受影响，仅展示字段缺失。
-      行情快照来自 akshare（东方财富），受反爬限制可能失败。
     </div>
 
     <main class="content">
@@ -89,17 +89,84 @@ function stopPolling() {
 }
 
 const status = ref(null)
-const collecting = ref(false)
+const updating = ref(false)
+const phase = ref(null)
+const updateError = ref('')
+const lastUpdate = ref('')
+let pollTimer = null
+
+const PHASES = {
+  starting: '准备中',
+  bars: '拉取日K（约 209 秒）',
+  limits: '采集涨跌停（约 35 秒）',
+  rps: '重算 RPS（约 10 秒）',
+  done: '完成',
+  failed: '失败',
+}
+const phaseLabel = computed(() => PHASES[phase.value] || phase.value || '')
+
+async function pollStatus() {
+  try {
+    const s = await adminApi.updateStatus()
+    phase.value = s.phase
+    if (!s.running && s.phase === 'failed') {
+      updating.value = false
+      updateError.value = s.error || '未知错误'
+      stopPoll()
+      return
+    }
+    if (!s.running && s.phase === 'done') {
+      updating.value = false
+      lastUpdate.value = `${s.finished_at || ''}${s.elapsed ? ` · 耗时 ${s.elapsed}s` : ''}`
+      updateError.value = ''
+      stopPoll()
+      load()
+      return
+    }
+    // 进程重启后前端不知道上一轮是否跑完，兜底展示持久化的最后一次采集
+    if (!s.running && !s.phase && s.last_collect_log?.finished_at) {
+      lastUpdate.value = s.last_collect_log.finished_at.replace('T', ' ')
+    }
+  } catch (e) {
+    updating.value = false
+    updateError.value = `无法获取更新状态：${e.message}`
+    stopPoll()
+  }
+}
+
+function startPoll() {
+  if (pollTimer) return
+  pollTimer = setInterval(pollStatus, 3000)
+}
+function stopPoll() {
+  if (pollTimer) {
+    clearInterval(pollTimer)
+    pollTimer = null
+  }
+}
+
+async function refresh() {
+  updating.value = true
+  updateError.value = ''
+  phase.value = 'starting'
+  try {
+    const r = await adminApi.update()
+    if (!r.ok) {
+      updating.value = false
+      updateError.value = r.error || '启动失败'
+      return
+    }
+    startPoll()
+  } catch (e) {
+    updating.value = false
+    updateError.value = e.message
+  }
+}
 
 const dbReady = computed(() => !!status.value?.db_ready)
-const spotStale = computed(() => !!status.value?.spot_stale)
 const unmapped = computed(() => status.value?.unmapped_symbols || 0)
 
-const statusDot = computed(() => {
-  if (!dbReady.value) return 'bad'
-  if (spotStale.value) return 'warn'
-  return 'ok'
-})
+const statusDot = computed(() => (dbReady.value ? 'ok' : 'bad'))
 
 const statusText = computed(() => {
   const s = status.value
@@ -110,23 +177,18 @@ const statusText = computed(() => {
   return `日K ${d} · ${n.toLocaleString()} 行`
 })
 
-async function refresh() {
-  collecting.value = true
-  try {
-    await adminApi.collect('compute-rps')
-    await load()
-  } catch (e) {
-    alert(`更新失败：${e.message}`)
-  } finally {
-    collecting.value = false
-  }
-}
+// 旧的 refresh（同步调用 collect）已被上面的异步版本取代：
+// 完整更新要 209+10 秒，同步 HTTP 必然超时，且会阻塞服务。
 
 onMounted(() => {
   load()
   startPolling()
+  pollStatus()   // 页面刷新后恢复上一轮更新的进度显示
 })
-onUnmounted(stopPolling)
+onUnmounted(() => {
+  stopPolling()
+  stopPoll()
+})
 </script>
 
 <style scoped>
@@ -153,6 +215,8 @@ onUnmounted(stopPolling)
 .nav a.active { color: #fff; background: var(--bg-panel-2); }
 
 .status { display: flex; align-items: center; gap: 10px; font-size: 12px; }
+.status .phase { color: var(--accent); }
+.status .phase.err { color: var(--up); }
 .dot { width: 8px; height: 8px; border-radius: 50%; }
 .dot.ok { background: var(--down); }
 .dot.warn { background: var(--warn); }
