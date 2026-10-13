@@ -64,7 +64,11 @@ def cmd_backfill(args: argparse.Namespace) -> int:
             print(f"[backfill] 数据源不可用: {exc}", file=sys.stderr)
             return 2
 
-    n_dirty = clean_bad_pct_chg(conn)
+        # 清理必须用**同一个仍然打开的**连接：原来这行写在 with 之外，
+        # 连接此时已经关闭 → sqlite3.ProgrammingError，整个 update 管道
+        # 在「日K 拉完之后」中断（涨跌停 / RPS / 形态 / 预警全没跑）。
+        n_dirty = clean_bad_pct_chg(conn)
+
     if n_dirty:
         print(f"[clean] 清理异常 pct_chg {n_dirty} 行")
 
