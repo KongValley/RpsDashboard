@@ -142,6 +142,37 @@ CREATE TABLE IF NOT EXISTS pattern_daily (
 CREATE INDEX IF NOT EXISTS idx_pattern_date ON pattern_daily(date);
 CREATE INDEX IF NOT EXISTS idx_pattern_symbol ON pattern_daily(symbol, date);
 
+-- ── 自选股池与条件预警（T6）──────────────────────────────────────
+-- 看板的写入面就这三张表（其余 handler 一律只读 SQLite）
+CREATE TABLE IF NOT EXISTS watchlist (
+  symbol   TEXT PRIMARY KEY,
+  note     TEXT,
+  added_at TEXT NOT NULL
+);
+
+-- 预警规则：kind 决定 params 的 JSON 结构
+--   rps_threshold: {"period": 60, "min": 90, "max": 100}
+--   sanxingdi:     {"window": 5}
+--   limit_up:      {}
+CREATE TABLE IF NOT EXISTS alert_rule (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  name       TEXT NOT NULL,
+  kind       TEXT NOT NULL,
+  params     TEXT NOT NULL,
+  enabled    INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL
+);
+
+-- 命中记录：按 (规则, 日期, 股票) 去重，反复 run 幂等
+CREATE TABLE IF NOT EXISTS alert_hit (
+  rule_id INTEGER NOT NULL,
+  date    TEXT NOT NULL,
+  symbol  TEXT NOT NULL,
+  detail  TEXT,
+  PRIMARY KEY (rule_id, date, symbol)
+);
+CREATE INDEX IF NOT EXISTS idx_alert_hit_date ON alert_hit(date);
+
 CREATE TABLE IF NOT EXISTS collect_log (
   run_id        TEXT PRIMARY KEY,
   task          TEXT NOT NULL,

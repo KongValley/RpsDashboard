@@ -1,0 +1,172 @@
+"""自选股池与条件预警的读写接口。
+
+这是**全 API 唯一的写入口**（`db.py` 里 watchlist / alert_rule / alert_hit 三张表）；
+其余 handler 保持只读 SQLite 的既有约束。写操作都在本文件内 commit + close，
+不做任何外部采集（与 README 的「只落库 + CLI 输出、不引入消息推送」边界一致）。
+"""
+
+from __future__ import annotations
+
+import json
+
+from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, Field, field_validator
+
+from .. import db
+from ..analytics.alerts import ALERT_KINDS
+
+router = APIRouter(prefix="/api", tags=["watchlist"])
+
+#: 代码必须是 6 位数字（与 eltdx 的 6 位代码口径一致）
+SYMBOL_PATTERN = r"^\d{6}$"
+
+
+class WatchItem(BaseModel):
+    symbol: str = Field(pattern=SYMBOL_PATTERN, description="6 位股票代码")
+    note: str | None = Field(default=None, max_length=120)
+
+
+class AlertRuleIn(BaseModel):
+    name: str = Field(min_length=1, max_length=60)
+    kind: str
+    params: dict = Field(default_factory=dict)
+    enabled: bool = True
+
+    @field_validator("kind")
+    @classmethod
+    def _known_kind(cls, v: str) -> str:
+        if v not in ALERT_KINDS:
+            raise ValueError(f"kind 必须是 {ALERT_KINDS} 之一")
+        return v
+
+
+@router.get("/watchlist")
+def list_watchlist() -> list[dict]:
+    """自选列表，附带最新交易日的各周期 RPS。"""
+    conn = db.connect()
+    try:
+        rows = conn.execute(
+            "SELECT w.symbol, w.note, w.added_at, s.name, s.is_st, i.industry, "
+            "       r.date AS data_date, r.rps20, r.rps60, r.rps120, r.rps250 "
+            "FROM watchlist w "
+            "LEFT JOIN security_master s ON s.symbol = w.symbol "
+            "LEFT JOIN industry_map i ON i.symbol = w.symbol "
+            "LEFT JOIN rps_daily r ON r.symbol = w.symbol "
+            "  AND r.date = (SELECT MAX(date) FROM rps_daily) "
+            "ORDER BY w.added_at DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+@router.post("/watchlist")
+def add_watchlist(item: WatchItem) -> dict:
+    conn = db.connect()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO watchlist(symbol, note, added_at) VALUES (?,?,?)",
+            (item.symbol, item.note, db.now()),
+        )
+        conn.commit()
+        return {"ok": True, "symbol": item.symbol}
+    finally:
+        conn.close()
+
+
+@router.delete("/watchlist/{symbol}")
+def remove_watchlist(symbol: str) -> dict:
+    if not symbol.isdigit() or len(symbol) != 6:
+        raise HTTPException(status_code=422, detail="代码必须是 6 位数字")
+    conn = db.connect()
+    try:
+        cur = conn.execute("DELETE FROM watchlist WHERE symbol = ?", (symbol,))
+        conn.commit()
+        return {"ok": True, "removed": cur.rowcount or 0}
+    finally:
+        conn.close()
+
+
+@router.get("/alerts/rules")
+def list_rules() -> list[dict]:
+    conn = db.connect()
+    try:
+        rows = conn.execute(
+            "SELECT id, name, kind, params, enabled, created_at FROM alert_rule ORDER BY id"
+        ).fetchall()
+        out = []
+        for r in rows:
+            item = dict(r)
+            try:
+                item["params"] = json.loads(item["params"] or "{}")
+            except (ValueError, TypeError):
+                item["params"] = {}
+            item["enabled"] = bool(item["enabled"])
+            item["hits"] = conn.execute(
+                "SELECT COUNT(*) AS c FROM alert_hit WHERE rule_id = ?", (r["id"],)
+            ).fetchone()["c"]
+            out.append(item)
+        return out
+    finally:
+        conn.close()
+
+
+@router.post("/alerts/rules")
+def add_rule(rule: AlertRuleIn) -> dict:
+    conn = db.connect()
+    try:
+        cur = conn.execute(
+            "INSERT INTO alert_rule(name, kind, params, enabled, created_at) VALUES (?,?,?,?,?)",
+            (rule.name, rule.kind,
+             json.dumps(rule.params, ensure_ascii=False),
+             1 if rule.enabled else 0, db.now()),
+        )
+        conn.commit()
+        return {"ok": True, "id": cur.lastrowid}
+    finally:
+        conn.close()
+
+
+@router.delete("/alerts/rules/{rule_id}")
+def remove_rule(rule_id: int) -> dict:
+    conn = db.connect()
+    try:
+        cur = conn.execute("DELETE FROM alert_rule WHERE id = ?", (rule_id,))
+        conn.execute("DELETE FROM alert_hit WHERE rule_id = ?", (rule_id,))
+        conn.commit()
+        return {"ok": True, "removed": cur.rowcount or 0}
+    finally:
+        conn.close()
+
+
+@router.get("/alerts/hits")
+def list_hits(
+    date: str | None = None,
+    limit: int = Query(200, ge=1, le=2000),
+) -> list[dict]:
+    """命中记录（默认最新交易日，倒序）。"""
+    conn = db.connect()
+    try:
+        if date is None:
+            row = conn.execute("SELECT MAX(date) AS d FROM alert_hit").fetchone()
+            date = row["d"] if row and row["d"] else None
+        if not date:
+            return []
+        rows = conn.execute(
+            "SELECT h.date, h.symbol, h.detail, h.rule_id, r.name AS rule_name, "
+            "       s.name AS name "
+            "FROM alert_hit h "
+            "LEFT JOIN alert_rule r ON r.id = h.rule_id "
+            "LEFT JOIN security_master s ON s.symbol = h.symbol "
+            "WHERE h.date = ? ORDER BY h.rule_id, h.symbol LIMIT ?",
+            (date, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+#: 供前端展示的 kind 选项（与引擎保持同一真源）
+@router.get("/alerts/kinds")
+def list_kinds() -> list[str]:
+    return list(ALERT_KINDS)

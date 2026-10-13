@@ -98,7 +98,8 @@
     <div class="panel" style="margin-top:12px;padding:0">
       <RpsTable :rows="rows" :page="page" :page-size="pageSize"
                 :loading="loading" :show-delta="deltaDays > 0"
-                :show-pattern="sanxingdi > 0" @select="goDetail" />
+                :show-pattern="sanxingdi > 0" :watched="watched"
+                @select="goDetail" @toggle-watch="toggleWatch" />
     </div>
   </div>
 </template>
@@ -106,11 +107,39 @@
 <script setup>
 import { ref, watch, onMounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
-import { rpsApi, metaApi } from '../api'
+import { rpsApi, metaApi, watchApi } from '../api'
 import RpsTable from '../components/RpsTable.vue'
 
 const router = useRouter()
 const route = useRoute()
+
+/** 自选股代码集合（行首星标用） */
+const watched = ref([])
+
+async function loadWatchlist() {
+  try {
+    watched.value = (await watchApi.list()).map((r) => r.symbol)
+  } catch (e) {
+    console.error('自选列表加载失败', e)
+  }
+}
+
+/** 星标点击：立刻改本地状态（点击手感），再落库；失败时回滚并提示 */
+async function toggleWatch(symbol) {
+  const has = watched.value.includes(symbol)
+  watched.value = has
+    ? watched.value.filter((s) => s !== symbol)
+    : [...watched.value, symbol]
+  try {
+    if (has) await watchApi.remove(symbol)
+    else await watchApi.add(symbol)
+  } catch (e) {
+    watched.value = has
+      ? [...watched.value, symbol]
+      : watched.value.filter((s) => s !== symbol)
+    errMsg.value = `自选更新失败：${e?.message || e}`
+  }
+}
 
 const periods = ref([20, 60, 120, 250])
 const period = ref(60)
@@ -221,6 +250,7 @@ watch(sanxingdi, () => { page.value = 1; load() })
 //   一旦元数据请求挂起，整个排行榜就永远停在「加载中」。）
 onMounted(() => {
   load()
+  loadWatchlist()
   // 不传 limit：后端默认 2000，覆盖全部 rps 历史（此前写死 400 会把日期下拉截断）
   Promise.all([metaApi.periods(), metaApi.industries(), metaApi.dates()])
     .then(([ps, inds, dates]) => {

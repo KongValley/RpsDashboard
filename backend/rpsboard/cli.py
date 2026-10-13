@@ -7,6 +7,7 @@ Windows 注意：调用 `python -m rpsboard.cli` 会走 __main__ 保护；
 from __future__ import annotations
 
 import argparse
+import json
 import multiprocessing as mp
 import sys
 import time
@@ -313,6 +314,111 @@ def cmd_patterns(_: argparse.Namespace) -> int:
     return 0
 
 
+# ── watch（自选股池）────────────────────────────────────────────────
+def cmd_watch(args: argparse.Namespace) -> int:
+    """自选股池：add / rm / ls（只落库，不做推送）。"""
+    action = getattr(args, "action", None)
+    symbol = getattr(args, "symbol", None)
+    if action in ("add", "rm") and not (symbol and str(symbol).isdigit() and len(str(symbol)) == 6):
+        print("[watch] 股票代码必须是 6 位数字，例如 600519", file=sys.stderr)
+        return 2
+
+    with db.session() as conn:
+        if action == "add":
+            conn.execute(
+                "INSERT OR REPLACE INTO watchlist(symbol, note, added_at) VALUES (?,?,?)",
+                (symbol, getattr(args, "note", None), db.now()),
+            )
+            conn.commit()
+            print(f"[watch] 已加入自选：{symbol}")
+            return 0
+        if action == "rm":
+            cur = conn.execute("DELETE FROM watchlist WHERE symbol = ?", (symbol,))
+            conn.commit()
+            print(f"[watch] 已移除 {symbol}" if cur.rowcount else f"[watch] {symbol} 不在自选中")
+            return 0
+
+        rows = conn.execute(
+            "SELECT w.symbol, w.note, w.added_at, s.name, "
+            "       r.rps20, r.rps60, r.rps120, r.rps250 "
+            "FROM watchlist w "
+            "LEFT JOIN security_master s ON s.symbol = w.symbol "
+            "LEFT JOIN rps_daily r ON r.symbol = w.symbol "
+            "  AND r.date = (SELECT MAX(date) FROM rps_daily) "
+            "ORDER BY w.added_at DESC"
+        ).fetchall()
+        if not rows:
+            print("[watch] 自选为空：cli watch add 600519 [--note 备注]")
+            return 0
+        print(f"{'代码':<8}{'名称':<10}{'RPS20':>7}{'RPS60':>7}{'RPS120':>8}{'RPS250':>8}  备注")
+        for r in rows:
+            name = (r["name"] or "")[:8]
+            def f(v):
+                return "—" if v is None else f"{v:.0f}"
+            print(f"{r['symbol']:<8}{name:<10}{f(r['rps20']):>7}{f(r['rps60']):>7}"
+                  f"{f(r['rps120']):>8}{f(r['rps250']):>8}  {r['note'] or ''}")
+    return 0
+
+
+# ── alert（条件预警）────────────────────────────────────────────────
+def cmd_alert(args: argparse.Namespace) -> int:
+    """条件预警：add / ls / rm / run（只落库 + 打印命中，不做推送）。"""
+    from .analytics import alerts as alerts_engine
+
+    action = getattr(args, "action", None)
+    with db.session() as conn:
+        if action == "add":
+            kind = args.kind
+            raw = getattr(args, "params", None) or "{}"
+            try:
+                params = json.loads(raw)
+                if not isinstance(params, dict):
+                    raise ValueError("必须是 JSON 对象")
+            except (ValueError, TypeError) as exc:
+                print(f"[alert] --params 不是合法 JSON 对象：{exc}", file=sys.stderr)
+                return 2
+            cur = conn.execute(
+                "INSERT INTO alert_rule(name, kind, params, enabled, created_at) "
+                "VALUES (?,?,?,1,?)",
+                (args.name, kind, json.dumps(params, ensure_ascii=False), db.now()),
+            )
+            conn.commit()
+            print(f"[alert] 已新增规则 #{cur.lastrowid} {args.name}（{kind} {raw}）")
+            return 0
+        if action == "rm":
+            cur = conn.execute("DELETE FROM alert_rule WHERE id = ?", (int(args.id),))
+            conn.commit()
+            print(f"[alert] 已删除规则 #{args.id}" if cur.rowcount
+                  else f"[alert] 规则 #{args.id} 不存在")
+            return 0
+        if action == "run":
+            hits = alerts_engine.run_rules(conn, getattr(args, "date", None))
+            if not hits:
+                print("[alert] 本次没有命中（没有规则、或规则都没触发）")
+                return 0
+            print(f"[alert] 命中 {len(hits)} 条：")
+            for h in hits:
+                print(f"  #{h['rule_id']:<3}{h['date']}  {h['symbol']}  "
+                      f"{h['rule_name']}  {h['detail']}")
+            return 0
+
+        rows = conn.execute(
+            "SELECT id, name, kind, params, enabled, created_at FROM alert_rule ORDER BY id"
+        ).fetchall()
+        if not rows:
+            print("[alert] 没有规则：cli alert add --name RPS90 --kind rps_threshold "
+                  "--params '{\"period\":60,\"min\":90,\"max\":100}'")
+            return 0
+        for r in rows:
+            flag = "" if r["enabled"] else "（已停用）"
+            hits = conn.execute(
+                "SELECT COUNT(*) AS c FROM alert_hit WHERE rule_id = ?", (r["id"],)
+            ).fetchone()["c"]
+            print(f"#{r['id']:<3}{r['name']:<16}{r['kind']:<14}{r['params']}"
+                  f"  累计命中 {hits}{flag}")
+    return 0
+
+
 # ── status ──────────────────────────────────────────────────────────
 def cmd_status(_: argparse.Namespace) -> int:
     conn = db.connect()
@@ -431,8 +537,15 @@ def run_update_pipeline(progress=None) -> dict:
     from .analytics import backtest as bt_engine
     bt_engine.clear_context_cache()
 
+    # 条件预警：评估全部规则并把命中落库（只落库 + 终端输出，不做推送）
+    say("alerts")
+    from .analytics import alerts as alerts_engine
+    with db.session() as conn:
+        n_hits = len(alerts_engine.run_rules(conn))
+    print(f"[alert] 命中 {n_hits} 条")
+
     say("done")
-    return {"ok": True, "price_limit_rows": n_lim}
+    return {"ok": True, "price_limit_rows": n_lim, "alert_hits": n_hits}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -476,6 +589,33 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_concept)
 
     sub.add_parser("patterns", help="计算三升底形态").set_defaults(func=cmd_patterns)
+
+    # ── 自选股池（只落库，不做推送）───────────────────────────────
+    wsp = sub.add_parser("watch", help="自选股池：add / rm / ls")
+    wsub = wsp.add_subparsers(dest="action", required=True)
+    w_add = wsub.add_parser("add", help="加入自选")
+    w_add.add_argument("symbol", help="6 位股票代码")
+    w_add.add_argument("--note", default=None, help="备注")
+    w_rm = wsub.add_parser("rm", help="移除自选")
+    w_rm.add_argument("symbol", help="6 位股票代码")
+    wsub.add_parser("ls", help="列出全部自选（含当日 RPS）")
+    wsp.set_defaults(func=cmd_watch)
+
+    # ── 条件预警（只落库 + CLI 输出）──────────────────────────────
+    from .analytics.alerts import ALERT_KINDS
+
+    asp = sub.add_parser("alert", help="条件预警：add / ls / rm / run")
+    asub = asp.add_subparsers(dest="action", required=True)
+    a_add = asub.add_parser("add", help="新增规则")
+    a_add.add_argument("--name", required=True, help="规则名")
+    a_add.add_argument("--kind", required=True, choices=ALERT_KINDS, help="规则类型")
+    a_add.add_argument("--params", default="{}", help="规则参数（JSON 对象）")
+    a_rm = asub.add_parser("rm", help="删除规则")
+    a_rm.add_argument("id", help="规则 id")
+    asub.add_parser("ls", help="列出规则与累计命中数")
+    a_run = asub.add_parser("run", help="评估全部规则并写入命中记录")
+    a_run.add_argument("--date", default=None, help="评估哪一天（默认最新交易日）")
+    asp.set_defaults(func=cmd_alert)
 
     sp = sub.add_parser("compute-rps", help="计算个股/板块 RPS")
     sp.add_argument("--include-st", action="store_true", help="把 ST 也纳入排名")

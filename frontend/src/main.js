@@ -35,6 +35,8 @@ const routes = [
     component: () => import('./views/StockDetail.vue'), meta: { title: '个股详情' } },
   { path: '/backtest', name: 'backtest', component: () => import('./views/Backtest.vue'),
     meta: { title: '策略回测' } },
+  { path: '/watchlist', name: 'watchlist', component: () => import('./views/Watchlist.vue'),
+    meta: { title: '自选与预警' } },
 ]
 
 const router = createRouter({

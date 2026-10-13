@@ -21,6 +21,13 @@
         </tr>
         <tr v-for="(r, i) in rows" :key="r.symbol" @click="$emit('select', r.symbol)">
           <td class="muted mono">{{ (page - 1) * pageSize + i + 1 }}</td>
+          <td>
+            <button class="star" :class="{ on: isWatched(r.symbol) }"
+                    :title="isWatched(r.symbol) ? '取消自选' : '加入自选'"
+                    @click.stop="$emit('toggleWatch', r.symbol)">
+              {{ isWatched(r.symbol) ? '★' : '☆' }}
+            </button>
+          </td>
           <td class="mono">{{ r.symbol }}</td>
           <td>
             <span v-if="r.is_st" class="badge st">ST</span>{{ r.name }}
@@ -65,8 +72,12 @@ const props = defineProps({
   showDelta: { type: Boolean, default: false },
   /** 是否展示「三升底」列（由 Rankings 的形态筛选决定） */
   showPattern: { type: Boolean, default: false },
+  /** 自选股代码列表（行首星标用） */
+  watched: { type: Array, default: () => [] },
 })
-defineEmits(['select'])
+defineEmits(['select', 'toggleWatch'])
+
+const isWatched = (symbol) => props.watched.includes(symbol)
 
 /**
  * 表头定义。列宽拖拽按 key 记住，所以每列必须有稳定的 key
@@ -74,6 +85,7 @@ defineEmits(['select'])
  */
 const columns = computed(() => [
   { key: 'no', label: '#', width: 52 },
+  { key: 'star', label: '自选', width: 56 },
   { key: 'symbol', label: '代码', width: 76 },
   { key: 'name', label: '名称', width: 168 },
   { key: 'industry', label: '行业', width: 150 },
@@ -173,6 +185,13 @@ function shortName(s) {
 .rps-table-wrap { overflow: auto; max-height: calc(100vh - 250px); }
 td.num, th.num { text-align: right; }
 td.empty { text-align: center; padding: 40px; }
+/* 自选星标：整行可点时按钮不能触发「打开个股」 */
+.star {
+  background: none; border: none; cursor: pointer; padding: 0 2px;
+  color: var(--text-dim); font-size: 15px; line-height: 1;
+}
+.star:hover { color: var(--accent); }
+.star.on { color: var(--warn); }
 .badge.st {
   background: rgba(246, 70, 93, .2); color: var(--up);
   margin-right: 5px; font-size: 10px; padding: 1px 5px;

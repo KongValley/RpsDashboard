@@ -10,7 +10,7 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - run: uv sync --frozen --extra dev
       - run: uv run ruff check backend
-      - run: uv run python -m pytest backend/tests -q
+      - run: uv run python -m pytest backend/tests -q --cov-fail-under=50
 
   frontend:
     runs-on: ubuntu-latest

@@ -33,13 +33,16 @@ function qs(params = {}) {
   return s ? `?${s}` : ''
 }
 
-async function request(path, params) {
+async function request(path, params, init) {
   const url = `/api${path}${qs(params)}`
   const t0 = performance.now()
   let res
   let error
   try {
-    res = await fetch(url, { headers: { Accept: 'application/json' } })
+    res = await fetch(url, {
+      headers: { Accept: 'application/json' },
+      ...(init || {}),
+    })
     if (!res.ok) throw new Error(`HTTP ${res.status} ${url}`)
     return await res.json()
   } catch (e) {
@@ -136,4 +139,19 @@ export const backtestApi = {
 export const adminApi = {
   update: () => post('/admin/update', {}),
   updateStatus: () => get('/admin/update/status'),
+}
+
+/** 自选股池（全 API 唯一的写入面，见 backend/rpsboard/api/watchlist.py） */
+export const watchApi = {
+  list: () => get('/watchlist'),
+  add: (symbol, note) => post('/watchlist', { symbol, note }),
+  remove: (symbol) => request(`/watchlist/${symbol}`, undefined, { method: 'DELETE' }),
+}
+
+export const alertApi = {
+  kinds: () => get('/alerts/kinds'),
+  rules: () => get('/alerts/rules'),
+  addRule: (rule) => post('/alerts/rules', rule),
+  removeRule: (id) => request(`/alerts/rules/${id}`, undefined, { method: 'DELETE' }),
+  hits: (params) => get('/alerts/hits', params),
 }

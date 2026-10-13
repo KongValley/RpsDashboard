@@ -389,9 +389,10 @@ cd frontend; npm run lint; npm run build             # 前端 lint + 构建
 
 全部测试离线运行，使用合成数据，不触网。
 
-- **覆盖率**：`pytest` 默认带 `--cov=rpsboard --cov-fail-under=50`（门槛取首次实测值：
-  全套实测 TOTAL **54%**）。`cli.py` 与 `sources/*` 目前接近零覆盖，门槛按实测值设，
-  不虚设高线。
+- **覆盖率**：`pytest` 默认带 `--cov=rpsboard --cov-report=term-missing`；**门槛
+  `--cov-fail-under=50` 只写在 CI 命令里**（全套实测 TOTAL **54%**，按实测值向下取整）——
+  放进 `addopts` 会让「只跑一个测试文件」也因总覆盖率不足而失败。`cli.py` 与
+  `sources/*` 目前接近零覆盖，门槛按实测值设，不虚设高线。
 - **lint**：ruff（`select = E,F,W,I,UP,B`，`ignore` 里三条都在 pyproject 注明理由）；
   一次性调研脚本（`probe_*` / `debug_*` / `diag_*` / `verify_*`）用
   `extend-exclude` 排除在外 —— 它们是现场临时脚本，重排风格只会淹没真实改动。
@@ -558,6 +559,40 @@ frontend/src/views/      Rankings / Sectors / StockDetail / Backtest
 start.bat / update.bat   Windows 一键启动 / 更新
 start.sh  / update.sh    Linux / macOS 一键启动 / 更新
 ```
+
+## 自选股池与条件预警
+
+在「排行榜」点行首 ☆ 即加入自选，顶栏「自选预警」页可以增删自选、管理规则、
+查看命中记录。命令行为等价入口（同样只落库 + 终端输出，**不做消息推送**）：
+
+```powershell
+.venv\Scripts\python.exe -m rpsboard.cli watch add 600519 --note 白马   # 加入自选
+.venv\Scripts\python.exe -m rpsboard.cli watch ls                       # 自选 + 当日 RPS
+.venv\Scripts\python.exe -m rpsboard.cli watch rm 600519
+
+.venv\Scripts\python.exe -m rpsboard.cli alert add --name RPS90 --kind rps_threshold `
+    --params '{"period":60,"min":90,"max":100}'
+.venv\Scripts\python.exe -m rpsboard.cli alert ls                       # 规则 + 累计命中
+.venv\Scripts\python.exe -m rpsboard.cli alert run                      # 评估并落库
+```
+
+规则类型（`kind` 决定 `params` 的 JSON 结构）：
+
+| kind | params | 命中条件 |
+|---|---|---|
+| `rps_threshold` | `{"period":60,"min":90,"max":100}` | 当日 `rps{period}` 落在区间内 |
+| `sanxingdi` | `{"window":5}` | 近 window 个交易日内出现过三升底 |
+| `limit_up` | `{}` | 当日按 `limit_ratio` + 容差判为涨停 |
+
+- 命中写进 `alert_hit`，主键 `(规则, 日期, 股票)` → **重复 run 幂等**（实测真实库
+  533 条命中，连跑两次行数不变）。
+- `cli update` 与页面「更新数据」的最后一步会自动跑一次 `alert run`，返回里带
+  `alert_hits`。
+- 数据结构：`watchlist(symbol, note, added_at)`、`alert_rule(id, name, kind, params,
+  enabled, created_at)`、`alert_hit(rule_id, date, symbol, detail)`。这三张表是**全 API
+  唯一的写入口**（`backend/rpsboard/api/watchlist.py`），其余 handler 仍只读 SQLite。
+- 已有库升级后需要跑一次 `cli init` 建这三张表（脚本全是 `CREATE TABLE IF NOT
+  EXISTS`，幂等、不动数据）。
 
 ## 许可证
 

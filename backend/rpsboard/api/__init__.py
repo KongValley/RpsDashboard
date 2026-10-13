@@ -1,6 +1,7 @@
 """FastAPI 应用工厂与公共依赖。
 
-硬性约束：**所有 handler 只读 SQLite，绝不在请求链路内做任何外部采集**
+硬性约束：**除 `api/watchlist.py` 里对 watchlist / alert_rule / alert_hit 三张表的
+少量写操作外，所有 handler 只读 SQLite，且都不在请求链路内做外部采集**
 （eltdx 取数在 CLI 里，见 sources/tdxnet_src.py）。
 外部数据采集一律由 CLI / 定时任务离线完成。
 """
@@ -125,9 +126,10 @@ def create_app() -> FastAPI:
     app.add_middleware(perf.PerfMiddleware)
 
     from . import backtest as bt_api
-    from . import meta, rps, stock
+    from . import meta, rps, stock, watchlist
 
     app.include_router(perf.router)
+    app.include_router(watchlist.router)
     app.include_router(meta.router)
     app.include_router(rps.router)
     app.include_router(stock.router)
