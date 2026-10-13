@@ -74,15 +74,6 @@ def test_rps_at_signal_date_unchanged():
     pd.testing.assert_series_equal(a, b, check_names=False)
 
 
-# ── 涨跌停阈值 ──────────────────────────────────────────────────────
-def test_limit_threshold_by_board():
-    from rpsboard import config
-    assert config.limit_threshold("600000") == pytest.approx(9.8)   # 主板
-    assert config.limit_threshold("000001") == pytest.approx(9.8)
-    assert config.limit_threshold("300750") == pytest.approx(19.8)  # 创业板
-    assert config.limit_threshold("688981") == pytest.approx(19.8)  # 科创板
-
-
 def test_exchange_detection_bj():
     """920xxx 必须判为北交所，不能像某些参考实现那样归到上海。"""
     from rpsboard import config
@@ -96,19 +87,36 @@ def test_exchange_detection_bj():
 
 
 def test_limit_up_filter_excludes():
-    """涨幅达到涨停阈值的股票被排除出池。"""
-    pct = pd.DataFrame(
-        [[10.0, 5.0, 20.0], [2.0, 9.9, 1.0]],
-        index=pd.bdate_range("2024-01-01", periods=2),
-        columns=["600000", "000001", "300750"],
-    )
-    limits = bt._limit_filter(list(pct.columns))
-    blocked = pct >= limits
-    assert blocked.iloc[0]["600000"]      # 主板 +10% → 涨停
-    assert not blocked.iloc[0]["000001"]  # +5% → 未涨停
-    assert blocked.iloc[0]["300750"]      # 创业板 +20% → 涨停
-    assert not blocked.iloc[1]["600000"]
-    assert blocked.iloc[1]["000001"]      # +9.9% ≥ 9.8 → 算涨停
+    """涨停判定（收益率比法）。
+
+    早期实现是 `pct >= config.limit_threshold(...)`，而 limit_threshold 是
+    拍出来的**百分数** 9.8 / 19.8，pct_chg 却是**小数** —— 量纲错了两个数量级，
+    这个过滤实测从未命中过任何一只股票。现在改走 analytics.limits，
+    按每只票当日真实的 limit_ratio 判定。
+    """
+    from rpsboard.analytics.limits import limit_mask
+
+    # 收盘价构造：600000 主板 10%、000001 也按 10%（当日比例给 5%）、
+    # 300750 创业板 20%
+    idx = pd.bdate_range("2024-01-02", periods=3)
+    close = pd.DataFrame({
+        "600000": [10.0, 11.0, 11.1],    # +10%, +0.9%
+        "000001": [10.0, 10.5, 10.4],    # +5%,  -1%
+        "300750": [10.0, 12.0, 11.8],    # +20%, -1.7%
+    }, index=idx)
+    ratios = pd.DataFrame({
+        "600000": [10.0, 10.0, 10.0],
+        "000001": [10.0, 10.0, 10.0],
+        "300750": [20.0, 20.0, 20.0],
+    }, index=idx)
+    up, dn = limit_mask(close, ratios)
+
+    assert bool(up.iloc[1]["600000"])     # 主板 +10% → 涨停
+    assert not bool(up.iloc[1]["000001"])  # +5% → 未涨停
+    assert bool(up.iloc[1]["300750"])     # 创业板 +20% → 涨停
+    assert not bool(up.iloc[0].any())     # 首日无前收盘，全部不算
+    assert not bool(up.iloc[2].any())     # 次日普跌
+    assert not bool(dn.iloc[2].any())
 
 
 # ── 指标 ────────────────────────────────────────────────────────────

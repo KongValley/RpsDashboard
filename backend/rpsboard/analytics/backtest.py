@@ -25,6 +25,7 @@ import pandas as pd
 
 from .. import config, db
 from . import matrix
+from .costs import CostModel, default_cost_model
 
 BUCKETS = [(90, 100), (80, 90), (70, 80), (50, 70), (0, 50)]
 BUCKET_LABELS = ["90-100", "80-90", "70-80", "50-70", "<50"]
@@ -85,6 +86,8 @@ class BacktestResult:
     warnings: list[str] = field(default_factory=list)
     #: 择时序列（沪深300 收盘 + 两条均线 + 是否允许开仓），供前端画开/空仓区间
     market_curve: list[dict] = field(default_factory=list)
+    #: 分档图的口径说明（零成本 vs 含成本）
+    buckets_note: str = ""
 
 
 def _forward_return(close_wide: pd.DataFrame, hold: int) -> pd.DataFrame:
@@ -98,9 +101,39 @@ def _forward_return(close_wide: pd.DataFrame, hold: int) -> pd.DataFrame:
     return close_wide.shift(-hold) / close_wide - 1.0
 
 
-def _limit_filter(symbols: list[str]) -> pd.Series:
-    """返回每个 symbol 的涨停阈值。"""
-    return pd.Series({s: config.limit_threshold(s) for s in symbols})
+def _exit_blocked(
+    dn: pd.DataFrame | None,
+    tradable: pd.DataFrame | None,
+    hold: int,
+) -> pd.DataFrame | None:
+    """标记「按计划卖出日无法卖出」的 date × symbol。
+
+    两种情况：
+    - 计划卖出日**跌停**（`dn`）：封在跌停板上卖不出去
+    - 计划卖出日**停牌**：`tradable` 在卖出日为 False，且价格来自 ffill
+
+    这些位置的前瞻收益不可实现，必须顺延。返回 None 表示无法判定
+    （没有涨跌停数据时退化为旧行为——宁可少一个约束，也不要伪造）。
+    """
+    blocks = []
+    if dn is not None and not dn.empty:
+        # 和 tradable 一样必须 shift：跌停发生在**卖出日**(T+hold)，
+        # 而掩码要标记在**买入日**(T) 那一行上。少这一步会把
+        # 「买入当天跌停」错当成「卖出时卖不掉」。
+        blocks.append(
+            dn.shift(-hold).reindex_like(dn).fillna(False).astype(bool)
+        )
+    if tradable is not None and not tradable.empty:
+        blocks.append(
+            ~tradable.shift(-hold).reindex_like(tradable)
+            .fillna(True).astype(bool)
+        )
+    if not blocks:
+        return None
+    out = blocks[0].copy()
+    for b in blocks[1:]:
+        out = out | b
+    return out
 
 
 def load_stored_rps(
@@ -218,6 +251,8 @@ def run_backtest(
     exclude_limit_up: bool = True,
     benchmark_symbol: str = "000300",
     market_filter: str = "none",
+    use_price_limits: bool = True,
+    cost_model: CostModel | None = None,
     use_stored_rps: bool = False,
     lookback_days: int | None = None,
 ) -> BacktestResult:
@@ -232,6 +267,8 @@ def run_backtest(
 
     if market_filter not in MARKET_FILTERS:
         market_filter = "none"
+    if cost_model is None:
+        cost_model = default_cost_model(enabled=True)
 
     result = BacktestResult(
         params={
@@ -240,6 +277,8 @@ def run_backtest(
             "exclude_st": exclude_st, "benchmark": benchmark_symbol,
             "market_filter": market_filter,
             "market_filter_label": MARKET_FILTER_LABELS[market_filter],
+            "cost": cost_model.describe(),
+            "use_price_limits": use_price_limits,
             "use_stored_rps": use_stored_rps,
             "lookback_days": lookback_days,
         }
@@ -295,9 +334,31 @@ def run_backtest(
         mask &= ~st_flags.reindex(index=mask.index, columns=mask.columns) \
             .fillna(False).astype(bool)
 
-    if exclude_limit_up and not pct_wide.empty:
-        limits = _limit_filter(list(pct_wide.columns)).reindex(pct_wide.columns)
-        mask &= ~(pct_wide >= limits)
+    # ── 可交易性：买入日涨停买不进 ─────────────────────────────────
+    # 旧实现是 `mask &= ~(pct_wide >= limits)`，而 limits 是拍出来的百分数
+    # （9.8 / 19.8）、pct_wide 却是小数 —— 量纲错了两个数量级，
+    # 实测这个过滤从未命中过任何一只股票。现在改用 price_limit_daily 的
+    # 真实 limit_ratio，并用「收益率比」判定（后复权价与不复权涨停价
+    # 不在同一基准，直接比会算出 4303 家假涨停）。
+    lim_up = lim_dn = None
+    if use_price_limits:
+        from .limits import limit_mask, load_ratio_frames
+
+        dates = [d.strftime("%Y-%m-%d") for d in close_wide.index]
+        ratios, statuses = load_ratio_frames(conn, dates, list(close_wide.columns))
+        if not ratios.empty:
+            lim_up, lim_dn = limit_mask(close_wide, ratios, statuses)
+            if exclude_limit_up:
+                mask &= ~lim_up.reindex(index=mask.index, columns=mask.columns) \
+                    .fillna(False).astype(bool)
+                result.params["limit_up_filtered"] = int(
+                    lim_up.to_numpy().sum()
+                )
+        else:
+            result.warnings.append(
+                "price_limit_daily 为空，未应用「剔除涨停」过滤"
+                "（请先执行 cli price-limits）"
+            )
 
     if tradable is not None and not tradable.empty:
         mask &= tradable.reindex_like(mask).fillna(False).astype(bool)
@@ -326,6 +387,15 @@ def run_backtest(
         True, index=dates, dtype=bool
     )
 
+    # ── 卖出受阻：跌停 / 停牌顺延 ────────────────────────────────
+    blocked = _exit_blocked(lim_dn, tradable, hold)
+    if blocked is not None and not blocked.empty:
+        blocked = blocked.reindex(index=mask.index, columns=mask.columns) \
+            .fillna(False).astype(bool)
+    # 受阻数量在净值循环里按**实际持仓**累计：整个矩阵有 887×5573 个格子，
+    # 其中大量是「t+hold 日该股还没上市」的空组合，直接统计会得到几十万
+    # 这种毫无意义的数字。
+
     # ── 净值曲线 ──────────────────────────────────────────────────
     # 关键：`fwd` 的每一行**本身就是「从当天买入、持有 hold 天卖出」的累计收益**，
     # 不是日收益。因此每个调仓点只能乘 **一个** fwd 值。
@@ -333,6 +403,7 @@ def run_backtest(
     # 于是出现「单期 +667%」「年化 61875%」这种数学上不可能的数字。
     equity = 1.0
     curve: list[dict] = []
+    total_deferred = 0
     for idx, t in enumerate(dates):
         if idx % step:
             continue
@@ -347,14 +418,43 @@ def run_backtest(
         if not sel.any():
             continue
         names = sel[sel].index
+
+        # 卖出受阻的那部分：收益不可实现，顺延到下一个调仓点。
+        # 保守做法是**剔除**它们（等价于这段收益记 0），而不是照单全收。
+        deferred = 0
+        if blocked is not None and not blocked.empty:
+            bad = blocked.loc[t].reindex(names).fillna(False).astype(bool)
+            if bool(bad.any()):
+                deferred = int(bad.sum())
+                names = names[~bad]
+        total_deferred += deferred
+
+        if len(names) == 0:
+            # 全部持仓都无法卖出：净值不变，但保留这个点
+            curve.append({"date": t.strftime("%Y-%m-%d"),
+                          "equity": round(equity, 6),
+                          "holdings": 0, "deferred": deferred})
+            continue
+
         period_ret = fwd.loc[t, names].mean()      # 单个持有期收益
         if pd.isna(period_ret):
             continue
+        # 成本按「组合名义金额」计，与实际持仓只数有关：等权分散持有上千只时，
+        # 券商的 5 元最低佣金才是真正生效的那一项。
+        period_ret = period_ret - cost_model.round_trip_cost(
+            t, n_positions=len(names)
+        )
         equity *= float(1.0 + period_ret)
         curve.append({"date": t.strftime("%Y-%m-%d"),
                       "equity": round(equity, 6),
-                      "holdings": int(len(names))})
+                      "holdings": int(len(names)),
+                      "deferred": deferred})
     result.equity_curve = curve
+    if total_deferred:
+        result.warnings.append(
+            f"卖出受阻：{total_deferred} 个持仓在计划卖出日跌停或停牌，"
+            f"其收益已顺延（保守处理，可能低估真实回撤）"
+        )
 
     # ── 基准 + 择时序列 ──────────────────────────────────────────
     # bench / bench_close 已在上面为择时读过一次，这里复用。
@@ -390,7 +490,13 @@ def run_backtest(
     result.metrics = compute_metrics(eq, n_days_per_point=step)
 
     # ── RPS 分档前瞻收益（核心验证图）───────────────────────────
+    # 刻意**不扣成本**：这张图衡量的是「RPS 信号本身有没有预测力」，
+    # 混进执行摩擦会把信号质量与交易成本两件事搅在一起。
     result.buckets = compute_buckets(rps_main, fwd)
+    result.buckets_note = (
+        "分档前瞻收益为**零成本**口径，衡量信号本身的预测力；"
+        "上方净值曲线为**含成本**口径，衡量策略的可执行性。"
+    )
     return result
 
 
