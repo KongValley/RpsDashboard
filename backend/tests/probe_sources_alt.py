@@ -5,6 +5,9 @@
 """
 import os, sys, time, socket
 
+sys.path.insert(0, "backend")            # 从仓库根目录运行
+from rpsboard import config              # noqa: E402
+
 TIMEOUT = 12
 
 # 关掉代理再测一遍对照（很多 *.com 站点走代理会失败）
@@ -73,6 +76,7 @@ probe("Tushare API 连通性",
 # ── 本地通达信 ────────────────────────────────────────────────────
 print("\n本地通达信数据目录探测:")
 cands = [
+    str(config.TDX_DIR),                     # 可用 RPSBOARD_TDX_DIR 覆盖
     r"C:\new_tdx", r"C:\tdx", r"C:\通达信", r"D:\new_tdx", r"D:\tdx",
     r"C:\Program Files\new_tdx", r"C:\Program Files (x86)\new_tdx",
 ]

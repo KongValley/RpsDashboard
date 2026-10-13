@@ -44,8 +44,8 @@ def _prefer_seq_scan(conn: sqlite3.Connection, start: str) -> bool:
 def load_long(conn: sqlite3.Connection, start: str | None = None) -> pd.DataFrame:
     """读取日 K 长表（可选按起始日期裁剪）。
 
-    注意列名是 daily_bar 的**内部命名** pct_chg（baostock 原始字段是 pctChg，
-    在 sources/baostock_src.py 的 BAR_RENAME 处已完成转换）。
+    注意列名是 daily_bar 的**内部命名** pct_chg（数据源侧的原始字段名不同，
+    在 sources/tdxnet_src.py 的入库转换处已统一为这套内部命名）。
     """
     sql = ("SELECT symbol, date, close, pct_chg, tradestatus, is_st "
            "FROM daily_bar")

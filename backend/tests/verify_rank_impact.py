@@ -1,8 +1,9 @@
-"""最终验证：用两个数据源分别算 RPS，看排名差异到底有多大。
+"""验证：用「库中已落库的价格」与「现场重新从 eltdx 拉取的价格」分别算 RPS，
+看横截面排名差异到底有多大。
 
-这是唯一有意义的问题——绝对价不同无所谓（基准不同），
-收益率有 2% 量级偏差也未必要紧，关键是**横截面排名**是否稳定。
-如果 Top100 重合度高，腾讯源就可以放心替代 baostock。
+绝对价不同无所谓（基准可能不同），收益率有 2% 量级偏差也未必致命，
+关键是**横截面排名**是否稳定——排名稳，说明落库链路与增量/重算没有把
+价格序列弄歪；排名大面积位移，先怀疑落库数据而不是策略。
 """
 import sys
 sys.path.insert(0, "backend")
@@ -10,26 +11,26 @@ sys.path.insert(0, "backend")
 import numpy as np
 import pandas as pd
 from rpsboard import db
-from rpsboard.sources.tencent_src import fetch_hfq_day
+from rpsboard.sources.tdxnet_src import TdxSource
 
 PERIODS = (20, 60, 120, 250)
 
 conn = db.connect()
+src = TdxSource()
 syms = [r[0] for r in conn.execute(
     "SELECT DISTINCT symbol FROM daily_bar ORDER BY symbol")][:60]
 print(f"库中样本 {len(syms)} 只，开始对比\n")
 
-# ── baostock 源 ─────────────────────────────────────────────────
+# ── 库中落库价 ──────────────────────────────────────────────────
 bs = pd.read_sql_query(
     "SELECT symbol, date, close FROM daily_bar WHERE tradestatus=1", conn)
 bs_w = bs.pivot_table(index="date", columns="symbol", values="close",
                       aggfunc="last").sort_index().ffill()
 
-# ── 腾讯源 ──────────────────────────────────────────────────────
-tx = pd.read_sql_query("SELECT DISTINCT symbol FROM daily_bar", conn)
+# ── 现场 eltdx 重新拉取 ─────────────────────────────────────────
 frames = []
 for s in syms:
-    d = fetch_hfq_day(s)
+    d = src.hfq_bars(s)
     if not d.empty:
         d = d.assign(symbol=s)[["date", "symbol", "close"]]
         frames.append(d)
@@ -77,4 +78,5 @@ for n in PERIODS:
     bb = pd.cut(b, [0,50,70,80,90,100.01], labels=[0,1,2,3,4])
     print(f"   RPS 分档完全一致的股票: {(ba.values == bb.values).mean()*100:.0f}%\n")
 
+src.close()
 conn.close()

@@ -7,6 +7,9 @@
   4. 能批量取多只（决定并发策略）
 """
 import json, time, sys
+
+sys.path.insert(0, "backend")            # 从仓库根目录运行
+from rpsboard import config              # noqa: E402
 import requests
 
 S = requests.Session()
@@ -68,10 +71,10 @@ try:
 except Exception as e:
     print("  失败", e)
 
-print("\n=== 5. 通达信本地数据 D:\\tdx ===")
+print(f"\n=== 5. 通达信本地数据 {config.TDX_DIR} ===")
 import os
 for sub in ["vipdoc", "T0002", "T0003"]:
-    p = f"D:\\tdx\\{sub}"
+    p = config.TDX_DIR / sub
     if os.path.isdir(p):
         items = os.listdir(p)
         print(f"  [有] {p}  ({len(items)} 项)  例: {items[:5]}")
@@ -79,7 +82,7 @@ for sub in ["vipdoc", "T0002", "T0003"]:
         print(f"  [无] {p}")
 # 找 .day 文件（通达信日线）
 hits = []
-for root in (r"D:\tdx",):
+for root in (config.TDX_DIR,):
     for dirpath, dirnames, filenames in os.walk(root):
         if ".git" in dirpath:
             continue

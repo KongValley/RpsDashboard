@@ -10,11 +10,13 @@
   24-27 vol    uint32  成交量（股）
   28-31 reserved uint32
 """
-import struct, os, time, glob
+import struct, os, time, glob, sys
 
-SH = r"D:\tdx\vipdoc\sh\lday"
-SZ = r"D:\tdx\vipdoc\sz\lday"
-BJ = r"D:\tdx\vipdoc\bj\lday"
+sys.path.insert(0, "backend")            # 从仓库根目录运行
+from rpsboard import config              # noqa: E402
+
+LDAY = config.TDX_DIR / "vipdoc"
+SH, SZ, BJ = LDAY / "sh" / "lday", LDAY / "sz" / "lday", LDAY / "bj" / "lday"
 
 
 def read_day(path):
@@ -34,10 +36,8 @@ def read_day(path):
 
 
 print("=== 抽样验证解析 ===")
-for path in [r"D:\tdx\vipdoc\sh\lday\sh600519.day",
-             r"D:\tdx\vipdoc\sz\lday\sz000001.day",
-             r"D:\tdx\vipdoc\sz\lday\sz300750.day",
-             r"D:\tdx\vipdoc\bj\lday\bj920000.day"]:
+for path in [SH / "sh600519.day", SZ / "sz000001.day",
+             SZ / "sz300750.day", BJ / "bj920000.day"]:
     if not os.path.exists(path):
         print(f"  [缺] {path}")
         continue
@@ -80,7 +80,7 @@ try:
     tx = {r[0]: float(r[2]) for r in
           (j["data"]["sh600519"]["hfqday"])}
     tdx = {r["date"]: r["close"] for r in
-           read_day(r"D:\tdx\vipdoc\sh\lday\sh600519.day")}
+           read_day(SH / "sh600519.day")}
     common = sorted(set(tx) & set(tdx))[-5:]
     print(f"  {'日期':<12}{'腾讯hfq':>12}{'通达信不复权':>14}{'比值':>10}")
     for d in common:

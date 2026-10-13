@@ -12,7 +12,18 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parents[2]          # 项目根（含 backend/）
 DATA_DIR = Path(os.environ.get("RPSBOARD_DATA_DIR", ROOT_DIR / "data"))
 DB_PATH = Path(os.environ.get("RPSBOARD_DB_PATH", DATA_DIR / "rpsboard.db"))
-CACHE_DIR = DATA_DIR / "backtest_cache"
+
+#: 本机通达信安装目录。**只有 backend/tests 下的探针脚本用它**——主源 eltdx 是
+#: TCP 直连，不依赖本机通达信安装。换机器/换盘符用环境变量覆盖：
+#:   Windows:     set RPSBOARD_TDX_DIR=E:\new_tdx
+#:   Linux/macOS: export RPSBOARD_TDX_DIR=/opt/tdx
+TDX_DIR = Path(os.environ.get("RPSBOARD_TDX_DIR", r"D:\tdx"))
+#: eltdx 的板块资料缓存目录（infoharbor_block.dat / tdxhy.cfg / security_list.json）
+DOWNLOAD_DIR = Path(os.environ.get("RPSBOARD_DOWNLOAD_DIR", ROOT_DIR / "downloads"))
+# eltdx 默认把板块资料缓存写到「进程 CWD 下的 downloads」（见其 helpers/boards.py），
+# 固定到 <仓库>/downloads：本机位置不变，别人从任何目录运行也不会多出一份缓存。
+# 用户显式设置 ELTDX_BOARD_DATA_DIR 时不覆盖。
+os.environ.setdefault("ELTDX_BOARD_DATA_DIR", str(DOWNLOAD_DIR))
 
 # ── RPS 周期 ────────────────────────────────────────────────────────
 # 欧奈尔原始定义为 250 日（52 周），国内实操常用 20/60/120
@@ -20,7 +31,8 @@ PERIODS: tuple[int, ...] = (20, 60, 120, 250)
 DEFAULT_PERIOD = 60
 
 # ── 性能监测 ────────────────────────────────────────────────────────
-#: 运行日志目录（uvicorn 的 out/err 日志也写在这里）
+#: 性能日志目录（logs/perf.jsonl，见 api/perf.py）。要留 uvicorn 的 stdout/stderr
+#: 也可以重定向到这里（启动脚本没有代做这件事）。
 LOG_DIR = Path(os.environ.get("RPSBOARD_LOG_DIR", ROOT_DIR / "logs"))
 #: 每个请求追加一行 JSON。logs/ 已在 .gitignore，刻意不做轮转：
 #: 一行约 0.2 KB，个人盯盘的使用强度下一天也就几百 KB。
@@ -79,5 +91,4 @@ def exchange_of(symbol: str) -> str:
 
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)

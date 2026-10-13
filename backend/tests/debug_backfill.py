@@ -1,27 +1,32 @@
-"""排查多进程采集卡死：单独跑一个 worker，看 baostock 是否正常返回。"""
-import sys, time, sqlite3
+"""排查采集链路：单进程直连 eltdx，逐段计时看日K 拉取是否正常。
+
+多进程回填卡死/变慢时先跑这个：只用一条连接、一只股票，先把并发因素排除掉，
+就能判断是协议侧不通/慢，还是本地并发调度的问题。
+"""
+import sys, time
 sys.path.insert(0, "backend")
-from rpsboard import db, config
-from rpsboard.sources import baostock_src
 
-print("rows in daily_bar:", db.count_rows(db.connect(), "daily_bar"))
+from rpsboard import db
+from rpsboard.sources.tdxnet_src import TdxSource
 
-print("\n--- single-process direct query (sh.600000) ---")
-t0 = time.time()
-import baostock as bs
-lg = bs.login()
-print("login:", lg.error_code, lg.error_msg, f"{time.time()-t0:.1f}s")
-t0 = time.time()
-rs = bs.query_history_k_data_plus(
-    "sh.600000", "date,open,high,low,close,volume,amount,turn,pctChg,isST,tradestatus",
-    start_date="2025-01-01", end_date="2026-10-12", frequency="d", adjustflag="1")
-n = 0
-while rs.error_code == "0" and rs.next():
-    n += 1
-print(f"rows={n} error={rs.error_code} elapsed={time.time()-t0:.1f}s")
-bs.logout()
+conn = db.connect()
+print("rows in daily_bar:", db.count_rows(conn, "daily_bar"))
 
-print("\n--- worker function direct call ---")
+print("\n--- connect + latest_stock_list ---")
 t0 = time.time()
-res = baostock_src._fetch_batch(([("600000", "sh.600000", "2025-01-01", "2026-10-12")], 3))
-print(f"worker rows={len(res)} elapsed={time.time()-t0:.1f}s")
+src = TdxSource()
+t_conn = time.time() - t0
+t0 = time.time()
+lst = src.stock_list()
+print(f"connect={t_conn:.2f}s  stock_list rows={len(lst)} elapsed={time.time()-t0:.2f}s")
+
+print("\n--- hfq_bars('600000') ---")
+t0 = time.time()
+df = src.hfq_bars("600000")
+print(f"rows={len(df)} elapsed={time.time()-t0:.3f}s")
+if not df.empty:
+    print(f"区间 {df['date'].iloc[0]} ~ {df['date'].iloc[-1]}")
+    print("末行:", df.iloc[-1].to_dict())
+
+src.close()
+conn.close()
