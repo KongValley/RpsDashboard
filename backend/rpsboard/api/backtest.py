@@ -24,6 +24,10 @@ _CACHE_MAX = 32
 
 
 def _cache_token(conn) -> str:
+    # 空库（刚 clone、还没 init/backfill）不能直查：调用方拿到 "" 会正常返回空结果，
+    # 而不是抛 no such table 变成 500。
+    if not db.table_exists(conn, "rps_daily"):
+        return ""
     row = conn.execute("SELECT MAX(date) AS d FROM rps_daily").fetchone()
     return str(row["d"]) if row and row["d"] else ""
 

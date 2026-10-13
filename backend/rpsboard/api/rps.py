@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pandas as pd
 from fastapi import APIRouter, Query
+from fastapi.responses import StreamingResponse
 
 from .. import config, db
 from . import jsonable, latest_bar_date, nth_previous_date, read_sql, resolve_date
@@ -405,14 +406,12 @@ def ranking_export(
     exclude_st: bool = True,
     min_amount: float = 0.0,
     sort: str = "rps",
-) -> "StreamingResponse":
+) -> StreamingResponse:
     """按当前筛选条件导出**全量** CSV。
 
     之前前端导出的是 `rows.value`，也就是**当前页那 100 行**，按钮却写「导出 CSV」，
     用户会以为拿到了全市场。这里改为服务端按同一套筛选条件取全量。
     """
-    from fastapi.responses import StreamingResponse
-
     industries = industries if isinstance(industries, str) else None
     if period not in config.PERIODS:
         period = config.DEFAULT_PERIOD

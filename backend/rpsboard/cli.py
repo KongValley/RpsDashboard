@@ -298,6 +298,12 @@ def cmd_status(_: argparse.Namespace) -> int:
         rps_n = db.count_rows(conn, "rps_daily")
         ind = db.count_rows(conn, "industry_rps_daily")
         lim = db.count_rows(conn, "price_limit_daily")
+        # 未建库时**不能**直接查表：start.bat 的第一步就是这个命令，
+        # 新人 clone 下来双击立刻吃一个 no such table traceback 是最糟的第一印象。
+        if not db.table_exists(conn, "daily_bar"):
+            print(f"数据库      {config.DB_PATH}")
+            print("  尚未初始化：先运行  python -m rpsboard.cli init")
+            return 0
         last = conn.execute("SELECT MAX(date) AS d FROM daily_bar").fetchone()["d"]
         n_sym = conn.execute("SELECT COUNT(*) AS c FROM security_master").fetchone()["c"]
         print(f"数据库      {config.DB_PATH}")

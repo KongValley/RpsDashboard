@@ -1,6 +1,7 @@
 """FastAPI 应用工厂与公共依赖。
 
-硬性约束：**所有 handler 只读 SQLite，绝不在请求链路内调用 baostock/akshare**。
+硬性约束：**所有 handler 只读 SQLite，绝不在请求链路内做任何外部采集**
+（eltdx 取数在 CLI 里，见 sources/tdxnet_src.py）。
 外部数据采集一律由 CLI / 定时任务离线完成。
 """
 
@@ -109,7 +110,7 @@ def jsonable(df: pd.DataFrame) -> list[dict]:
 def create_app() -> FastAPI:
     app = FastAPI(
         title="A股 RPS 看板",
-        description="欧奈尔相对价格强度看板 · 数据源 baostock + akshare",
+        description="欧奈尔相对价格强度看板 · 数据源 eltdx（通达信行情协议，TCP 直连）",
         version="0.1.0",
     )
     app.add_middleware(
@@ -156,6 +157,9 @@ def _mount_frontend(app: FastAPI) -> None:
     dist = Path(__file__).resolve().parents[3] / "frontend" / "dist"
     index = dist / "index.html"
     if not index.is_file():
+        # 新人 clone 下来直接跑 uvicorn 时，/ 会是 404；把原因和两条出路直接说出来
+        print("[api] 未找到 frontend/dist：本次只提供 API（/ 不会返回页面）。"
+              "前端开发用 vite dev（5173），或先 `npm run build` 由后端单端口托管")
         return
 
     assets = dist / "assets"
