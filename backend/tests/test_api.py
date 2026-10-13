@@ -7,8 +7,8 @@ import sqlite3
 import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
-
-from rpsboard import config, db as dbmod
+from rpsboard import config
+from rpsboard import db as dbmod
 from rpsboard.analytics import rps as rps_engine
 from rpsboard.analytics.matrix import (
     build_close_matrix,
@@ -51,9 +51,6 @@ def seeded(tmp_path, monkeypatch):
     ).to_sql("industry_map", conn, if_exists="append", index=False)
 
     close = build_close_matrix(df)
-    frames = rps_engine.compute_rps_frames(
-        close, build_tradable_matrix(df), build_st_flags(df)
-    )
     rps_engine.materialize(
         conn, close, build_tradable_matrix(df), build_st_flags(df), ind, None
     )

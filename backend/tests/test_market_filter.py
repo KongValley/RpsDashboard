@@ -15,7 +15,6 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import pytest
-
 from rpsboard.analytics.backtest import (
     MARKET_FILTERS,
     market_state,
@@ -69,7 +68,6 @@ def test_trend_up_requires_both_conditions():
     # 先涨后跌：价格 > MA200 但 MA50 < MA200 → trend_up 必须为 False
     close = pd.Series(np.concatenate([np.linspace(100, 300, 300), np.linspace(300, 120, 100)]), index=idx)
     ok = market_state(close, "trend_up")
-    tail = ok.iloc[350:]
     ma50 = close.rolling(50, min_periods=50).mean().iloc[350:]
     ma200 = close.rolling(200, min_periods=200).mean().iloc[350:]
     manual = ((close.iloc[350:] > ma200) & (ma50 > ma200)).fillna(False)
@@ -80,8 +78,9 @@ def test_trend_up_requires_both_conditions():
 @pytest.mark.parametrize("mode", ["ma200", "above_ma50", "trend_up"])
 def test_market_filter_has_no_lookahead(mode):
     """扰动截止日之后的行情，截止日当天的择时判定必须逐值不变。"""
-    from .fixtures import perturb_after
     from rpsboard.analytics.matrix import build_close_matrix
+
+    from .fixtures import perturb_after
 
     df = make_long(n_symbols=12, n_days=320, seed=808)
     cutoff = "2024-06-28"
@@ -103,8 +102,9 @@ def test_market_filter_has_no_lookahead(mode):
 
 def test_market_filter_reacts_to_past_only():
     """反向确认：改动截止日**之前**的历史，判定必须改变（否则说明压根没在用行情）。"""
-    from .fixtures import perturb_after
     from rpsboard.analytics.matrix import build_close_matrix
+
+    from .fixtures import perturb_after
 
     df = make_long(n_symbols=12, n_days=320, seed=808)
     cutoff = "2024-06-28"

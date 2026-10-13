@@ -4,9 +4,6 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
-from typing import TypeVar
-
-T = TypeVar("T")
 
 
 class SourceError(RuntimeError):
@@ -16,7 +13,7 @@ class SourceError(RuntimeError):
     """
 
 
-def with_retry(
+def with_retry[T](
     fn: Callable[[], T],
     *,
     max_retries: int = 3,

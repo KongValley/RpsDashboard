@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import sqlite3
 
-import numpy as np
 import pandas as pd
 
 #: 判定容差（百分点）。用于吸收交易所价位四舍五入与后复权比率的偏差。

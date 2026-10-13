@@ -143,7 +143,6 @@ def backfill_bars(
         print(f"[eltdx] 证券清单 {len(master)} 只，用时 {time.time()-t0:.1f}s")
 
         st_map = master.set_index("symbol")["is_st"].to_dict()
-        name_map = master.set_index("symbol")["name"].to_dict()
         db.upsert_master(conn, master[["symbol", "name", "exchange"]].assign(
             ipo_date=None, is_st=master["is_st"], updated_at=db.now()
         ))

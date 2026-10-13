@@ -28,11 +28,12 @@ RPS 把全市场个股按区间涨幅做**横截面百分位排名**：RPS=90 �
 ### 1. 环境
 
 需要 [uv](https://docs.astral.sh/uv/)（本机已装 0.12.24）和 Node.js 18+。
+Python 需要 **3.12**（`pyproject.toml` 的 `requires-python` 与 `.python-version` 一致）。
 
 ```powershell
 cd <克隆到本地的目录>
-uv venv --python 3.12
-uv pip install -e ".[dev]"
+uv sync --extra dev            # 按 uv.lock 装出可复现的环境（推荐）
+# 等价写法：uv venv --python 3.12 && uv pip install -e ".[dev]"
 ```
 
 ### 2. 初始化与采集
@@ -378,13 +379,25 @@ RPS        4,009,287 行（20/60/120/250 四周期）
 
 命令行等价入口：`update.bat` 或 `python -m rpsboard.cli update`。
 
-## 测试
+## 测试与检查
 
 ```powershell
-.venv\Scripts\python.exe -m pytest backend/tests
+.venv\Scripts\python.exe -m pytest backend/tests     # 全套（含覆盖率）
+.venv\Scripts\python.exe -m ruff check backend       # Python lint
+cd frontend; npm run lint; npm run build             # 前端 lint + 构建
 ```
 
 全部测试离线运行，使用合成数据，不触网。
+
+- **覆盖率**：`pytest` 默认带 `--cov=rpsboard --cov-fail-under=50`（门槛取首次实测值：
+  全套实测 TOTAL **54%**）。`cli.py` 与 `sources/*` 目前接近零覆盖，门槛按实测值设，
+  不虚设高线。
+- **lint**：ruff（`select = E,F,W,I,UP,B`，`ignore` 里三条都在 pyproject 注明理由）；
+  一次性调研脚本（`probe_*` / `debug_*` / `diag_*` / `verify_*`）用
+  `extend-exclude` 排除在外 —— 它们是现场临时脚本，重排风格只会淹没真实改动。
+- **CI**：`.github/workflows/ci.yml`，push 与 PR 各跑一遍 backend（ruff + pytest，
+  用 `uv sync --frozen` 按 `uv.lock` 装）与 frontend（`npm ci` + lint + build）两个 job。
+- **依赖锁定**：`uv.lock` 入库，CI 用 `--frozen` 保证可复现。
 
 ### 开发脚本
 
@@ -393,6 +406,8 @@ RPS        4,009,287 行（20/60/120/250 四周期）
 保留下来是为了让当时的结论可复现。约定：
 
 - 必须**从仓库根目录**运行（脚本里 `sys.path.insert(0, "backend")`，相对路径也按根解析）。
+- **不参与 lint**（ruff 的 `extend-exclude` 排除了这批）：它们是现场跑的一次性脚本，
+  风格不统一，重排只会淹没真实改动。
 - 依赖装在 optional extra 里：`uv pip install -e ".[dev,probe]"`（`requests` / `akshare` / `baostock`）。
 - 多数需要联网；`verify_*` 还需要已 `backfill` 过的库；`verify_api.py` / `verify_sector_sort.py` /
   `bench_api.py` / `build_sort_check.mjs` 需要后端已在 8000 端口运行。

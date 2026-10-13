@@ -10,12 +10,12 @@ import argparse
 import multiprocessing as mp
 import sys
 import time
-from datetime import date
 
 import pandas as pd
 
 from . import config, db
-from .analytics import matrix, rps as rps_engine
+from .analytics import matrix
+from .analytics import rps as rps_engine
 from .sources import limit_src, tdxnet_src
 from .sources.base import SourceError
 
@@ -115,7 +115,7 @@ def cmd_compute_rps(args: argparse.Namespace) -> int:
                 print(f"[rps] 增量计算 {len(targets)} 天：{targets[0]} ~ {targets[-1]}")
                 print(f"[rps] 计算窗口从 {start} 起（需要 {max(config.PERIODS)} 根前置 K 线）")
                 if len(targets) > INCREMENTAL_PENDING_HINT:
-                    print(f"[rps] 提示：待算日期偏多，若刚订正过历史行情请加 --full 重算")
+                    print("[rps] 提示：待算日期偏多，若刚订正过历史行情请加 --full 重算")
 
             long = matrix.load_long(conn, start)
             if long.empty:

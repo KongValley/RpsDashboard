@@ -10,8 +10,6 @@ from __future__ import annotations
 import sqlite3
 
 import pandas as pd
-import pytest
-
 from rpsboard.analytics import rps as engine
 from rpsboard.analytics.matrix import (
     build_close_matrix,
@@ -76,8 +74,6 @@ def test_symbol_in_many_concepts_is_counted_once(tmp_path):
     这是个真实的建模陷阱：概念成分高度重叠（AI 算力 / CPO 常常共享个股）。
     """
     df = make_long(n_symbols=30, n_days=300, seed=99)
-    close = build_close_matrix(df)
-    frames = engine.compute_rps_frames(close)
     symbols = sorted(df["symbol"].unique())
     mapping = {s: "概念A" for s in symbols}          # 全部同一个概念
     conn = sqlite3.connect(str(tmp_path / "m.db"))

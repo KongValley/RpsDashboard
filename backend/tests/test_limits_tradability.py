@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import pandas as pd
 import pytest
-
 from rpsboard.analytics.backtest import _exit_blocked, _forward_return
 from rpsboard.analytics.limits import limit_mask
 

@@ -10,9 +10,8 @@ import sqlite3
 
 import pytest
 from fastapi.testclient import TestClient
-
-from rpsboard import config, db as dbmod
-
+from rpsboard import config
+from rpsboard import db as dbmod
 from rpsboard.api import perf
 
 
@@ -122,7 +121,7 @@ def test_jsonl_appended(perf_env):
     client.post("/api/meta/perf/client", json={"entries": [{"path": "/api/x", "ms": 5}]})
 
     lines = (tmp_path / "perf.jsonl").read_text(encoding="utf-8").strip().splitlines()
-    rows = [json.loads(l) for l in lines]
+    rows = [json.loads(line) for line in lines]
     assert len(rows) == 3
     assert [r["src"] for r in rows] == ["server", "server", "client"]
     assert rows[1]["path"] == "/api/stock/ZZZZZZ" and rows[1]["status"] == 404

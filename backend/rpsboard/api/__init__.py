@@ -15,7 +15,7 @@ import pandas as pd
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .. import config, db
+from .. import __version__, db
 from . import perf
 
 _cache: dict[str, Any] = {"conn": None, "opened": None}
@@ -111,7 +111,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="A股 RPS 看板",
         description="欧奈尔相对价格强度看板 · 数据源 eltdx（通达信行情协议，TCP 直连）",
-        version="0.1.0",
+        version=__version__,
     )
     app.add_middleware(
         CORSMiddleware,

@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import pandas as pd
 import pytest
-
 from rpsboard.analytics import patterns
 
 
@@ -176,6 +175,7 @@ def test_window_start_uses_rps_dates():
     于是「近1日」实际覆盖 2 天，命中数对不上。
     """
     import sqlite3
+
     from rpsboard import db as dbmod
 
     conn = sqlite3.connect(":memory:")

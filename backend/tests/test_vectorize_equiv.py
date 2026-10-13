@@ -13,7 +13,6 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import pytest
-
 from rpsboard.analytics import backtest, rps
 from rpsboard.analytics.matrix import (
     build_close_matrix,

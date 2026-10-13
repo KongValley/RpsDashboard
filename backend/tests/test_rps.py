@@ -9,7 +9,6 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import pytest
-
 from rpsboard.analytics import rps
 from rpsboard.analytics.matrix import (
     build_close_matrix,
@@ -17,7 +16,7 @@ from rpsboard.analytics.matrix import (
     build_tradable_matrix,
 )
 
-from .fixtures import make_industry_map, make_long, perturb_after
+from .fixtures import make_long, perturb_after
 
 PERIODS = (20, 60, 120, 250)
 
@@ -220,7 +219,7 @@ def test_suspect_gaps_finds_interior_hole():
         "daily_bar", conn, if_exists="append", index=False)
 
     dates = sorted(df["date"].unique())
-    covered, hole = dates[20], dates[40]
+    hole = dates[40]
     conn.executemany(
         "INSERT INTO rps_daily(date, symbol, rps60) VALUES (?,?,?)",
         [(d, "000001", 50.0) for d in dates[20:] if d != hole],

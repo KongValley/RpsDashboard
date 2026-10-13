@@ -6,7 +6,7 @@ import pandas as pd
 from fastapi import APIRouter, HTTPException
 
 from .. import config, db
-from . import jsonable, read_sql, resolve_date
+from . import jsonable, read_sql
 
 router = APIRouter(prefix="/api/stock", tags=["stock"])
 
@@ -15,7 +15,6 @@ router = APIRouter(prefix="/api/stock", tags=["stock"])
 def detail(symbol: str) -> dict:
     conn = db.connect()
     try:
-        d = resolve_date(conn, None)
         row = read_sql(
             conn,
             "SELECT s.symbol, s.name, s.exchange, s.ipo_date, s.is_st, i.industry "

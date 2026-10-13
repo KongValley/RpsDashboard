@@ -234,7 +234,6 @@ def run_backtest(
     把总收益从 +43% 压到 +0.9%，属于静默改结论，因此不作为默认。
     矩阵通过 load_context() 做进程内缓存，重复调参不再重复读库。
     """
-    from .rps import compute_rps_frames
 
     if market_filter not in MARKET_FILTERS:
         market_filter = "none"
@@ -266,7 +265,6 @@ def run_backtest(
     close_wide = ctx["close"]
     tradable = ctx["tradable"]
     st_flags = ctx["st_flags"]
-    pct_wide = ctx["pct"]
 
     frames = get_frames(ctx, exclude_st)
     rps_main = frames[f"rps{period}"]

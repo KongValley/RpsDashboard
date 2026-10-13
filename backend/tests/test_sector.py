@@ -5,7 +5,6 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import pytest
-
 from rpsboard.analytics import rps
 from rpsboard.analytics.matrix import (
     build_close_matrix,
@@ -59,7 +58,7 @@ def test_industry_rps_ranking():
     ind_map = make_industry_map_zh(sorted(df["symbol"].unique()), 5)
     ind = rps.compute_industry_rps(frames, ind_map)
 
-    for date, grp in ind.groupby("date"):
+    for _date, grp in ind.groupby("date"):
         if len(grp) < 2:
             continue
         # 最强的行业，rps 必须显著高于均值

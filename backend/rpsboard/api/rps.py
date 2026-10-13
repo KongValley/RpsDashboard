@@ -226,7 +226,7 @@ def _ranking_fast(
     total_row = read_sql(
         conn,
         "SELECT COUNT(*) AS c FROM ("
-        + inner.replace(f" LIMIT ? OFFSET ?", "")
+        + inner.replace(" LIMIT ? OFFSET ?", "")
         + ") t",
         tuple(params),
     )
@@ -261,7 +261,7 @@ def _ranking_filtered(
     limit: int, page: int, sanxingdi: int = 0,
 ) -> tuple[pd.DataFrame, int]:
     """慢路径：行业 / 成交额过滤必须先 JOIN 再排序分页。"""
-    where = [f"r.date = ?"]
+    where = ["r.date = ?"]
     params: list = [d]
     where.append(f"r.rps{period} IS NOT NULL")
     where.append(f"r.rps{period} >= ? AND r.rps{period} <= ?")
@@ -271,7 +271,7 @@ def _ranking_filtered(
     if industries:
         names = [x.strip() for x in industries.split(",") if x.strip()]
         if names:
-            where.append("i.industry IN (%s)" % ",".join("?" * len(names)))
+            where.append(f"i.industry IN ({','.join('?' * len(names))})")
             params += names
     if min_amount > 0:
         where.append("b.amount >= ?")
@@ -528,10 +528,10 @@ def concept_ranking(date: str | None = None, period: int = config.DEFAULT_PERIOD
             period = config.DEFAULT_PERIOD
         df = read_sql(
             conn,
-            "SELECT concept, rps{p} AS rps, ret{p} AS period_return, "
+            f"SELECT concept, rps{period} AS rps, ret{period} AS period_return, "
             "member_count, leader_symbol, leader_name "
             "FROM concept_rps_daily WHERE date = ? "
-            "ORDER BY (rps{p} IS NULL), rps{p} DESC".format(p=period),
+            f"ORDER BY (rps{period} IS NULL), rps{period} DESC",
             (d,),
         )
         return {"rows": jsonable(df), "data_date": d, "period": period}
@@ -581,10 +581,10 @@ def sector(date: str | None = None, period: int = config.DEFAULT_PERIOD) -> dict
             period = config.DEFAULT_PERIOD
         df = read_sql(
             conn,
-            "SELECT industry, rps{p} AS rps, ret{p} AS period_return, "
+            f"SELECT industry, rps{period} AS rps, ret{period} AS period_return, "
             "member_count, leader_symbol, leader_name "
             "FROM industry_rps_daily WHERE date = ? "
-            "ORDER BY (rps{p} IS NULL), rps{p} DESC".format(p=period),
+            f"ORDER BY (rps{period} IS NULL), rps{period} DESC",
             (d,),
         )
         return {"rows": jsonable(df), "data_date": d, "period": period}

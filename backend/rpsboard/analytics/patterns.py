@@ -87,7 +87,7 @@ def compute_sanxingdi(
     # 三根分别是 T-2(k=2) / T-1(k=1) / T(k=0)
     c = {k: g["close"].shift(k) for k in (0, 1, 2)}
     h = {k: g["high"].shift(k) for k in (0, 1, 2)}
-    l = {k: g["low"].shift(k) for k in (0, 1, 2)}
+    lo = {k: g["low"].shift(k) for k in (0, 1, 2)}
     b = {k: body.groupby(d["symbol"], sort=False).shift(k) for k in (0, 1, 2)}
     date_of = {k: g["date"].shift(k) for k in (0, 1, 2)}
     bull = {k: (b[k] > 0) for k in (0, 1, 2)}
@@ -100,7 +100,7 @@ def compute_sanxingdi(
 
     out = d.loc[ok, ["date", "symbol"]].copy()
     out["base_date"] = date_of[2][ok].to_numpy()
-    out["base_low"] = l[2][ok].to_numpy()
+    out["base_low"] = lo[2][ok].to_numpy()
     out["base_high"] = h[2][ok].to_numpy()
     out["strength"] = (c[0][ok] / d["open"][ok].to_numpy() - 1.0)
     # 第一根实体 / 第三根实体。

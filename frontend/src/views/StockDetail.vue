@@ -81,7 +81,7 @@
             </tr>
           </thead>
           <tbody>
-            <tr v-for="(p, i) in pattern.patterns" :key="p.date">
+            <tr v-for="p in pattern.patterns" :key="p.date">
               <td class="mono">{{ p.date }}</td>
               <td class="mono muted">{{ p.base_date }}</td>
               <td class="num" :class="cls(p.strength)">{{ pctText(p.strength) }}</td>

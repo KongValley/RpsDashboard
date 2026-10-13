@@ -10,7 +10,6 @@ import sqlite3
 
 import pandas as pd
 
-
 #: 窗口占比超过这个比例时改走顺序扫描（见 load_long 的说明）
 SEQ_SCAN_RATIO = 0.2
 

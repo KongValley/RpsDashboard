@@ -13,7 +13,6 @@ from datetime import date
 
 import pandas as pd
 import pytest
-
 from rpsboard.analytics.costs import (
     DEFAULT_PORTFOLIO_NOTIONAL,
     STAMP_CUTOFF,

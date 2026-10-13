@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import pandas as pd
 import pytest
-
 from rpsboard.analytics.limits import NO_LIMIT_STATUSES, limit_mask
 
 RULES = ["main_10pct", "chinext_20pct", "star_20pct", "bse_30pct",

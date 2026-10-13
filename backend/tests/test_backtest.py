@@ -5,7 +5,6 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import pytest
-
 from rpsboard.analytics import backtest as bt
 from rpsboard.analytics.matrix import build_close_matrix
 
@@ -210,6 +209,7 @@ def _seed_db(tmp_path, name, n_symbols, n_days, seed):
         build_st_flags,
         build_tradable_matrix,
     )
+
     from .fixtures import make_industry_map_zh
 
     path = tmp_path / name
@@ -252,6 +252,7 @@ def test_equity_curve_does_not_double_count(tmp_path):
     from rpsboard import db as dbmod
     from rpsboard.analytics import rps as rps_engine
     from rpsboard.analytics.matrix import build_st_flags, build_tradable_matrix
+
     from .fixtures import make_industry_map_zh
 
     # 40 只股票，每天稳定涨 1%（后复权），持有 20 天 → 单期约 +21.9%
