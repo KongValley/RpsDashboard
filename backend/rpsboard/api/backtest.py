@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import math
+import os
+import sqlite3
 import threading
 import time
 
@@ -24,12 +27,46 @@ _CACHE_MAX = 32
 
 
 def _cache_token(conn) -> str:
-    # 空库（刚 clone、还没 init/backfill）不能直查：调用方拿到 "" 会正常返回空结果，
-    # 而不是抛 no such table 变成 500。
+    """数据版本指纹：rps / 涨跌停 / 基准三张表的最大日期 + 库文件（含 -wal）mtime/size。
+
+    空库（刚 clone、还没 init/backfill）不能直查：调用方拿到 "" 会正常返回空结果，
+    而不是抛 no such table 变成 500。
+
+    只用 rps_daily.MAX(date) 是不够的：同日补采涨跌停、补基准、形态重算都不改
+    RPS 的日期，同参数请求会继续返回旧结论（实测过）。-wal 必须一起看：
+    WAL 模式下写入先进 db-wal，主库文件的 mtime/size 往往纹丝不动。
+    """
     if not db.table_exists(conn, "rps_daily"):
         return ""
-    row = conn.execute("SELECT MAX(date) AS d FROM rps_daily").fetchone()
-    return str(row["d"]) if row and row["d"] else ""
+    parts: list[str] = []
+    for sql in (
+        "SELECT MAX(date) AS d FROM rps_daily",
+        "SELECT MAX(date) AS d FROM price_limit_daily",
+        "SELECT MAX(date) AS d FROM benchmark_bar",
+    ):
+        try:
+            row = conn.execute(sql).fetchone()
+            parts.append(str(row["d"]) if row and row["d"] else "-")
+        except sqlite3.Error:
+            parts.append("-")
+    try:
+        path = conn.execute("PRAGMA database_list").fetchone()[2] or ""
+    except sqlite3.Error:
+        path = ""
+    stamp = 0
+    for suffix in ("", "-wal"):
+        try:
+            st = os.stat(path + suffix)
+        except OSError:
+            continue
+        stamp += int(st.st_mtime) * 1_000_000 + st.st_size
+    parts.append(str(stamp))
+    return "|".join(parts)
+
+
+def clear_backtest_cache() -> None:
+    """数据更新后清掉回测结果缓存（后台更新流程结束时调用）。"""
+    _CACHE.clear()
 
 
 #: 允许的基准指数。给了白名单外的字符串时 benchmark_bar 查不到 → 基准线全空
@@ -59,7 +96,14 @@ def run(
     if period not in config.PERIODS:
         period = config.DEFAULT_PERIOD
     hold = max(1, min(int(hold), 250))
+    # nan 会被 min/max 静默吞掉（min(nan,100)=nan，max(0.0,nan)=0.0 → 变成 0.0），
+    # 于是「阈值 0」这种从没被请求过的参数被当成有效输入拿去算回测。
+    if not math.isfinite(float(threshold)):
+        threshold = 80.0
     threshold = max(0.0, min(float(threshold), 100.0))
+    # rebalance 完全不夹取时，负数会绕过引擎里的 step 计算
+    if rebalance is not None:
+        rebalance = max(1, min(int(rebalance), 250))
     if market_filter not in engine.MARKET_FILTERS:
         market_filter = "none"
     if benchmark not in BENCHMARKS:
@@ -127,24 +171,32 @@ _update_state: dict = {"running": False, "phase": None, "run_id": None,
                       "error": None, "started_at": None, "finished_at": None}
 
 
-def _run_update_bg() -> None:
-    """后台线程体。异常必须自己吞掉并写状态，否则前端会永远轮询到 running。"""
+def _run_update_bg(run_id: str) -> None:
+    """后台线程体。异常必须自己吞掉并写状态，否则前端会永远轮询到 running。
+
+    run_id 由**请求线程**生成后传进来：以前在线程里 start_run 之后立刻把
+    `_update_state["run_id"]` 读出去返回，竞态下响应里的 run_id 是 None。
+    """
     t0 = time.time()
     try:
         def progress(phase: str) -> None:
             _update_state["phase"] = phase
-        with db.session() as conn:
-            run_id = db.start_run(conn, task="update", source="internal")
-            _update_state["run_id"] = run_id
         res = cli_run_update_pipeline(progress)
         _update_state.update(phase="done", error=None,
                              result=res, elapsed=round(time.time() - t0, 1))
+        with db.session() as conn:
+            db.finish_run(conn, run_id, "success", int(res.get("price_limit_rows", 0)),
+                          f"更新完成；预警命中 {res.get('alert_hits', 0)} 条")
     except Exception as exc:  # noqa: BLE001
         _update_state.update(phase="failed", error=str(exc),
                              elapsed=round(time.time() - t0, 1))
+        with db.session() as conn:
+            db.finish_run(conn, run_id, "failed", 0, f"{type(exc).__name__}: {exc}")
     finally:
         _update_state["running"] = False
         _update_state["finished_at"] = db.now()
+        # 数据变了 → 回测结果缓存必须失效（指纹能拦掉大部分，这里更直接）
+        clear_backtest_cache()
 
 
 @router.post("/admin/update")
@@ -161,13 +213,20 @@ def start_update(req: CollectRequest = Body(default=CollectRequest())) -> dict:
         return {"ok": False, "error": "已有更新任务在执行中，请等待完成",
                 "phase": _update_state.get("phase"), "running": True}
     try:
+        # 互斥判定必须在锁内做：以前只在启动瞬间持锁，第二次 POST 拿到锁后又
+        # 直接覆盖状态并起第二个线程（两个采集进程写同一个库）。
+        if _update_state.get("running"):
+            return {"ok": False, "error": "已有更新任务在执行中，请等待完成",
+                    "phase": _update_state.get("phase"), "running": True}
+        with db.session() as conn:
+            run_id = db.start_run(conn, task="update", source="internal")
         _update_state.update(running=True, phase="starting", error=None,
-                             run_id=None, started_at=db.now(),
+                             run_id=run_id, started_at=db.now(),
                              finished_at=None, elapsed=None)
-        threading.Thread(target=_run_update_bg, daemon=True).start()
-        return {"ok": True, "run_id": _update_state["run_id"], "running": True}
+        threading.Thread(target=_run_update_bg, args=(run_id,), daemon=True).start()
+        return {"ok": True, "run_id": run_id, "running": True}
     finally:
-        # 锁只在启动瞬间持有，线程本身不持锁；真正的互斥靠 running 标记
+        # 锁只在启动瞬间持有，线程本身不持锁；真正的互斥靠上面的 running 检查
         _update_lock.release()
 
 

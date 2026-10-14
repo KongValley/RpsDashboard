@@ -187,27 +187,28 @@ def load_context(
 def clear_context_cache() -> None:
     """数据更新后主动失效（CLI 跑完 compute-rps / backfill 后调用）。"""
     _ctx_cache.update(key=None, at=0.0, data=None)
-    _frames_cache.clear()
-
-
-_frames_cache: dict[tuple, dict] = {}
 
 
 def get_frames(ctx: dict, exclude_st: bool = True) -> dict:
-    """取 RPS 各周期帧（同样进程内缓存）。
+    """取 RPS 各周期帧（缓存在 ctx 内，随 ctx 一起被替换/回收）。
 
     compute_rps_frames 一次算出全部周期的 ret+rps 共 2×len(config.PERIODS) 个矩阵，
     约 3 秒；缓存后切换周期/阈值就不用重算。
+
+    ⚠ 缓存必须挂在 ctx 上。早期版本用 `id(ctx)` 当全局字典的 key：ctx 被替换后
+    旧 id 指针不再被引用，而 `id()` 可以被新对象复用，于是每次 5 分钟过期都会
+    往 `_frames_cache` 里塞进一份**新的**约 400MB 矩阵且永不回收。
     """
     from .rps import compute_rps_frames
 
-    key = (id(ctx), bool(exclude_st))
-    hit = _frames_cache.get(key)
+    cache = ctx.setdefault("_frames", {})
+    key = bool(exclude_st)
+    hit = cache.get(key)
     if hit is None:
         hit = compute_rps_frames(
             ctx["close"], ctx["tradable"], ctx["st_flags"], exclude_st, config.PERIODS
         )
-        _frames_cache[key] = hit
+        cache[key] = hit
     return hit
 
 
@@ -258,6 +259,11 @@ def run_backtest(
     矩阵通过 load_context() 做进程内缓存，重复调参不再重复读库。
     """
 
+    # 入口兜底：传进来的 period 不在周期真源里会让 frames[f"rps{period}"] KeyError，
+    # hold 为 0/负数会让 fwd = close.shift(-hold) 变成「未来负数天」的假收益。
+    if period not in config.PERIODS:
+        period = config.DEFAULT_PERIOD
+    hold = max(1, min(int(hold), 250))
     if market_filter not in MARKET_FILTERS:
         market_filter = "none"
     if cost_model is None:
@@ -341,7 +347,18 @@ def run_backtest(
     fwd = fwd.reindex(index=mask.index, columns=mask.columns)
 
     dates = list(mask.index)
-    step = max(1, int(rebalance or hold))
+    # 重叠持仓期（rebalance < hold）在当前「逐段复利」的净值模型里无法正确表达：
+    # fwd 恒为 hold 日收益，若每 rebalance 天乘一次就等于把同一段行情重复计入
+    # （hold=20/rebalance=5 会把 20 日收益乘 4 次）。回落为 hold 并写 warning，
+    # 不静默给出几百个百分点的年化。
+    step = int(rebalance or hold)
+    if step < hold:
+        result.warnings.append(
+            f"调仓间隔 {step} 天小于持有期 {hold} 天，重叠持仓无法逐段复利，"
+            f"已按持有期 {hold} 天作为调仓间隔计算"
+        )
+        step = hold
+    step = max(1, step)
 
     # ── 大盘择时 ──────────────────────────────────────────────────
     # 先取基准，再据此决定每个调仓点是否允许开仓。择时只看当日及之前的
@@ -356,6 +373,15 @@ def run_backtest(
         bench["close"] = pd.to_numeric(bench["close"], errors="coerce")
         bench = bench.dropna(subset=["close"])
         bench_close = bench.set_index("date")["close"].sort_index()
+    if market_filter != "none" and bench_close.empty:
+        # 静默回落成「全 False」会让净值曲线变成 0% 平线，看起来像「这个策略不赚钱」，
+        # 实际是择时数据缺了。必须说清楚并退回不择时。
+        result.warnings.append(
+            f"benchmark_bar 无 {benchmark_symbol} 数据，无法判定"
+            f"「{MARKET_FILTER_LABELS[market_filter]}」，"
+            "本次回测按不择时处理（结果不是「零收益策略」）"
+        )
+        market_filter = "none"
     mkt_ok = market_state(bench_close, market_filter).reindex(dates).fillna(False)
     mkt_ok = mkt_ok.astype(bool) if market_filter != "none" else pd.Series(
         True, index=dates, dtype=bool
@@ -378,6 +404,7 @@ def run_backtest(
     equity = 1.0
     curve: list[dict] = []
     total_deferred = 0
+    holdings_used: list[int] = []      # 供成本口径说明算真实持仓中位数
     for idx, t in enumerate(dates):
         if idx % step:
             continue
@@ -419,11 +446,19 @@ def run_backtest(
             t, n_positions=len(names)
         )
         equity *= float(1.0 + period_ret)
+        holdings_used.append(int(len(names)))
         curve.append({"date": t.strftime("%Y-%m-%d"),
                       "equity": round(equity, 6),
                       "holdings": int(len(names)),
                       "deferred": deferred})
     result.equity_curve = curve
+    if holdings_used:
+        # 5 元最低佣金是按「组合名义金额」生效的：持仓越多，均摊到每只票的
+        # 固定费用越低。params["cost"] 是前端用来解释扣费口径的说明，
+        # 必须按**实际**持仓数的中位数来描述，而不是默认的 50 只。
+        result.params["cost"] = cost_model.describe(
+            n_positions=int(max(1, np.median(holdings_used)))
+        )
     if total_deferred:
         result.warnings.append(
             f"卖出受阻：{total_deferred} 个持仓在计划卖出日跌停或停牌，"
@@ -468,7 +503,11 @@ def run_backtest(
 
     # ── 指标 ─────────────────────────────────────────────────────
     eq = pd.Series([c["equity"] for c in result.equity_curve], dtype="float64")
-    result.metrics = compute_metrics(eq, n_days_per_point=step)
+    result.metrics = compute_metrics(
+        eq,
+        n_days_per_point=step,
+        dates=[c["date"] for c in result.equity_curve],
+    )
 
     # ── RPS 分档前瞻收益（核心验证图）───────────────────────────
     # 刻意**不扣成本**：这张图衡量的是「RPS 信号本身有没有预测力」，
@@ -481,13 +520,21 @@ def run_backtest(
     return result
 
 
-def compute_metrics(equity: pd.Series, n_days_per_point: int = 20) -> dict:
+def compute_metrics(
+    equity: pd.Series,
+    n_days_per_point: int = 20,
+    dates: list[str] | None = None,
+) -> dict:
     """由净值序列算收益/风险指标。
 
     `n_days_per_point` 是相邻两个净值点之间跨越的**交易日数**（= 调仓周期）。
     净值点数 ≠ 交易日数，所以年化必须按 点数 × 调仓周期 折算，
     否则点数少时会算出天文数字（早期 bug：25 个点被当成 25 天，
     年化直接变成 61875%）。
+
+    `dates` 给出每个净值点的真实日期时**优先按首末日期跨度折算**：
+    被跳过的调仓点（矩阵前几行 RPS 全 NaN 必然发生）会让
+    `点数 × 调仓周期` 系统性低估已用时长、抬高年化（实测约 7%）。
     """
     if equity.empty or len(equity) < 2:
         return {"total_return": 0.0, "annualized": 0.0, "volatility": 0.0,
@@ -497,7 +544,11 @@ def compute_metrics(equity: pd.Series, n_days_per_point: int = 20) -> dict:
     rets = equity.pct_change().dropna()
     total = float(equity.iloc[-1] / equity.iloc[0] - 1.0)
     n_pts = len(equity)
-    years = max(1e-9, (n_pts - 1) * max(1, n_days_per_point) / 252.0)
+    if dates is not None and len(dates) == n_pts:
+        span_days = (pd.Timestamp(dates[-1]) - pd.Timestamp(dates[0])).days
+        years = max(1e-9, span_days / 365.25)
+    else:
+        years = max(1e-9, (n_pts - 1) * max(1, n_days_per_point) / 252.0)
 
     ann = (1.0 + total) ** (1.0 / years) - 1.0 if total > -1 else -1.0
     vol = float(rets.std(ddof=1) * np.sqrt(1.0 / years)) if len(rets) > 1 else 0.0

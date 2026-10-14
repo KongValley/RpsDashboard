@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 
 from .. import config
@@ -35,12 +36,38 @@ def _trade_dates_before(conn: sqlite3.Connection, date: str, n: int) -> list[str
     return sorted(r["date"] for r in rows)
 
 
+def _as_float(params: dict, key: str, default: float) -> float:
+    """params[key] 转 float；None / 空串 / 非法 / 非有限值一律回落 default。
+
+    库里可能存着老版本前端写进去的 `{"min": null}`（JSON null）——
+    直接 float(None) 会让整条规则评估抛 TypeError，连带后面所有规则都不跑。
+    """
+    raw = params.get(key)
+    if raw is None or raw == "":
+        return default
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return val if math.isfinite(val) else default
+
+
+def _as_int(params: dict, key: str, default: int) -> int:
+    raw = params.get(key)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
 def _hit_rps_threshold(conn, date: str, params: dict) -> list[tuple[str, str]]:
-    period = params.get("period", config.DEFAULT_PERIOD)
+    period = _as_int(params, "period", config.DEFAULT_PERIOD)
     if period not in config.PERIODS:
         period = config.DEFAULT_PERIOD
-    lo = float(params.get("min", 0.0))
-    hi = float(params.get("max", 100.0))
+    lo = _as_float(params, "min", 0.0)
+    hi = _as_float(params, "max", 100.0)
     lo, hi = min(lo, hi), max(lo, hi)
     rows = conn.execute(
         f"SELECT symbol, rps{period} AS v FROM rps_daily "
@@ -55,7 +82,7 @@ def _hit_sanxingdi(conn, date: str, params: dict) -> list[tuple[str, str]]:
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pattern_daily'"
     ).fetchone()):
         return []
-    window = int(params.get("window", 5))
+    window = _as_int(params, "window", 5)
     if window not in SANXINGDI_WINDOWS:
         window = 5
     dates = _trade_dates_before(conn, date, window)
@@ -124,7 +151,7 @@ def run_rules(conn: sqlite3.Connection, date: str | None = None) -> list[dict]:
             continue
         try:
             matched = _EVALUATORS[kind](conn, date, params)
-        except sqlite3.Error as exc:
+        except (sqlite3.Error, ValueError, TypeError) as exc:
             print(f"[alert] 规则 {rule['id']} 评估失败：{exc}")
             continue
         for symbol, detail in matched:
@@ -135,5 +162,8 @@ def run_rules(conn: sqlite3.Connection, date: str | None = None) -> list[dict]:
             )
             hits.append({"rule_id": rule["id"], "rule_name": rule["name"],
                          "date": date, "symbol": symbol, "detail": detail})
+        # 每条规则单独提交：只在最后 commit 的话，后面一条规则抛错会把前面
+        # 已经算好并写入的命中一起回滚掉（并且异常还会中断整轮评估）。
+        conn.commit()
     conn.commit()
     return hits
