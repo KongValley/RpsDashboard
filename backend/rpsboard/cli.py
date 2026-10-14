@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import multiprocessing as mp
+import sqlite3
 import sys
 import time
 
@@ -18,7 +19,7 @@ from . import config, db
 from .analytics import matrix
 from .analytics import rps as rps_engine
 from .sources import limit_src, tdxnet_src
-from .sources.base import SourceError
+from .sources.base import SourceError, tradestatus_from_calendar
 
 
 # ── init ────────────────────────────────────────────────────────────
@@ -153,43 +154,125 @@ def cmd_compute_rps(args: argparse.Namespace) -> int:
     return 0
 
 
+# ── tradestatus（数据修复，不联网）──────────────────────────────────
+def cmd_tradestatus(args: argparse.Namespace) -> int:
+    """按交易日口径重算 daily_bar.tradestatus，只写回真正变化的行（不联网、幂等）。
+
+    旧口径按**自然日**间隔判停牌，长假后第一个交易日被整日误判成停牌，
+    实测 21 个交易日 / 112k 行因此没有 RPS（见 sources/base.py 的说明）。
+    """
+    with db.session() as conn:
+        df = pd.read_sql_query(
+            "SELECT symbol, date, tradestatus FROM daily_bar ORDER BY symbol, date", conn
+        )
+        if df.empty:
+            print("[tradestatus] daily_bar 为空")
+            return 1
+        new = tradestatus_from_calendar(df)
+        old = df["tradestatus"].fillna(1).astype(int)
+        n_up = int(((old == 0) & (new == 1)).sum())
+        n_dn = int(((old == 1) & (new == 0)).sum())
+        print(f"[tradestatus] 0→1 {n_up} 行，1→0 {n_dn} 行（共 {len(df)} 行）")
+        if getattr(args, "dry_run", False):
+            print("[tradestatus] --dry-run：未写回")
+            return 0
+        changed = (old != new).to_numpy()
+        # 必须显式 int()：numpy 标量走缓冲区协议，sqlite3 会把它当成 BLOB 写进去
+        rows = list(zip(
+            (int(v) for v in new.to_numpy()[changed]),
+            df["symbol"].to_numpy()[changed],
+            df["date"].to_numpy()[changed],
+        ))
+        conn.executemany(
+            "UPDATE daily_bar SET tradestatus=? WHERE symbol=? AND date=?", rows
+        )
+        conn.commit()
+        print(f"[tradestatus] 已写回 {len(rows)} 行")
+    return 0
+
+
 # ── price-limits ────────────────────────────────────────────────────
+def missing_limit_dates(conn: sqlite3.Connection, limit: int = 0) -> list[str]:
+    """daily_bar 有、price_limit_daily 没有的交易日，**倒序**（先补最近的，保持覆盖连续）。
+
+    limit > 0 时只取前 limit 个（配合时间预算分批跑）。
+    """
+    sql = (
+        "SELECT DISTINCT d.date AS date FROM daily_bar d "
+        "WHERE NOT EXISTS (SELECT 1 FROM price_limit_daily p WHERE p.date = d.date) "
+        "ORDER BY d.date DESC"
+    )
+    if limit > 0:
+        sql += f" LIMIT {int(limit)}"
+    return [r["date"] for r in conn.execute(sql)]
+
+
 def cmd_price_limits(args: argparse.Namespace) -> int:
     """采集涨跌停。
 
     `daily_price_limits` 每次调用约 34 秒且**服务端不缓存**
     （同一 trade_date 连调两次分别 35.3s / 31.4s），
-    因此全历史 887 个交易日需要 8 小时以上。默认只补最近一天，
-    历史回补用 --days N 分批进行。
+    因此全历史 887 个交易日需要 8 小时以上。默认只补最近一天；
+    历史回补用 --days N 分批，或 `--fill` 断点续采（跳过已覆盖的日期，可反复运行）。
     """
+    days = int(getattr(args, "days", 0) or 0)
+    fill = bool(getattr(args, "fill", False))
+    if fill and days > 0:
+        print("[limits] --fill 与 --days 不能同时使用", file=sys.stderr)
+        return 2
+
     conn = db.connect()
     try:
-        days = int(getattr(args, "days", 0) or 0)
-        if days > 0:
-            rows = conn.execute(
-                "SELECT DISTINCT date FROM daily_bar ORDER BY date DESC LIMIT ?",
-                (days,),
-            ).fetchall()
+        if fill:
+            dates = missing_limit_dates(conn, limit=int(getattr(args, "max_days", 0) or 0))
+        elif days > 0:
+            dates = [
+                r["date"] for r in conn.execute(
+                    "SELECT DISTINCT date FROM daily_bar ORDER BY date DESC LIMIT ?",
+                    (days,),
+                )
+            ]
         else:
-            row = conn.execute(
-                "SELECT MAX(date) AS d FROM daily_bar").fetchone()
-            rows = [{"date": row["d"]}] if row and row["d"] else []
+            row = conn.execute("SELECT MAX(date) AS d FROM daily_bar").fetchone()
+            dates = [row["d"]] if row and row["d"] else []
     finally:
         conn.close()
-    if not rows:
-        print("[limits] daily_bar 为空")
-        return 1
+    if not dates:
+        print("[limits] daily_bar 为空" if not fill else "[limits] 涨跌停已覆盖全部交易日")
+        return 0 if fill else 1
 
-    dates = [r["date"] for r in rows]
+    max_minutes = float(getattr(args, "max_minutes", 0.0) or 0.0)
     total = 0
-    t_all = time.time()
+    done_days = 0
+    empty: list[str] = []
+    t_all = time.monotonic()
     for i, d in enumerate(dates, 1):
-        total += limit_src.sync_price_limits(d)
-        done = time.time() - t_all
+        n = limit_src.sync_price_limits(d)
+        total += n
+        done_days += 1
+        if n == 0:
+            # 服务器没数据或当天失败：本轮跳过（否则同一个空日期会反复重试，天荒地老）
+            empty.append(d)
+        done = time.monotonic() - t_all
         eta = done / i * (len(dates) - i)
         print(f"[limits] {i}/{len(dates)} 累计 {total} 行"
               f" | 已用 {done/60:.1f} 分钟 | 预计剩余 {eta/60:.1f} 分钟",
               flush=True)
+        if max_minutes > 0 and done > max_minutes * 60:
+            print(f"[limits] 已用 {done/60:.1f} 分钟，补了 {i} 天，"
+                  f"还剩 {len(dates) - i} 天，可再跑一次续采")
+            break
+    if empty:
+        print(f"[limits] 本轮 {len(empty)} 天返回 0 行（服务器无数据或失败）："
+              f"{', '.join(empty[:10])}{' …' if len(empty) > 10 else ''}")
+    if fill:
+        conn = db.connect()
+        try:
+            left = len(missing_limit_dates(conn))
+        finally:
+            conn.close()
+        print(f"[limits] 本轮补 {done_days} 天 / {total} 行，"
+              f"仍未覆盖 {left} 天（再跑一次 --fill 续采）")
     return 0
 
 
@@ -576,6 +659,7 @@ def _ns(**over):
         workers=config.TDX_WORKERS, limit=None, include_st=False,
         period=config.DEFAULT_PERIOD, threshold=80.0, hold=20,
         rebalance=None, resonance=False, full=False, market_filter="none",
+        dry_run=False, fill=False, max_minutes=0.0, max_days=0,
     )
     base.update(over)
     return argparse.Namespace(**base)
@@ -660,11 +744,20 @@ def build_parser() -> argparse.ArgumentParser:
                     help="从 CSV 导入（列：symbol,industry[,industry_cls]）")
     sp.set_defaults(func=cmd_industry_map)
 
+    sp = sub.add_parser("tradestatus", help="按交易日口径重算 tradestatus（修长假误判，不联网）")
+    sp.add_argument("--dry-run", action="store_true", help="只打印会改多少行，不写库")
+    sp.set_defaults(func=cmd_tradestatus)
+
     sp = sub.add_parser("price-limits", help="采集涨跌停价")
     sp.add_argument("--days", type=int, default=0,
                     help="回补最近 N 个交易日（每次调用约 34 秒且服务端不缓存，"
                          "全历史 887 天需 8 小时以上；默认只补最近一天）")
-    sp.set_defaults(func=lambda ns: (cmd_price_limits(ns), 0)[1])
+    sp.add_argument("--fill", action="store_true",
+                    help="补全历史：按 daily_bar 倒序补齐尚未覆盖的交易日（可反复运行续采）")
+    sp.add_argument("--max-days", type=int, default=0, help="本轮最多补几天（0 = 不限）")
+    sp.add_argument("--max-minutes", type=float, default=0.0,
+                    help="本轮时间预算（分钟，0 = 不限）；到点后打印剩余天数并退出")
+    sp.set_defaults(func=cmd_price_limits)
 
     sp = sub.add_parser("concept", help="采集概念板块并计算概念 RPS")
     sp.add_argument("--compute-only", action="store_true",
