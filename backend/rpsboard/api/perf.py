@@ -78,8 +78,15 @@ def record(
     ok: bool = True,
     error: str | None = None,
     ts: float | None = None,
-) -> dict:
-    """记一条请求。src 为 "server"（本进程处理的请求）或 "client"（浏览器上报）。"""
+) -> dict | None:
+    """记一条请求。src 为 "server"（本进程处理的请求）或 "client"（浏览器上报）。
+
+    ms 非有限值直接丢弃：NaN/Inf 会一路污染环形缓冲里的 p50/p95/max
+    （排序后 NaN 排在末尾、Inf 直接成为 max），而且会让落盘 JSON 变成
+    非标准 JSON。前端老版本上报过 `ms: NaN`（`performance.now()` 相减出问题）。
+    """
+    if not math.isfinite(ms):
+        return None
     entry = {
         "ts": ts or time.time(),
         "src": src,
@@ -165,14 +172,19 @@ router = APIRouter(prefix="/api/meta/perf", tags=["perf"])
 
 
 class ClientEntry(BaseModel):
-    """浏览器上报的单条请求。字段全部来自前端，属信任边界外，故限长限条数。"""
+    """浏览器上报的单条请求。字段全部来自前端，属信任边界外，故限长限条数。
+
+    数值字段必须带 `allow_inf_nan=False`：JSON 里的 `NaN` / `Infinity`
+    以前会被原样收下，进入环形缓冲后把 p50/p95/max 全变成 NaN，
+    `GET /api/meta/perf` 也跟着坏掉。现在直接 422。
+    """
 
     path: str = Field(max_length=300)
-    ms: float
-    server_ms: float | None = None
-    status: int | None = None
+    ms: float = Field(ge=0, le=600_000, allow_inf_nan=False)
+    server_ms: float | None = Field(default=None, ge=0, le=600_000, allow_inf_nan=False)
+    status: int | None = Field(default=None, ge=0, le=599)
     ok: bool = True
-    ts: float | None = None
+    ts: float | None = Field(default=None, ge=0, le=4_102_444_800, allow_inf_nan=False)
 
 
 class ClientBatch(BaseModel):
@@ -249,17 +261,26 @@ def _server_summary(rows: list[dict]) -> dict:
 
 
 def _client_summary(rows: list[dict]) -> dict:
+    def fin(v) -> float | None:
+        """非有限值一律 None：被污染过的老缓冲（旧版本收下过 ms=NaN）不能顺出来，
+        否则 round(NaN) 会让整个 JSON 响应变成非标准的 500。"""
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return None
+        return v if math.isfinite(v) else None
+
     def one(r: dict) -> dict:
-        server_ms = r["ttfb_ms"]
+        server_ms = fin(r.get("ttfb_ms"))
+        ms = fin(r.get("ms"))
+        # 允许为负：两端时钟/量化差异是真实存在的，夹紧只会掩盖它
+        net = None if ms is None or server_ms is None else round(ms - server_ms, 1)
         return {
-            "ts": round(r["ts"], 3),
-            "path": r["path"],
-            "ms": r["ms"],
+            "ts": fin(r.get("ts")),
+            "path": r.get("path"),
+            "ms": ms,
             "server_ms": server_ms,
-            # 允许为负：两端时钟/量化差异是真实存在的，夹紧只会掩盖它
-            "net_ms": None if server_ms is None else round(r["ms"] - server_ms, 1),
-            "status": r["status"],
-            "ok": r["ok"],
+            "net_ms": net,
+            "status": r.get("status"),
+            "ok": r.get("ok"),
         }
 
     return {

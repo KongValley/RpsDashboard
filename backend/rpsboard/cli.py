@@ -19,7 +19,7 @@ from . import config, db
 from .analytics import matrix
 from .analytics import rps as rps_engine
 from .sources import limit_src, tdxnet_src
-from .sources.base import SourceError, tradestatus_from_calendar
+from .sources.base import tradestatus_from_calendar
 
 
 # ── init ────────────────────────────────────────────────────────────
@@ -52,18 +52,32 @@ def cmd_backfill(args: argparse.Namespace) -> int:
     """回填 / 增量更新日K。eltdx 本身返回最近 N 根，多跑一次即为增量。"""
     config.ensure_dirs()
     db.init_db()
+    raw_workers = getattr(args, "workers", None)
+    # 不能用 `raw or default`：0 会被 or 当成「缺省」悄悄换成 8，
+    # 下面这道防线就永远拦不住 --workers 0
+    workers = int(config.TDX_WORKERS if raw_workers is None else raw_workers)
+    if workers < 1:
+        # ThreadPoolExecutor(max_workers=0) 会抛 ValueError 直接穿透整个命令
+        print("[backfill] --workers 必须 ≥ 1", file=sys.stderr)
+        return 2
     with db.session() as conn:
         run_id = db.start_run(conn, task="backfill", source=config.DATA_SOURCE)
         try:
-            n_sym, n_rows = tdxnet_src.backfill_bars(
-                conn, workers=args.workers
-            )
-            status = "success" if n_rows else "partial"
-            db.finish_run(conn, run_id, status, n_rows, f"{n_sym} 只股票")
-        except SourceError as exc:
-            db.finish_run(conn, run_id, "failed", 0, str(exc))
-            print(f"[backfill] 数据源不可用: {exc}", file=sys.stderr)
+            n_sym, n_rows, failed = tdxnet_src.backfill_bars(conn, workers=workers)
+        except Exception as exc:  # noqa: BLE001
+            # 只捕 SourceError 的话，别的异常（sqlite/线程池/解析）会让
+            # collect_log 留下永久 running 行，页面永远显示「进行中」
+            db.finish_run(conn, run_id, "failed", 0, f"{type(exc).__name__}: {exc}")
+            print(f"[backfill] 采集失败: {exc}", file=sys.stderr)
             return 2
+
+        status = "success" if not failed else ("failed" if n_rows == 0 else "partial")
+        msg = f"{n_sym} 只股票 / {n_rows} 行"
+        if failed:
+            sample = "、".join(failed[:5])
+            msg += (f"；失败 {len(failed)} 只：{sample}"
+                    f"{' 等' if len(failed) > 5 else ''}")
+        db.finish_run(conn, run_id, status, n_rows, msg)
 
         # 清理必须用**同一个仍然打开的**连接：原来这行写在 with 之外，
         # 连接此时已经关闭 → sqlite3.ProgrammingError，整个 update 管道
@@ -73,7 +87,20 @@ def cmd_backfill(args: argparse.Namespace) -> int:
     if n_dirty:
         print(f"[clean] 清理异常 pct_chg {n_dirty} 行")
 
+    if failed:
+        # 少量个股失败不中止 update 流水线（数据可用），但必须显式可见：
+        # collect_log 记 partial + 失败代码，终端也打印一份。
+        print(f"[backfill] ⚠ {len(failed)} 只失败（示例："
+              f"{', '.join(failed[:10])}）", file=sys.stderr)
+
     print(f"[backfill] 完成，{n_rows} 行。请执行 compute-rps")
+    attempted = n_sym + len(failed)
+    if n_rows == 0:
+        return 2
+    if failed and len(failed) > 0.1 * max(1, attempted):
+        print(f"[backfill] 失败率 {len(failed)}/{attempted} 超过 10%，按失败处理",
+              file=sys.stderr)
+        return 2
     return 0
 
 
@@ -123,7 +150,7 @@ def cmd_compute_rps(args: argparse.Namespace) -> int:
                 if len(targets) > INCREMENTAL_PENDING_HINT:
                     print("[rps] 提示：待算日期偏多，若刚订正过历史行情请加 --full 重算")
 
-            long = matrix.load_long(conn, start)
+            long = matrix.load_long(conn, start, seed_before_start=(mode == "incremental"))
             if long.empty:
                 db.finish_run(conn, run_id, "failed", 0, "daily_bar 为空")
                 print("[rps] daily_bar 为空，请先 backfill", file=sys.stderr)
@@ -147,6 +174,13 @@ def cmd_compute_rps(args: argparse.Namespace) -> int:
         except Exception as exc:  # noqa: BLE001
             db.finish_run(conn, run_id, "failed", 0, str(exc))
             raise
+        else:
+            # 成功路径必须收尾：以前这里直接掉出 try，collect_log 留下永久的
+            # running 行（实测 4 条），页面「最近更新」永远显示「进行中」。
+            db.finish_run(
+                conn, run_id, "success", n_stock + n_ind,
+                f"mode={mode} 个股 {n_stock} 行 / 板块 {n_ind} 行",
+            )
     print(f"[rps] 个股 {n_stock} 行，板块 {n_ind} 行（{mode}）")
     # RPS 变了 → 回测的进程内矩阵/帧缓存必须失效（否则最长 300s 用旧值）
     from .analytics import backtest as bt_engine
@@ -193,13 +227,20 @@ def cmd_tradestatus(args: argparse.Namespace) -> int:
 
 # ── price-limits ────────────────────────────────────────────────────
 def missing_limit_dates(conn: sqlite3.Connection, limit: int = 0) -> list[str]:
-    """daily_bar 有、price_limit_daily 没有的交易日，**倒序**（先补最近的，保持覆盖连续）。
+    """daily_bar 有、price_limit_daily **没有覆盖齐**的交易日，**倒序**（先补最近的）。
+
+    「已覆盖」的判据不只是「有行」：某个日期只采到几十行（部分失败）同样要重采，
+    否则残缺分区永远不会被补上。行数少于当日 daily_bar 行数的一半才算未覆盖。
 
     limit > 0 时只取前 limit 个（配合时间预算分批跑）。
     """
     sql = (
-        "SELECT DISTINCT d.date AS date FROM daily_bar d "
-        "WHERE NOT EXISTS (SELECT 1 FROM price_limit_daily p WHERE p.date = d.date) "
+        "SELECT d.date AS date FROM "
+        "  (SELECT date, COUNT(*) AS n FROM daily_bar GROUP BY date) d "
+        "LEFT JOIN "
+        "  (SELECT date, COUNT(*) AS m FROM price_limit_daily GROUP BY date) p "
+        "  ON p.date = d.date "
+        "WHERE COALESCE(p.m, 0) < MAX(1, d.n * 0.5) "
         "ORDER BY d.date DESC"
     )
     if limit > 0:
@@ -242,12 +283,22 @@ def cmd_price_limits(args: argparse.Namespace) -> int:
         return 0 if fill else 1
 
     max_minutes = float(getattr(args, "max_minutes", 0.0) or 0.0)
+    with db.session() as conn:
+        run_id = db.start_run(conn, task="price-limits", source=config.DATA_SOURCE)
     total = 0
     done_days = 0
     empty: list[str] = []
+    failed: list[str] = []
     t_all = time.monotonic()
     for i, d in enumerate(dates, 1):
-        n = limit_src.sync_price_limits(d)
+        try:
+            n = limit_src.sync_price_limits(d)
+        except Exception as exc:  # noqa: BLE001
+            # 单天失败不能终止整轮：一次网络抖动就把剩下的日期全丢掉，
+            # 而且命令还会以「成功」退出。计入失败并继续。
+            failed.append(d)
+            print(f"[limits] {d} 采集失败：{type(exc).__name__}: {exc}", file=sys.stderr)
+            n = 0
         total += n
         done_days += 1
         if n == 0:
@@ -262,9 +313,16 @@ def cmd_price_limits(args: argparse.Namespace) -> int:
             print(f"[limits] 已用 {done/60:.1f} 分钟，补了 {i} 天，"
                   f"还剩 {len(dates) - i} 天，可再跑一次续采")
             break
+    ok_days = done_days - len(empty)
+    print(f"[limits] 成功 {ok_days} 天 / 空 {len(empty)} 天")
     if empty:
         print(f"[limits] 本轮 {len(empty)} 天返回 0 行（服务器无数据或失败）："
               f"{', '.join(empty[:10])}{' …' if len(empty) > 10 else ''}")
+    msg = f"补 {done_days} 天 / {total} 行（成功 {ok_days} 天）"
+    if failed:
+        msg += f"；失败 {len(failed)} 天：{', '.join(failed[:5])}"
+    with db.session() as conn:
+        db.finish_run(conn, run_id, "success" if total else "failed", total, msg)
     if fill:
         conn = db.connect()
         try:
@@ -273,6 +331,10 @@ def cmd_price_limits(args: argparse.Namespace) -> int:
             conn.close()
         print(f"[limits] 本轮补 {done_days} 天 / {total} 行，"
               f"仍未覆盖 {left} 天（再跑一次 --fill 续采）")
+    if total == 0:
+        # 一天都没采到：不能静默返回 0，update.bat / CI 要靠退出码发现问题
+        print("[limits] 本轮没有采到任何涨跌停数据", file=sys.stderr)
+        return 2
     return 0
 
 
@@ -285,11 +347,17 @@ def cmd_industry_map(args: argparse.Namespace) -> int:
     with db.session() as conn:
         run_id = db.start_run(conn, task="industry-map", source=config.DATA_SOURCE)
         try:
-            n_sym = industry_src.sync_industry_map(
+            n_sym, n_failed = industry_src.sync_industry_map(
                 replace=bool(getattr(args, "replace", False)),
                 from_csv=getattr(args, "from_csv", None),
             )
-            db.finish_run(conn, run_id, "success", n_sym, f"覆盖 {n_sym} 只股票")
+            msg = f"覆盖 {n_sym} 只股票"
+            if n_failed:
+                # 数据可用（旧行保留）→ 退出码保持 0；但状态必须是 partial，
+                # 否则页面「最近更新」看不出来有一批板块没采到
+                msg += f"；{n_failed} 个板块失败（保留旧行，未做整表重建）"
+            db.finish_run(conn, run_id, "partial" if n_failed else "success",
+                          n_sym, msg)
             return 0
         except Exception as exc:  # noqa: BLE001
             db.finish_run(conn, run_id, "failed", 0, str(exc))
@@ -307,8 +375,13 @@ def cmd_concept(args: argparse.Namespace) -> int:
         with db.session() as conn:
             run_id = db.start_run(conn, task="concept", source=config.DATA_SOURCE)
             try:
-                n_sym = board_src.sync_concept_map()
-                db.finish_run(conn, run_id, "success", n_sym, f"覆盖 {n_sym} 只股票")
+                n_sym, failed_boards = board_src.sync_concept_map()
+                msg = f"覆盖 {n_sym} 只股票"
+                if failed_boards:
+                    msg += (f"；{len(failed_boards)} 个板块失败（保留旧成分）："
+                            f"{'、'.join(failed_boards[:5])}")
+                db.finish_run(conn, run_id,
+                              "partial" if failed_boards else "success", n_sym, msg)
             except Exception as exc:  # noqa: BLE001
                 db.finish_run(conn, run_id, "failed", 0, str(exc))
                 print(f"[concept] 采集失败: {exc}", file=sys.stderr)
@@ -329,7 +402,7 @@ def cmd_concept(args: argparse.Namespace) -> int:
         else:
             targets, start = None, None
 
-        long = matrix.load_long(conn, start)
+        long = matrix.load_long(conn, start, seed_before_start=(targets is not None))
         close = matrix.build_close_matrix(long)
         frames = rps_engine.compute_rps_frames(
             close, matrix.build_tradable_matrix(long), matrix.build_st_flags(long),
@@ -345,6 +418,12 @@ def cmd_concept(args: argparse.Namespace) -> int:
         if cdf.empty:
             print("[concept] 未算出概念 RPS（concept_map 为空？）")
             return 1
+        # 与个股/行业同口径：先清 ±inf，再丢掉只有 1 个概念的横截面日期
+        # （单成员时百分位恒 100，那不是强度）
+        cdf = rps_engine.drop_thin_dates(
+            rps_engine.clean_inf(cdf),
+            [c for c in cdf.columns if c.startswith("ret")],
+        )
         if targets is not None:
             cdf = cdf[cdf["date"].isin(set(targets))]
         conn.execute("DELETE FROM concept_rps_daily") if targets is None else None
@@ -632,6 +711,12 @@ def cmd_status(_: argparse.Namespace) -> int:
 def cmd_backtest(args: argparse.Namespace) -> int:
     from .analytics import backtest as engine
 
+    # 入口挡住明显非法的值：hold<1 会让 fwd 变成「未来负数天」的假收益，
+    # rebalance<1 会和 hold 比较出荒谬的调仓间隔。
+    if args.hold < 1 or (args.rebalance is not None and args.rebalance < 1):
+        print("[backtest] --hold / --rebalance 必须 ≥ 1", file=sys.stderr)
+        return 2
+
     conn = db.connect()
     try:
         res = engine.run_backtest(
@@ -654,26 +739,32 @@ def cmd_backtest(args: argparse.Namespace) -> int:
 
 
 # ── 供 /api/admin/update 派发 ───────────────────────────────────────
-def _ns(**over):
-    base = dict(
-        workers=config.TDX_WORKERS, limit=None, include_st=False,
-        period=config.DEFAULT_PERIOD, threshold=80.0, hold=20,
-        rebalance=None, resonance=False, full=False, market_filter="none",
-        dry_run=False, fill=False, max_minutes=0.0, max_days=0,
-    )
+def _ns(cmd: str = "status", **over):
+    """生成 argparse namespace：先按**真实 parser** 解析子命令，再叠加覆盖。
+
+    默认取 `status`（无参数子命令），因此 `cli._ns(dry_run=True)` 这类测试写法
+    照旧可用；而默认值只有 parser 一份 —— 早期实现手抄了一份默认值字典
+    （workers/limit/period/market_filter/...），新增参数后必然漂移。
+
+    例：`_ns("compute-rps", full=True)` 拿到的就是 `compute-rps --full` 的完整参数集。
+    """
+    base = vars(build_parser().parse_args([cmd]))
     base.update(over)
     return argparse.Namespace(**base)
 
 
-def run_update_pipeline(progress=None) -> dict:
+def run_update_pipeline(progress=None, workers: int | None = None) -> dict:
     """完整更新流程：拉日K → 采涨跌停 → 重算 RPS。
 
     供 API 后台线程与 update.bat 共用。任一步失败即中止并把错误抛出，
     调用方负责写 collect_log。`progress(phase)` 用于向前端播报当前阶段。
+
+    每一步都用**该子命令自己的** parser 生成参数（`_ns("<cmd>")`），
+    这样新增/改名参数不会让这条流水线悄悄跑偏。
     """
     say = progress or (lambda _phase: None)
     say("bars")
-    rc = cmd_backfill(_ns())
+    rc = cmd_backfill(_ns("backfill", workers=workers))
     if rc != 0:
         raise RuntimeError(f"日K 更新失败（退出码 {rc}）")
 
@@ -688,17 +779,17 @@ def run_update_pipeline(progress=None) -> dict:
         print("[industry] industry_map 已有数据，跳过（要换口径用 cli industry-map --replace）")
     else:
         say("industry")
-        rc = cmd_industry_map(_ns())
+        rc = cmd_industry_map(_ns("industry-map"))
         if rc != 0:
             raise RuntimeError(f"行业分类采集失败（退出码 {rc}）")
 
     say("rps")
-    rc = cmd_compute_rps(_ns())
+    rc = cmd_compute_rps(_ns("compute-rps"))
     if rc != 0:
         raise RuntimeError(f"RPS 计算失败（退出码 {rc}）")
 
     say("patterns")
-    rc = cmd_patterns(_ns())
+    rc = cmd_patterns(_ns("patterns"))
     if rc != 0:
         raise RuntimeError(f"形态计算失败（退出码 {rc}）")
 
@@ -733,9 +824,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="采集并发线程数（默认 8）")
         sp.set_defaults(func=fn)
 
-    sub.add_parser("update", help="完整更新：日K + 涨跌停 + RPS").set_defaults(
-        func=lambda _ns: (run_update_pipeline(), 0)[1]
-    )
+    up = sub.add_parser("update", help="完整更新：日K + 涨跌停 + RPS")
+    # 以前 update 一个参数都没注册：`cli update --workers 4` 会直接 argparse 报错
+    up.add_argument("--workers", type=int, default=config.TDX_WORKERS,
+                    help="日K 采集并发线程数（默认 8）")
+    up.set_defaults(func=lambda ns: (run_update_pipeline(workers=ns.workers), 0)[1])
 
     sp = sub.add_parser("industry-map", help="写入 industry_map（eltdx 行业分类或自带 CSV）")
     sp.add_argument("--replace", action="store_true",
@@ -812,7 +905,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_compute_rps)
 
     sp = sub.add_parser("backtest", help="命令行回测")
-    sp.add_argument("--period", type=int, default=config.DEFAULT_PERIOD)
+    sp.add_argument("--period", type=int, default=config.DEFAULT_PERIOD,
+                    choices=list(config.PERIODS),
+                    help=f"RPS 周期，可选 {list(config.PERIODS)}")
     sp.add_argument("--threshold", type=float, default=80.0)
     sp.add_argument("--hold", type=int, default=20)
     sp.add_argument("--rebalance", type=int, default=None)

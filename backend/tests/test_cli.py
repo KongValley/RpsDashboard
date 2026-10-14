@@ -19,7 +19,7 @@ def test_cmd_backfill_returns_zero_and_cleans_pct_chg(tmp_path, monkeypatch):
     dbmod.init_db(path)
     monkeypatch.setattr(config, "DB_PATH", path)
     monkeypatch.setattr(cli.config, "ensure_dirs", lambda: None)
-    monkeypatch.setattr(cli.tdxnet_src, "backfill_bars", lambda *a, **k: (3, 300))
+    monkeypatch.setattr(cli.tdxnet_src, "backfill_bars", lambda *a, **k: (3, 300, []))
 
     with dbmod.session() as conn:
         conn.execute(
@@ -170,3 +170,131 @@ def test_cmd_price_limits_fill_conflicts_with_days(tmp_path, monkeypatch, capsys
     assert cli.cmd_price_limits(cli._ns(fill=True, days=5)) == 2
     assert called == [], "参数冲突时不能联网采集"
     assert "--fill 与 --days 不能同时使用" in capsys.readouterr().err
+
+
+# ── 失败可见性（2026-10-14）──────────────────────────────────────────
+def _last_log(path):
+    with dbmod.session() as conn:
+        return dict(conn.execute(
+            "SELECT * FROM collect_log ORDER BY started_at DESC, rowid DESC LIMIT 1"
+        ).fetchone())
+
+
+def test_cmd_backfill_reports_partial_failures(tmp_path, monkeypatch, capsys):
+    """少量个股失败 → partial + 退出码 0；全军覆没 / 失败率 >10% → 退出码 2。
+
+    旧实现把失败列表打成一行 print 就丢掉、只捕 SourceError：collect_log 里
+    永远写着 success，页面看不出有一批股票根本没补到。
+    """
+    path = tmp_path / "bf.db"
+    dbmod.init_db(path)
+    monkeypatch.setattr(config, "DB_PATH", path)
+    monkeypatch.setattr(cli.config, "ensure_dirs", lambda: None)
+
+    monkeypatch.setattr(cli.tdxnet_src, "backfill_bars",
+                        lambda *a, **k: (99, 1000, ["000009"]))
+    assert cli.cmd_backfill(cli._ns("backfill", workers=1)) == 0
+    log = _last_log(path)
+    assert log["status"] == "partial" and "000009" in log["message"]
+
+    monkeypatch.setattr(cli.tdxnet_src, "backfill_bars",
+                        lambda *a, **k: (80, 1000, [f"{i:06d}" for i in range(20)]))
+    assert cli.cmd_backfill(cli._ns("backfill", workers=1)) == 2, "失败率 20/100 > 10%"
+
+    monkeypatch.setattr(cli.tdxnet_src, "backfill_bars",
+                        lambda *a, **k: (0, 0, ["000001"]))
+    assert cli.cmd_backfill(cli._ns("backfill", workers=1)) == 2
+    assert _last_log(path)["status"] == "failed"
+
+
+def test_cmd_backfill_rejects_bad_workers(tmp_path, monkeypatch, capsys):
+    """--workers 0 必须自己拦住：ThreadPoolExecutor 会抛 ValueError 穿透命令。"""
+    path = tmp_path / "bf0.db"
+    dbmod.init_db(path)
+    monkeypatch.setattr(config, "DB_PATH", path)
+    monkeypatch.setattr(cli.config, "ensure_dirs", lambda: None)
+    called: list = []
+    monkeypatch.setattr(cli.tdxnet_src, "backfill_bars",
+                        lambda *a, **k: (called.append(1), (0, 0, []))[1])
+    assert cli.cmd_backfill(cli._ns("backfill", workers=0)) == 2
+    assert called == [], "参数非法时不应真的去采集"
+    assert "--workers 必须 ≥ 1" in capsys.readouterr().err
+
+
+def test_cmd_compute_rps_closes_collect_log(tmp_path, monkeypatch):
+    """compute-rps 成功路径必须给 collect_log 收尾（否则页面永远「进行中」）。"""
+    path = tmp_path / "cpr.db"
+    dbmod.init_db(path)
+    monkeypatch.setattr(config, "DB_PATH", path)
+    with dbmod.session() as conn:
+        conn.executemany(
+            "INSERT INTO daily_bar(symbol, date, close, tradestatus, is_st) "
+            "VALUES ('000001',?,?,1,0)",
+            [(f"2026-01-{d:02d}", 10.0 + d) for d in range(1, 21)],
+        )
+        conn.commit()
+
+    assert cli.cmd_compute_rps(cli._ns("compute-rps", full=True)) == 0
+    with dbmod.session() as conn:
+        log = dict(conn.execute(
+            "SELECT * FROM collect_log WHERE task = 'compute-rps-cli' "
+            "ORDER BY rowid DESC LIMIT 1"
+        ).fetchone())
+    # materialize 自己还会写一条 task='compute-rps' 的内部记录，
+    # 这里要看的是 CLI 那条（它以前永远停在 running）
+    assert log["status"] == "success" and log["finished_at"], \
+        "成功路径没写 finished_at 就会留下永久的 running 行"
+
+
+def test_missing_limit_dates_requires_real_coverage(tmp_path, monkeypatch):
+    """「有 1 行」不算已覆盖：残缺分区（部分失败）必须还能被重新采到。"""
+    path = tmp_path / "cov.db"
+    dbmod.init_db(path)
+    monkeypatch.setattr(config, "DB_PATH", path)
+    with dbmod.session() as conn:
+        conn.executemany(
+            "INSERT INTO daily_bar(symbol, date, close) VALUES (?,?,1.0)",
+            [(f"{i:06d}", "2026-01-05") for i in range(10)],
+        )
+        # 10 只股票只采到 1 行涨跌停 → 仍算未覆盖
+        conn.execute("INSERT INTO price_limit_daily(date, symbol, limit_ratio) "
+                     "VALUES ('2026-01-05','000001',10.0)")
+        conn.commit()
+        conn.row_factory = None
+    with dbmod.session() as conn:
+        assert cli.missing_limit_dates(conn) == ["2026-01-05"]
+
+        # 再补 4 行（合计 5 行 = 一半）就算覆盖（000001 已经有行了）
+        conn.executemany(
+            "INSERT INTO price_limit_daily(date, symbol, limit_ratio) VALUES (?,?,10.0)",
+            [("2026-01-05", f"{i:06d}") for i in range(2, 6)],
+        )
+        conn.commit()
+    with dbmod.session() as conn:
+        assert cli.missing_limit_dates(conn) == []
+
+
+def test_cmd_price_limits_logs_and_fails_loudly(tmp_path, monkeypatch, capsys):
+    """整轮一行都没采到 → 退出码 2 + collect_log failed；单天异常不终止整轮。"""
+    path = tmp_path / "limits5.db"
+    dbmod.init_db(path)
+    monkeypatch.setattr(config, "DB_PATH", path)
+    _seed_bars_with_limits(path)
+
+    monkeypatch.setattr(cli.limit_src, "sync_price_limits", lambda date=None: 0)
+    assert cli.cmd_price_limits(cli._ns("price-limits", fill=True)) == 2
+    log = _last_log(path)
+    assert log["task"] == "price-limits" and log["status"] == "failed"
+    assert "成功 0 天 / 空 3 天" in capsys.readouterr().out
+
+    calls: list[str] = []
+
+    def boom(date=None):
+        calls.append(date)
+        raise RuntimeError("连接被重置")
+
+    monkeypatch.setattr(cli.limit_src, "sync_price_limits", boom)
+    assert cli.cmd_price_limits(cli._ns("price-limits", fill=True)) == 2
+    assert calls == ["2026-01-07", "2026-01-06", "2026-01-05"], \
+        "单天异常不能中断整轮"
+    assert _last_log(path)["status"] == "failed"

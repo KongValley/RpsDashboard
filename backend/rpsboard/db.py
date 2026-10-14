@@ -405,9 +405,11 @@ def replace_date_partition(
     """
     if df.empty:
         return 0
+    # 删除与写入必须同一个事务：中间 commit 一次的话，插入失败（磁盘满、主键冲突）
+    # 会留下一个**已删未写**的空分区，而且是静默的 —— 调用方只看到异常，
+    # 数据却已经没了。
     for d in dates:
         conn.execute(f"DELETE FROM {table} WHERE {date_col} = ?", (d,))
-    conn.commit()
     df.to_sql(table, conn, if_exists="append", index=False, chunksize=2000)
     conn.commit()
     return len(df)

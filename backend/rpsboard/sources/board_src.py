@@ -85,11 +85,14 @@ def fetch_members(full_code: str, src: TdxSource) -> list[str]:
     return out
 
 
-def sync_concept_map(progress=None) -> int:
-    """抓取全部概念板块成分股，写入 concept_map。返回覆盖的股票数。
+def sync_concept_map(progress=None) -> tuple[int, list[str]]:
+    """抓取全部概念板块成分股，**按板块增量**写入 concept_map。
+
+    返回 (覆盖的股票数, 失败板块名列表)。
 
     每 3.7 秒一个板块、约 500 个板块，全程约 31 分钟。
-    中途失败只记录并继续，不让一个坏板块毁掉整轮采集。
+    失败的板块**保留旧行**而不是整表替换：31 分钟的长任务里一个坏板块就清空
+    整张表，会让概念 RPS 当天直接算不出东西（而本轮结果其实基本可用）。
     """
     say = progress or (lambda _msg: None)
     t0 = time.time()
@@ -102,42 +105,59 @@ def sync_concept_map(progress=None) -> int:
     print(f"[concept] 板块 {len(boards)} 个，其中概念题材 {len(concepts)} 个，"
           f"清单耗时 {time.time()-t0:.0f}s")
 
-    rows: list[dict] = []
-    failed = 0
+    grabbed: list[tuple[dict, list[str]]] = []
+    failed_boards: list[str] = []
     src = TdxSource()
     try:
         for i, (_, b) in enumerate(concepts.iterrows(), 1):
             try:
-                for sym in fetch_members(b["full_code"], src):
-                    rows.append({"symbol": sym, "concept": b["board_name"],
-                                 "board_code": b["board_code"],
-                                 "updated_at": db.now()})
+                members = list(dict.fromkeys(fetch_members(b["full_code"], src)))
+                grabbed.append((b, members))
             except Exception as exc:  # noqa: BLE001
-                failed += 1
-                if failed <= 3:
+                failed_boards.append(b["board_name"])
+                if len(failed_boards) <= 3:
                     print(f"[concept] 板块 {b['board_name']} 失败: {exc}")
             if i % 25 == 0:
                 el = time.time() - t0
-                print(f"[concept] {i}/{len(concepts)} 失败 {failed} "
+                print(f"[concept] {i}/{len(concepts)} 失败 {len(failed_boards)} "
                       f"| 已用 {el/60:.1f} 分钟 | 预计剩余 {el/i*(len(concepts)-i)/60:.1f} 分钟",
                       flush=True)
     finally:
         src.close()
 
-    if not rows:
+    if not grabbed:
         raise RuntimeError("未取到任何概念成分股")
 
-    df = pd.DataFrame(rows).drop_duplicates(subset=["symbol", "concept"])
     conn = db.connect()
     try:
-        conn.execute("DELETE FROM concept_map")
-        df.to_sql("concept_map", conn, if_exists="append", index=False)
+        # board_code 为 NULL 的旧行不会被任何板块的 DELETE 命中，
+        # 是「整表替换」时代留下的孤儿，一次性清掉
+        conn.execute("DELETE FROM concept_map WHERE board_code IS NULL")
+        for b, members in grabbed:
+            conn.execute(
+                "DELETE FROM concept_map WHERE board_code = ?", (b["board_code"],))
+            if not members:
+                continue
+            now = db.now()
+            conn.executemany(
+                "INSERT OR REPLACE INTO concept_map"
+                "(symbol, concept, board_code, updated_at) VALUES (?,?,?,?)",
+                [(s, b["board_name"], b["board_code"], now) for s in members],
+            )
         conn.commit()
+        n_sym = conn.execute(
+            "SELECT COUNT(DISTINCT symbol) AS n FROM concept_map").fetchone()["n"]
+        n_rows = conn.execute("SELECT COUNT(*) AS n FROM concept_map").fetchone()["n"]
+        n_concepts = conn.execute(
+            "SELECT COUNT(DISTINCT concept) AS n FROM concept_map").fetchone()["n"]
     finally:
         conn.close()
 
-    n_sym = df["symbol"].nunique()
-    print(f"[concept] 完成：{len(df)} 条 成分关系，覆盖 {n_sym} 只股票、"
-          f"{df['concept'].nunique()} 个概念，失败 {failed} 个板块，"
+    print(f"[concept] 完成：{n_rows} 条 成分关系，覆盖 {n_sym} 只股票、"
+          f"{n_concepts} 个概念，失败 {len(failed_boards)} 个板块，"
           f"总耗时 {(time.time()-t0)/60:.1f} 分钟")
-    return n_sym
+    if failed_boards:
+        print(f"[concept] ⚠ 失败板块（保留旧成分）："
+              f"{', '.join(failed_boards[:10])}"
+              f"{' 等' if len(failed_boards) > 10 else ''}")
+    return n_sym, failed_boards

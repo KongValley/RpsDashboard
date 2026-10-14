@@ -133,8 +133,15 @@ def backfill_bars(
     count: int = MAX_COUNT,
     workers: int = config.TDX_WORKERS,
     progress_every: int = 300,
-) -> tuple[int, int]:
-    """用 eltdx 全量刷新日 K（后复权）。返回 (成功股票数, 写入行数)。"""
+) -> tuple[int, int, list[str]]:
+    """用 eltdx 全量刷新日 K（后复权）。
+
+    返回 (成功股票数, 写入行数, 失败代码列表)。
+
+    ⚠ 失败列表必须往上传：调用方要靠它区分「全成功」与「只补到一部分」，
+    并把失败代码写进 collect_log —— 旧版本把 failed 打成一行 print 就丢掉了，
+    页面「最近更新」于是永远显示成功。
+    """
     t_all = time.time()
     src = TdxSource()
     try:
@@ -203,7 +210,7 @@ def backfill_bars(
 
         if not frames:
             print("[eltdx] 未取到任何数据")
-            return 0, 0
+            return 0, 0, failed
 
         df = pd.concat(frames, ignore_index=True)
         df["pct_chg"] = df.groupby("symbol")["close"].pct_change().round(6)
@@ -225,9 +232,27 @@ def backfill_bars(
         df.to_sql("daily_bar", conn, if_exists="append", index=False, chunksize=5000)
         conn.commit()
 
+        # 组内**首行**的 pct_chg 必为 NaN，而首行正是本帧最早的那一天：
+        # 每次运行都会把上一次算好的值覆盖成 NULL（实测库内 pct_chg IS NULL
+        # 的 10,662 行全部聚在窗口边界日期上）。这里就地把边界日期补回来，
+        # 前值不存在的行（新股首日、前面没有 close>0 的 bar）保持 NULL。
+        boundary = sorted(set(df.groupby("symbol")["date"].first()))
+        if boundary:
+            marks = ",".join("?" * len(boundary))
+            conn.execute(
+                f"UPDATE daily_bar SET pct_chg = ("
+                f"  SELECT ROUND(daily_bar.close / q.close - 1, 6) FROM daily_bar q "
+                f"  WHERE q.symbol = daily_bar.symbol AND q.date < daily_bar.date "
+                f"    AND q.close > 0 ORDER BY q.date DESC LIMIT 1) "
+                f"WHERE date IN ({marks}) AND pct_chg IS NULL "
+                f"  AND close IS NOT NULL AND close > 0",
+                tuple(boundary),
+            )
+            conn.commit()
+
         n_sym = df["symbol"].nunique()
         print(f"[eltdx] 完成：{n_sym} 只 / {len(df)} 行，失败 {len(failed)} 只，"
               f"总用时 {time.time()-t_all:.0f}s")
-        return n_sym, len(df)
+        return n_sym, len(df), failed
     finally:
         src.close()

@@ -62,8 +62,12 @@ def _pick_one_industry(rows: list[dict]) -> pd.DataFrame:
     return df.drop_duplicates(subset=["symbol"], keep="first").drop(columns="_size")
 
 
-def _from_named_boards(progress=None) -> tuple[pd.DataFrame, str]:
-    """eltdx 具名行业板块 → (df[symbol, industry], 口径标签)。取不到返回空表。"""
+def _from_named_boards(progress=None) -> tuple[pd.DataFrame, str, int]:
+    """eltdx 具名行业板块 → (df[symbol, industry], 口径标签, 失败板块数)。
+
+    取不到任何分类时返回空表 + 0 失败（由调用方落到下一条数据源）。
+    失败数必须往上传：调用方要靠它决定「能不能整表重建」。
+    """
     for category in CATEGORIES:
         boards = fetch_boards(category=category)
         if boards.empty:
@@ -89,8 +93,8 @@ def _from_named_boards(progress=None) -> tuple[pd.DataFrame, str]:
             src.close()
         if rows:
             print(f"[industry] {len(rows)} 条成分关系，失败 {len(failed)} 个板块")
-            return _pick_one_industry(rows), CLS_NAMED.format(category)
-    return pd.DataFrame(), ""
+            return _pick_one_industry(rows), CLS_NAMED.format(category), len(failed)
+    return pd.DataFrame(), "", 0
 
 
 def _ensure_tdxhy(path: Path) -> Path:
@@ -113,8 +117,8 @@ def _ensure_tdxhy(path: Path) -> Path:
     return path
 
 
-def _from_tdxhy(progress=None) -> tuple[pd.DataFrame, str]:
-    """tdxhy.cfg → (df[symbol, industry], 口径标签)。行业键是层级代码，无名称。"""
+def _from_tdxhy(progress=None) -> tuple[pd.DataFrame, str, int]:
+    """tdxhy.cfg → (df[symbol, industry], 口径标签, 失败数)。行业键是层级代码，无名称。"""
     say = progress or (lambda _m: None)
     say("industry")
     path = _ensure_tdxhy(Path(config.DOWNLOAD_DIR) / "tdxhy.cfg")
@@ -134,10 +138,11 @@ def _from_tdxhy(progress=None) -> tuple[pd.DataFrame, str]:
     print(f"[industry] tdxhy.cfg：{len(df)} 只股票 / "
           f"{df['industry'].nunique() if not df.empty else 0} 个行业键"
           f"（该文件不含行业名称，键为层级代码）")
-    return df, CLS_CODE
+    # 文件是**整份**映射，不存在部分失败
+    return df, CLS_CODE, 0
 
 
-def _from_csv(path: Path, progress=None) -> tuple[pd.DataFrame, str]:
+def _from_csv(path: Path, progress=None) -> tuple[pd.DataFrame, str, int]:
     """用户自带映射：symbol,industry[,industry_cls]。"""
     say = progress or (lambda _m: None)
     say("industry")
@@ -150,15 +155,21 @@ def _from_csv(path: Path, progress=None) -> tuple[pd.DataFrame, str]:
     cls = df["industry_cls"].iloc[0] if "industry_cls" in df.columns else CLS_CSV
     df = df.assign(industry_cls=cls or CLS_CSV)
     print(f"[industry] 从 {path} 读入 {len(df)} 只股票 / {df['industry'].nunique()} 个行业")
-    return _pick_one_industry(df[["symbol", "industry"]]).assign(industry_cls=cls or CLS_CSV), cls or CLS_CSV
+    picked = _pick_one_industry(df[["symbol", "industry"]])
+    return picked.assign(industry_cls=cls or CLS_CSV), cls or CLS_CSV, 0
 
 
 def sync_industry_map(
     replace: bool = False, from_csv: str | Path | None = None, progress=None
-) -> int:
-    """写入 industry_map，返回覆盖的股票数。
+) -> tuple[int, int]:
+    """写入 industry_map，返回 (覆盖的股票数, 失败的板块数)。
 
-    已有数据且未指定 replace 时返回 0（保护已有的具名口径，例如证监会行业分类）。
+    已有数据且未指定 replace 时返回 (0, 0)（保护已有的具名口径，例如证监会行业分类）。
+
+    写入是**按 symbol 覆盖**而不是先清空整表：部分板块采集失败时，整表重建会把
+    那些失败板块覆盖的股票连旧行一起删掉，行业 RPS 当天就出现整块缺口。
+    只有在「--replace 且本轮零失败」时才真正清空重建（这才是文档承诺的
+    「整表重建」语义）。
     """
     conn = db.connect()
     try:
@@ -171,15 +182,15 @@ def sync_industry_map(
             label = f"{cls['industry_cls']}（{cls['c']} 行）" if cls else "未知"
             print(f"[industry] industry_map 已有 {existing} 行，口径：{label}，跳过；"
                   f"要重建请加 --replace")
-            return 0
+            return 0, 0
 
         t0 = time.time()
         if from_csv:
-            df, cls = _from_csv(Path(from_csv), progress=progress)
+            df, cls, n_failed = _from_csv(Path(from_csv), progress=progress)
         else:
-            df, cls = _from_named_boards(progress=progress)
+            df, cls, n_failed = _from_named_boards(progress=progress)
             if df.empty:
-                df, cls = _from_tdxhy(progress=progress)
+                df, cls, n_failed = _from_tdxhy(progress=progress)
         if df.empty:
             raise RuntimeError(
                 "没有取到任何行业分类；请用 `cli industry-map --from-csv <映射.csv>` 提供"
@@ -187,14 +198,22 @@ def sync_industry_map(
 
         df = df.assign(industry_cls=df["industry_cls"] if "industry_cls" in df else cls,
                        updated_at=db.now())
-        conn.execute("DELETE FROM industry_map")
-        df[["symbol", "industry", "industry_cls", "updated_at"]].to_sql(
-            "industry_map", conn, if_exists="append", index=False)
+        cols = df[["symbol", "industry", "industry_cls", "updated_at"]]
+        if replace and not n_failed:
+            conn.execute("DELETE FROM industry_map")
+        conn.executemany(
+            "INSERT OR REPLACE INTO industry_map"
+            "(symbol, industry, industry_cls, updated_at) VALUES (?,?,?,?)",
+            list(cols.itertuples(index=False, name=None)),
+        )
         conn.commit()
 
         n_sym = int(df["symbol"].nunique())
         print(f"[industry] 完成：{n_sym} 只股票 / {df['industry'].nunique()} 个行业"
               f"（口径：{cls}），总耗时 {(time.time()-t0)/60:.1f} 分钟")
-        return n_sym
+        if n_failed:
+            print(f"[industry] ⚠ {n_failed} 个板块失败：这些股票保留原有行业行，"
+                  f"本轮不做整表重建")
+        return n_sym, n_failed
     finally:
         conn.close()
