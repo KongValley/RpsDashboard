@@ -27,7 +27,7 @@ import numpy as np
 import pandas as pd
 
 from .. import config, db
-from .base import with_retry
+from .base import tradestatus_from_calendar, with_retry
 
 MAX_COUNT = 800          # 通达信协议单页上限
 CONNECT_POOL = 8
@@ -211,13 +211,9 @@ def backfill_bars(
         # 它们会污染任何阈值比较与图表绘制，必须在落库前清掉。
         df["pct_chg"] = df["pct_chg"].replace([np.inf, -np.inf], np.nan)
         df["is_st"] = df["symbol"].map(st_map).fillna(0).astype(int)
-        # tradestatus 不再硬编码为 1：eltdx 在**停牌期间不给 bar**（只在复牌日补一根），
-        # 因此「相邻两根 bar 间隔超过 3 个自然日」就是停牌的可靠信号。
-        # 之前写死 1 会让人误以为这一列在做事，实际可交易性完全由
-        # matrix.build_tradable_matrix 的「NaN → 不可交易」承担。
-        d = pd.to_datetime(df["date"])
-        gap = d.groupby(df["symbol"]).diff().dt.days
-        df["tradestatus"] = (gap.isna() | (gap <= 3)).astype(int)
+        # eltdx 在停牌期间不给 bar（只在复牌日补一根），所以「与上一个交易日的间隔」
+        # 就是停牌信号；判定口径见 tradestatus_from_calendar（按交易日，不按自然日）。
+        df["tradestatus"] = tradestatus_from_calendar(df)
         df = df.drop_duplicates(subset=["symbol", "date"], keep="last")
         cols = ["symbol", "date", "open", "high", "low", "close",
                 "volume", "amount", "pct_chg", "is_st", "tradestatus"]

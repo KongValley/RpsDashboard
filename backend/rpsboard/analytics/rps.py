@@ -241,8 +241,7 @@ def pending_dates(
     这类日期有两种（实测 2026-10-13）：
       ① 窗口起点那 15 天：每天只有 1 只股票有 K 线，且不足 16 根前置 K 线
          （最短的 15 日周期门槛），各周期全为 NaN；
-      ② 长假后第一个交易日那 21 天：行情完整，但数据源把**全市场**标成
-         tradestatus=0，被「停牌不参与排名」的掩码整日掩掉（见 suspect_gaps）。
+      ② 数据修复前的长假误判（已由 `cli tradestatus` 修掉，2026-10-13 之后不再出现）。
     两者落库时都被 dropna 丢掉，于是永远缺失。
 
     取「晚于 dmax」还有一个好处：新交易日如果当天只回补到少量股票（数据不全），
@@ -271,9 +270,9 @@ def suspect_gaps(conn: sqlite3.Connection, min_symbols: int = 20) -> list[str]:
     但 rps_daily 里一行都没有的交易日（升序）。
 
     刻意不自动补：这些日期算不出结果（见 pending_dates 的两种情形），永远补不出来。
-    实测 2026-10-13 报出 21 天，全部属于第 ② 种：长假后第一个交易日，`daily_bar`
-    行情完整但全市场 tradestatus=0（占全库 tradestatus=0 的 112,379/113,268 行）。
-    这里只把这类日期报出来，补齐仍走 `compute-rps --full`。
+    2026-10-13 修掉 tradestatus 的长假误判之后，第 ② 种不再出现；第 ① 种每天只有
+    1 只股票，达不到 min_symbols，本来就进不了这个判据 —— 也就是说修复后这里会返回空。
+    补齐仍走 `compute-rps --full`。
     """
     if not db.table_has_rows(conn, "rps_daily"):
         return []
