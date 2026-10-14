@@ -40,11 +40,21 @@ def _prefer_seq_scan(conn: sqlite3.Connection, start: str) -> bool:
         return False
 
 
-def load_long(conn: sqlite3.Connection, start: str | None = None) -> pd.DataFrame:
+def load_long(
+    conn: sqlite3.Connection,
+    start: str | None = None,
+    *,
+    seed_before_start: bool = False,
+) -> pd.DataFrame:
     """读取日 K 长表（可选按起始日期裁剪）。
 
     注意列名是 daily_bar 的**内部命名** pct_chg（数据源侧的原始字段名不同，
     在 sources/tdxnet_src.py 的入库转换处已统一为这套内部命名）。
+
+    `seed_before_start=True` 时额外带上「每个 symbol 在 start 之前的最后一根 bar」：
+    增量重算只取窗口内的行，`build_close_matrix` 的 ffill 在窗口起点没有种子，
+    「窗口第一天没有 bar（停牌）」的股票会被误判成不可交易 → 不参与排名。
+    种子行不属于调用方声明的 target_dates，落库时会被增量过滤掉。
     """
     sql = ("SELECT symbol, date, close, pct_chg, tradestatus, is_st "
            "FROM daily_bar")
@@ -56,7 +66,19 @@ def load_long(conn: sqlite3.Connection, start: str | None = None) -> pd.DataFram
             # NOT INDEXED 只能放在 FROM 表名与 WHERE 之间
             sql = ("SELECT symbol, date, close, pct_chg, tradestatus, is_st "
                    "FROM daily_bar NOT INDEXED WHERE date >= ?")
-    return pd.read_sql_query(sql, conn, params=params)
+    out = pd.read_sql_query(sql, conn, params=params)
+    if seed_before_start and start:
+        # 每个 symbol 在 start 之前的最后一根 bar（一条相关子查询扫完，走主键索引）
+        seed = pd.read_sql_query(
+            "SELECT symbol, date, close, pct_chg, tradestatus, is_st "
+            "FROM daily_bar d WHERE d.date < ? AND d.date = ("
+            "  SELECT MAX(e.date) FROM daily_bar e "
+            "  WHERE e.symbol = d.symbol AND e.date < ?)",
+            conn, params=(start, start),
+        )
+        if not seed.empty:
+            out = pd.concat([seed, out], ignore_index=True)
+    return out
 
 
 def build_close_matrix(long: pd.DataFrame) -> pd.DataFrame:
@@ -74,17 +96,20 @@ def build_close_matrix(long: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_tradable_matrix(long: pd.DataFrame) -> pd.DataFrame:
-    """可交易日掩码矩阵：True 表示该股票当日正常交易。
+    """可交易日掩码矩阵：True = 该股票当日正常交易。
 
-    tradestatus != 1 表示停牌，这类日子**不参与横截面排名**。
+    判据是「当天有 bar 且收盘价有效」——**不要再用 `tradestatus`**：那一列的含义是
+    「该 bar 之前缺了交易日（停牌复牌当天）」（见 sources/base.py），复牌当天本身是
+    真实成交日（实测 000582 2026-10-12 有成交量、+2.91%），把它剔出去会让龙头榜漏掉
+    「复牌补涨当天」的股票（实测 1,299 个股票日）。
     """
     if long.empty:
         return pd.DataFrame()
     df = long.copy()
     df["date"] = pd.to_datetime(df["date"])
-    df["ok"] = (pd.to_numeric(df["tradestatus"], errors="coerce").fillna(1) == 1)
+    df["ok"] = pd.to_numeric(df["close"], errors="coerce") > 0
     m = df.pivot_table(index="date", columns="symbol", values="ok", aggfunc="last")
-    return m.sort_index().fillna(False)
+    return m.sort_index().fillna(False).astype(bool)
 
 
 def build_st_flags(long: pd.DataFrame) -> pd.DataFrame:

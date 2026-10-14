@@ -159,15 +159,25 @@ def test_new_listing_excluded():
     assert pd.isna(frames["rps20"].loc[market_last, late]), "上市前不应参与排名"
 
 
-def test_suspended_days_excluded_from_rank():
-    """停牌日（tradestatus=0）的股票不参与当日排名。"""
+def test_resumption_day_participates_missing_bar_does_not():
+    """复牌当天参与排名；真正没有 bar 的日子才被剔除。
+
+    `tradestatus=0` 的语义是「这根 bar 之前缺了交易日（停牌复牌当天）」，
+    复牌日本身是真实成交日（有量、有涨跌），把它剔出去会漏掉复牌补涨的龙头。
+    停牌期间没有 bar，那一格在 pivot 后是 NaN → 不可交易，自然不参与。
+    """
     n_days = 30
     df = make_long(n_symbols=5, n_days=n_days, seed=5)
     last = df["date"].max()
     df.loc[(df["date"] == last) & (df["symbol"] == "000003"), "tradestatus"] = 0
 
     _, frames = build_frames(df)
-    assert pd.isna(frames["rps20"].loc[last, "000003"]), "停牌股不应出现在排名里"
+    assert pd.notna(frames["rps20"].loc[last, "000003"]), "复牌当天应参与排名"
+
+    # 停牌期间（没有 bar）不参与：把 000004 最后一根 bar 删掉模拟停牌最后一日
+    stopped = df[~((df["date"] == last) & (df["symbol"] == "000004"))]
+    _, frames2 = build_frames(stopped)
+    assert pd.isna(frames2["rps20"].loc[last, "000004"]), "没有 bar 的日子不应参与排名"
 
 
 def test_exclude_st_flag():
@@ -258,5 +268,61 @@ def test_short_history_stock_enters_board_via_rps15(tmp_path):
         assert row is not None, "16 根 K 线的股票应当进榜"
         assert row["rps15"] is not None and not pd.isna(row["rps15"])
         assert row["rps20"] is None, "20 日周期的前置 K 线还不够，不该有值"
+    finally:
+        conn.close()
+
+
+def test_non_positive_close_excluded_from_returns():
+    """后复权价穿零（close<=0）不得进入收益率。
+
+    负分母会让比值符号翻转、0 分母得 ±inf，而 rank() 会把 +inf 当最大值排到榜首
+    （实测 600076 因此拿到全市场 rps60=100）。
+    """
+    df = make_long(n_symbols=6, n_days=80, seed=11)
+    last = df["date"].max()
+    df.loc[(df["date"] == last) & (df["symbol"] == "000002"), "close"] = -1.0
+    df.loc[(df["date"] == last) & (df["symbol"] == "000003"), "close"] = 0.0
+
+    _, frames = build_frames(df)
+    for n in PERIODS:
+        assert pd.isna(frames[f"ret{n}"].loc[last, "000002"]), f"负价不该有 ret{n}"
+        assert pd.isna(frames[f"ret{n}"].loc[last, "000003"]), f"零价不该有 ret{n}"
+    assert frames["rps20"].loc[last].dropna().max() == 100.0, "其余股票排名不受影响"
+
+
+def test_thin_cross_section_dates_dropped(tmp_path):
+    """横截面只有 1 只股票的日期不落库。
+
+    单只股票时 rank(pct) 恒等于 100，那不是「强度」而是没有可比对象
+    （实测 2023-03-06 起约 23 个交易日全市场只有 1 只股票有 RPS）。
+    """
+    import sqlite3
+
+    from rpsboard import db as dbmod
+
+    # 000001 只有前 30 根 K 线 → 后段横截面只剩 000000 一只
+    df = make_long(n_symbols=2, n_days=60, seed=13, listed_bars={"000001": 30})
+    conn = sqlite3.connect(str(tmp_path / "thin.db"))
+    conn.row_factory = sqlite3.Row
+    conn.executescript(dbmod.SCHEMA)
+    try:
+        ind = pd.Series({s: "行业A" for s in sorted(df["symbol"].unique())})
+        rps.materialize(
+            conn, build_close_matrix(df), build_tradable_matrix(df),
+            build_st_flags(df), ind, None,
+        )
+        thin = conn.execute(
+            "SELECT date FROM rps_daily GROUP BY date HAVING COUNT(*) < 2"
+        ).fetchall()
+        assert [r["date"] for r in thin] == [], "单成员日期不该落库"
+
+        tail = sorted(df["date"].unique())[35:]
+        n_tail = conn.execute(
+            "SELECT COUNT(*) AS n FROM rps_daily WHERE date >= ?", (tail[0],)
+        ).fetchone()["n"]
+        assert n_tail == 0, "只剩一只股票有行情的那段不该有 RPS 行"
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM rps_daily"
+        ).fetchone()["n"] > 0, "双股票那段仍应有行"
     finally:
         conn.close()

@@ -10,8 +10,11 @@
   test_rps.py 用「扰动 t 之后的行情，t 日 RPS 必须逐值不变」来硬断言这一点。
 - **新股自动排除**：上市不足 N 日的股票 shift(N) 为 NaN → RPS 为 NaN，
   等价于方法论要求的「剔除新股」。
-- **停牌不参与排名**：tradestatus != 1 的日子掩码为 NaN，但价格用 ffill 补齐，
+- **停牌日没有 bar，因此没有行**（正常停牌日数据源不返回 K 线）；价格用 ffill 补齐，
   这样停牌期间的区间收益仍然可算（价格确实没动）。
+- **复牌当天参与排名**：`tradestatus=0` 只表示「这根 bar 之前缺了交易日」，
+  复牌日本身是真实成交日，旧实现把它剔出去会漏掉复牌补涨的龙头（见
+  matrix.build_tradable_matrix）。
 - **ST 默认剔除**：避免 ST 股因连续涨停霸榜，可通过 exclude_st 放开。
 """
 
@@ -40,6 +43,12 @@ def compute_rps_frames(
     if close_wide.empty:
         return {}
 
+    # 后复权价在长期高分红/重组后会穿零（实测 3 只 23 行 close<=0）。close/prev 只在
+    # 两边都为正时有意义：prev 为负会让比值符号翻转、prev=0 得 ±inf，而 rank() 会把
+    # +inf 当最大值排到榜首（实测 600076 因此拿到全市场 rps60=100，把 C20木材加工
+    # 拖到 rps120=1.2）。
+    close_wide = close_wide.where(close_wide > 0)
+
     # 有效掩码：停牌日、ST 日标记为无效
     valid = pd.DataFrame(True, index=close_wide.index, columns=close_wide.columns)
     if tradable is not None and not tradable.empty:
@@ -56,6 +65,34 @@ def compute_rps_frames(
         out[f"ret{n}"] = ret
         out[f"rps{n}"] = (ret.rank(axis=1, pct=True) * 100.0).round(2)
     return out
+
+
+def clean_inf(df: pd.DataFrame) -> pd.DataFrame:
+    """把 ±inf 换成 NaN（整表）。
+
+    rank() 会把 +inf 当最大值排到榜首；SQLite 也存不下 inf。个股 / 行业 / 概念
+    三条落库路径都要先过一遍。
+    """
+    if df.empty:
+        return df
+    return df.replace([np.inf, -np.inf], np.nan)
+
+
+def drop_thin_dates(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    """丢掉横截面成员不足 2 个的日期。
+
+    只有 1 个成员时百分位恒等于 100 —— 那不是「强度」，只是没有可比对象
+    （实测 2023-04~06 的数据爬坡期每天只有 1~3 只股票有 RPS，
+    另有 41 个日期只有 1 个概念有值）。
+    个股 / 行业 / 概念三条路径都要过这一步，否则「假榜首」会从不同入口漏回来。
+    """
+    if df.empty or "date" not in df.columns:
+        return df
+    cols = [c for c in cols if c in df.columns]
+    if not cols:
+        return df
+    per_date = df[cols].notna().any(axis=1).groupby(df["date"]).sum()
+    return df[df["date"].isin(set(per_date[per_date >= 2].index))]
 
 
 def _leader_frames(
@@ -249,7 +286,13 @@ def pending_dates(
 
     中间出现**真正的空洞**（例如某次抓取部分失败）增量补不上，用 `--full` 重算。
     """
-    tgt = "rps_daily" if table == "rps_daily" else "industry_rps_daily"
+    # 表名直接用入参：以前是 `"rps_daily" if table == "rps_daily" else "industry_rps_daily"`，
+    # 传 concept_rps_daily（概念板块）时会被静默换成行业表。
+    tgt = table if table in (
+        "rps_daily", "industry_rps_daily", "concept_rps_daily"
+    ) else "rps_daily"
+    if not db.table_exists(conn, tgt):
+        return []
     row = conn.execute(f"SELECT MAX(date) AS dmax FROM {tgt}").fetchone()
     if not row or not row["dmax"]:
         # 目标表为空 → 整体都算待算
@@ -332,10 +375,20 @@ def materialize(
     """
     run_id = db.start_run(conn, task="compute-rps", source="internal")
 
+    if mode == "incremental" and not target_dates:
+        # 少了目标日期，下面的落库分支会走进「整表重写」——代价高且清空期间表是空的
+        raise ValueError("incremental 模式必须给 target_dates；否则会整表重写")
+
     frames = compute_rps_frames(close_wide, tradable, st_flags, exclude_st, periods)
     if not frames:
         db.finish_run(conn, run_id, "failed", 0, "close_wide 为空")
         return 0, 0
+
+    # ±inf 就地清掉：rank() 会把 +inf 当最大值排到榜首，而下面 dropna 之后
+    # 只剩「全 NaN 行」的形态落库占住主键。行业表复用同一份 frames，
+    # 因此必须在这里清，而不是等落库前各自清。
+    for key, frame in frames.items():
+        frames[key] = clean_inf(frame)
 
     dates = close_wide.index.strftime("%Y-%m-%d")
     symbol_cols = list(close_wide.columns)
@@ -348,26 +401,37 @@ def materialize(
         payload[f"ret{n}"] = frames[f"ret{n}"].to_numpy().ravel()
 
     rps_df = pd.DataFrame(payload)
-    # 至少一个周期有效才落库（全 NaN 行没有信息量）
+    # 至少一个周期有效才落库（全 NaN 行没有信息量）。先清 ±inf 再 dropna：
+    # 反过来的话「rps 全 inf」的行会被当成有效行落库。
     rps_cols = [f"rps{n}" for n in periods]
+    rps_df = clean_inf(rps_df)
     rps_df = rps_df.dropna(subset=rps_cols, how="all")
-    rps_df = rps_df.replace([np.inf, -np.inf], np.nan)
 
     # 领涨股以 60 日周期为代表（中期代表性最好），见 _leader_frames
     leader = _leader_frames(frames, periods)
     ind_df = compute_industry_rps(
         frames, industries, leader_rps=leader, names=names, periods=periods,
     )
+    if not ind_df.empty:
+        # 板块表的 ret/rps/member_count 全是浮点，同一处清干净
+        ind_df = clean_inf(ind_df)
 
-    if mode == "incremental" and target_dates is not None:
-        wanted = set(target_dates)
+    # 横截面只有 1 个成员时百分位恒等于 100：那不是「强度」，只是没有可比对象。
+    # 个股与行业各按自己的横截面宽度判断（单行业自比同样没有意义）。
+    rps_df = drop_thin_dates(rps_df, rps_cols)
+    if not ind_df.empty:
+        ind_df = drop_thin_dates(
+            ind_df, [c for c in ind_df.columns if c.startswith("ret")])
+
+    if mode == "incremental":
+        wanted = set(target_dates or ())
         rps_df = rps_df[rps_df["date"].isin(wanted)]
         if not ind_df.empty:
             ind_df = ind_df[ind_df["date"].isin(wanted)]
 
     n_stock = 0
     n_ind = 0
-    if mode == "incremental" and target_dates is not None:
+    if mode == "incremental":
         # 原地覆盖指定日期：先删这些日期再写，天然幂等
         if not rps_df.empty:
             n_stock = db.replace_date_partition(

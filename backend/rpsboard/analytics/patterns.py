@@ -86,6 +86,7 @@ def compute_sanxingdi(
     body = d["close"] - d["open"]
     # 三根分别是 T-2(k=2) / T-1(k=1) / T(k=0)
     c = {k: g["close"].shift(k) for k in (0, 1, 2)}
+    o = {k: g["open"].shift(k) for k in (0, 1, 2)}
     h = {k: g["high"].shift(k) for k in (0, 1, 2)}
     lo = {k: g["low"].shift(k) for k in (0, 1, 2)}
     b = {k: body.groupby(d["symbol"], sort=False).shift(k) for k in (0, 1, 2)}
@@ -102,7 +103,9 @@ def compute_sanxingdi(
     out["base_date"] = date_of[2][ok].to_numpy()
     out["base_low"] = lo[2][ok].to_numpy()
     out["base_high"] = h[2][ok].to_numpy()
-    out["strength"] = (c[0][ok] / d["open"][ok].to_numpy() - 1.0)
+    # 分子是第三根收盘（c[0]），分母必须是**第一根**开盘（o[2]）；
+    # 原来用本行自己的开盘（= 第三根），于是 strength 恒等于第三根自身涨幅。
+    out["strength"] = (c[0][ok] / o[2][ok].to_numpy() - 1.0)
     # 第一根实体 / 第三根实体。
     # ⚠ 必须向量化：用 `[b[2][ok].iloc[i] for i in range(n)]` 这种
     # 逐行 .iloc 在 20 万个形态上是分钟级的开销（Series.iloc 单点取值常数极大）。

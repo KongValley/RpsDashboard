@@ -27,6 +27,9 @@ def tradestatus_from_calendar(
 
     判定**必须按交易日而不是自然日**：长假（国庆 7 个自然日）与长期停牌在自然日口径下
     无法区分，会把全市场整天标成停牌 —— 实测 21 个交易日 / 112,379 行因此没有 RPS。
+
+    该列**不参与 RPS 掩码**（复牌当天是真实成交日，见
+    matrix.build_tradable_matrix），只作为数据质量标记与复牌日诊断使用。
     """
     cal = pd.Index(sorted(df["date"].unique())) if calendar is None else calendar
     pos = pd.Series(cal.get_indexer(df["date"]), index=df.index)
