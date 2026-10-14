@@ -76,6 +76,19 @@ def _lookback_start(conn: sqlite3.Connection, lookback_days: int | None) -> str 
     return (date.fromisoformat(latest) - timedelta(days=int(lookback_days))).isoformat()
 
 
+def _rps_dates(conn: sqlite3.Connection, lo, hi) -> set[str]:
+    """区间内**产出过 RPS** 的交易日（`YYYY-MM-DD` 字符串集合）。
+
+    回测的调仓日以它为准：`daily_bar` 里还有横截面不足 1,000 只股票的稀疏日期
+    （长期停牌股的历史延伸），那些日子没有信号，不该出现在窗口里。
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT date FROM rps_daily WHERE date BETWEEN ? AND ?",
+        (lo.strftime("%Y-%m-%d"), hi.strftime("%Y-%m-%d")),
+    ).fetchall()
+    return {r["date"] for r in rows}
+
+
 @dataclass
 class BacktestResult:
     equity_curve: list[dict] = field(default_factory=list)
@@ -175,7 +188,8 @@ def load_context(
     long = matrix.load_long(conn, start)
     data = {
         "start": start,
-        "close": matrix.build_close_matrix(long),
+        # 负偏移股票（5 只）必须还原后再算比值，否则它们的区间收益整段失真
+        "close": matrix.build_close_matrix(long, matrix.negative_offsets(conn)),
         "tradable": matrix.build_tradable_matrix(long),
         "st_flags": matrix.build_st_flags(long),
         "pct": matrix.build_pctchg_matrix(long),
@@ -315,6 +329,9 @@ def run_backtest(
     # 真实 limit_ratio，并用「收益率比」判定（后复权价与不复权涨停价
     # 不在同一基准，直接比会算出 4303 家假涨停）。
     lim_up = lim_dn = None
+    #: 产出过 RPS 的交易日（信号日）：覆盖率分母与调仓日都用它，
+    #: 口径必须一致（见下方 coverage 与 dates 两处使用）
+    sig_dates: set[str] = set()
     if use_price_limits:
         from .limits import (
             MODEL_VALIDATION_DAYS,
@@ -327,6 +344,13 @@ def run_backtest(
         )
 
         dates = [d.strftime("%Y-%m-%d") for d in close_wide.index]
+        # 调仓日与覆盖率的分母都只用**产出过 RPS 的交易日**：daily_bar 里还有
+        # 横截面不足 config.MIN_CROSS_SECTION 的稀疏日期（长期停牌股的历史延伸），
+        # 那些日子没有信号、现在也不参与调仓 —— 若仍把它们算进分母，
+        # 警告里的覆盖率会从 50% 被稀释成 37%，与真实可交易区间对不上。
+        sig_dates = _rps_dates(conn, close_wide.index[0], close_wide.index[-1])
+        if sig_dates:
+            dates = [d for d in dates if d in sig_dates]
         cols = list(close_wide.columns)
         measured = load_ratio_frames(conn, dates, cols)
         covered, total = coverage(conn, dates)
@@ -371,6 +395,14 @@ def run_backtest(
     fwd = fwd.reindex(index=mask.index, columns=mask.columns)
 
     dates = list(mask.index)
+    # 调仓日同样只取信号日：矩阵里还包含只有历史延伸的稀疏日期（2018~2021，
+    # 横截面不足 config.MIN_CROSS_SECTION，RPS 不落库）。在那些日子调仓等于
+    # 按空信号调仓，却把回测窗口拉长到 7.4 年、覆盖率分母撑到 1,734 天 ——
+    # 看板上的「窗口 / 覆盖率」必须对应真实可交易区间。
+    if dates:
+        if not sig_dates:
+            sig_dates = _rps_dates(conn, dates[0], dates[-1])
+        dates = [d for d in dates if d.strftime("%Y-%m-%d") in sig_dates]
     # 重叠持仓期（rebalance < hold）在当前「逐段复利」的净值模型里无法正确表达：
     # fwd 恒为 hold 日收益，若每 rebalance 天乘一次就等于把同一段行情重复计入
     # （hold=20/rebalance=5 会把 20 日收益乘 4 次）。回落为 hold 并写 warning，

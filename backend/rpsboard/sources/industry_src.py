@@ -160,11 +160,22 @@ def _from_csv(path: Path, progress=None) -> tuple[pd.DataFrame, str, int]:
 
 
 def sync_industry_map(
-    replace: bool = False, from_csv: str | Path | None = None, progress=None
+    replace: bool = False,
+    from_csv: str | Path | None = None,
+    fill_missing: bool = False,
+    progress=None,
 ) -> tuple[int, int]:
     """写入 industry_map，返回 (覆盖的股票数, 失败的板块数)。
 
-    已有数据且未指定 replace 时返回 (0, 0)（保护已有的具名口径，例如证监会行业分类）。
+    已有数据且未指定 replace / fill_missing 时返回 (0, 0)（保护已有的具名口径，
+    例如证监会行业分类）。
+
+    `fill_missing=True` 走第三条路：**保留**已有行，只用 `tdxhy.cfg` 给**缺行业**
+    的股票补一行（该文件不含行业名称，补进来的是层级代码，如 `X32`）。取舍是明确的：
+    两套口径混在一张表里，`industry_cls` 逐行标注来源；换来的是 6% 的股票
+    （实测 356 只，绝大多数北交所）能进板块 RPS，而不是永远「未分类」。
+    当前具名行业源不可复现（eltdx 的行业板块分类本机恒为 0 个，见模块 docstring），
+    所以这是唯一能不丢已有口径又补上缺口的做法。
 
     写入是**按 symbol 覆盖**而不是先清空整表：部分板块采集失败时，整表重建会把
     那些失败板块覆盖的股票连旧行一起删掉，行业 RPS 当天就出现整块缺口。
@@ -174,7 +185,7 @@ def sync_industry_map(
     conn = db.connect()
     try:
         existing = conn.execute("SELECT COUNT(*) AS c FROM industry_map").fetchone()["c"]
-        if existing and not replace:
+        if existing and not replace and not fill_missing:
             cls = conn.execute(
                 "SELECT industry_cls, COUNT(*) AS c FROM industry_map "
                 "GROUP BY industry_cls ORDER BY c DESC LIMIT 1"
@@ -187,11 +198,23 @@ def sync_industry_map(
         t0 = time.time()
         if from_csv:
             df, cls, n_failed = _from_csv(Path(from_csv), progress=progress)
+        elif fill_missing and existing:
+            df, cls, n_failed = _from_tdxhy(progress=progress)
+            if not df.empty:
+                have = {r[0] for r in conn.execute("SELECT symbol FROM industry_map")}
+                missing = df[~df["symbol"].isin(have)]
+                print(f"[industry] --fill-missing：tdxhy 覆盖 {len(df)} 只，"
+                      f"其中缺行业 {len(missing)} 只")
+                df = missing
         else:
             df, cls, n_failed = _from_named_boards(progress=progress)
             if df.empty:
                 df, cls, n_failed = _from_tdxhy(progress=progress)
         if df.empty:
+            if fill_missing:
+                print("[industry] 没有需要补的股票（已有口径已覆盖全部，"
+                      "或 tdxhy.cfg 里也没有它们）")
+                return 0, 0
             raise RuntimeError(
                 "没有取到任何行业分类；请用 `cli industry-map --from-csv <映射.csv>` 提供"
             )

@@ -155,7 +155,7 @@ def cmd_compute_rps(args: argparse.Namespace) -> int:
                 db.finish_run(conn, run_id, "failed", 0, "daily_bar 为空")
                 print("[rps] daily_bar 为空，请先 backfill", file=sys.stderr)
                 return 1
-            close = matrix.build_close_matrix(long)
+            close = matrix.build_close_matrix(long, matrix.negative_offsets(conn))
             tradable = matrix.build_tradable_matrix(long)
             st = matrix.build_st_flags(long)
             ind_map = matrix.load_industry_map(conn)
@@ -185,14 +185,28 @@ def cmd_compute_rps(args: argparse.Namespace) -> int:
     # 复权异常端点已自动剔除（收益为 NULL）：这里报出被剔除的行数，其余异常见 cli quality
     with db.session() as conn:
         floor = config.ANOMALY_MIN_PRICE
+        # 必须按**矩阵口径**统计：负偏移股票先加回 |offset| 再比门槛
+        # （matrix.negative_offsets）。否则报出来的是后复权价的行数（414），
+        # 与实际被置空的端点（49）对不上，等于给用户一个假的核对基线。
+        offs = matrix.negative_offsets(conn)
         if floor > 0:
-            row = conn.execute(
-                "SELECT COUNT(*) AS n FROM daily_bar WHERE close < ?",
-                (floor,)).fetchone()
+            off_syms = list(offs)
+            if off_syms:
+                marks = ",".join("?" * len(off_syms))
+                n_excl = conn.execute(
+                    f"SELECT COUNT(*) AS n FROM daily_bar WHERE close < ? "
+                    f"AND symbol NOT IN ({marks})", (floor, *off_syms)).fetchone()["n"]
+                for sym, off in offs.items():
+                    n_excl += conn.execute(
+                        "SELECT COUNT(*) AS n FROM daily_bar WHERE symbol = ? AND close < ?",
+                        (sym, floor - float(off))).fetchone()["n"]
+            else:
+                n_excl = conn.execute(
+                    "SELECT COUNT(*) AS n FROM daily_bar WHERE close < ?",
+                    (floor,)).fetchone()["n"]
         else:                       # 门槛为 0 时只剔除非正价（旧行为）
-            row = conn.execute(
-                "SELECT COUNT(*) AS n FROM daily_bar WHERE close <= 0").fetchone()
-        n_excl = row["n"]
+            n_excl = conn.execute(
+                "SELECT COUNT(*) AS n FROM daily_bar WHERE close <= 0").fetchone()["n"]
         if n_excl:
             print(f"[rps] 复权异常：{n_excl} 行端点价 < {floor:g} 元（含穿零）已置空，"
                   f"跨这些点的区间收益不计：cli quality")
@@ -446,6 +460,7 @@ def cmd_industry_map(args: argparse.Namespace) -> int:
             n_sym, n_failed = industry_src.sync_industry_map(
                 replace=bool(getattr(args, "replace", False)),
                 from_csv=getattr(args, "from_csv", None),
+                fill_missing=bool(getattr(args, "fill_missing", False)),
             )
             msg = f"覆盖 {n_sym} 只股票"
             if n_failed:
@@ -499,7 +514,7 @@ def cmd_concept(args: argparse.Namespace) -> int:
             targets, start = None, None
 
         long = matrix.load_long(conn, start, seed_before_start=(targets is not None))
-        close = matrix.build_close_matrix(long)
+        close = matrix.build_close_matrix(long, matrix.negative_offsets(conn))
         frames = rps_engine.compute_rps_frames(
             close, matrix.build_tradable_matrix(long), matrix.build_st_flags(long),
             exclude_st=not args.include_st, periods=config.PERIODS,
@@ -514,16 +529,19 @@ def cmd_concept(args: argparse.Namespace) -> int:
         if cdf.empty:
             print("[concept] 未算出概念 RPS（concept_map 为空？）")
             return 1
-        # 与个股/行业同口径：先清 ±inf，再丢掉只有 1 个概念的横截面日期
-        # （单成员时百分位恒 100，那不是强度）
+        # 与个股同口径：横截面不足时不产出概念 RPS（成分股来自同一批个股，
+        # 日期集合必须一致，否则同一行数据在个股表里没有、在概念表里却有）；
+        # 另外单成员时百分位恒 100，那不是强度
+        keep = rps_engine.cross_section_dates(frames, config.MIN_CROSS_SECTION)
+        cdf = cdf[cdf["date"].isin(keep)]
         cdf = rps_engine.drop_thin_dates(
             rps_engine.clean_inf(cdf),
             [c for c in cdf.columns if c.startswith("ret")],
         )
         if targets is not None:
             cdf = cdf[cdf["date"].isin(set(targets))]
-        conn.execute("DELETE FROM concept_rps_daily") if targets is None else None
-        conn.commit()
+        # 全量分支由 _write_all 在同一事务里 DELETE + 写入；这里不再单独删一次并提交，
+        # 否则中断会停在「已删未写」的空表状态
         n = db.replace_date_partition(
             conn, "concept_rps_daily", sorted(set(cdf["date"])), cdf
         ) if targets is not None else _write_all(conn, "concept_rps_daily", cdf)
@@ -532,9 +550,10 @@ def cmd_concept(args: argparse.Namespace) -> int:
 
 
 def _write_all(conn, table: str, df) -> int:
+    """整表替换。DELETE 与写入必须同一事务：中间 commit 的话，中断就只剩空表。"""
     conn.execute(f"DELETE FROM {table}")
-    conn.commit()
-    df.to_sql(table, conn, if_exists="append", index=False)
+    if not df.empty:
+        df.to_sql(table, conn, if_exists="append", index=False)
     conn.commit()
     return len(df)
 
@@ -811,8 +830,10 @@ def cmd_status(_: argparse.Namespace) -> int:
             if sum(c.values()) or sum(o.values()):
                 print(f"复权异常    可疑跳变 {c.get('hfq_jump', 0)} 处 / "
                       f"极小价 {c.get('tiny_price', 0)} 行 / 非正价 {c.get('nonpositive_price', 0)} 行 / "
-                      f"负偏移 {o.get('negative_offset', 0)} 只 / 因子跳变 {o.get('factor_jump', 0)} 处"
-                      f" → cli quality")
+                      f"负偏移 {o.get('negative_offset', 0)} 只 → cli quality")
+                print(f"            （信息性：除权/送转事件 {o.get('factor_jump', 0)} 处、"
+                      f"无涨跌幅限制日 {c.get('no_limit_day', 0)} 处 —— 正常企业行为，"
+                      f"复牌日不设限未进买入过滤）")
             else:
                 print("复权异常    无")
     finally:
@@ -917,6 +938,14 @@ def run_update_pipeline(progress=None, workers: int | None = None) -> dict:
         n_hits = len(alerts_engine.run_rules(conn))
     print(f"[alert] 命中 {n_hits} 条")
 
+    # 复权异常 / 价格档位扫描：以前只能手动跑，于是「复权异常」永远显示上一次
+    # 手动跑出来的数字（甚至从未跑过）。跟着更新一起刷新（实测约 20 秒）；
+    # 它是诊断步骤，失败不阻断本次更新，但必须打印出来。
+    say("quality")
+    rc = cmd_quality(_ns("quality"))
+    if rc != 0:
+        print(f"[quality] 复权异常扫描失败（退出码 {rc}），本次更新继续")
+
     say("done")
     return {"ok": True, "price_limit_rows": n_lim, "alert_hits": n_hits}
 
@@ -946,6 +975,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("industry-map", help="写入 industry_map（eltdx 行业分类或自带 CSV）")
     sp.add_argument("--replace", action="store_true",
                     help="整表重建（默认已有数据则跳过，避免覆盖已有口径）")
+    sp.add_argument("--fill-missing", dest="fill_missing", action="store_true",
+                    help="只给缺行业的股票补行（tdxhy.cfg 的行业代码，保留已有具名口径）")
     sp.add_argument("--from-csv", dest="from_csv", default=None,
                     help="从 CSV 导入（列：symbol,industry[,industry_cls]）")
     sp.set_defaults(func=cmd_industry_map)

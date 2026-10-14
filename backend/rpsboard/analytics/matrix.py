@@ -83,15 +83,44 @@ def load_long(
     return out
 
 
-def build_close_matrix(long: pd.DataFrame) -> pd.DataFrame:
+def negative_offsets(conn: sqlite3.Connection) -> dict[str, float]:
+    """负偏移档位的股票 → 该档位的 |offset|（`adjust_event.ratio` 存的就是 offset）。
+
+    后复权价 = 原始价 × scale + offset，offset < 0 时原始价接近变换零点
+    （`-offset/scale`）会让 `close(t)/close(t−N)` 的比值被严重放大。
+    **还原不需要 scale**：(p+r)/(q+r) 里 scale 被约掉，只要给整列加 |offset|，
+    得到的序列就与原始价成比例、比值正确。
+
+    同一只股票有多档时取**最新**一档：库内序列由当前因子档位算出来（每天全量重取），
+    旧档位的偏移用不上。
+    """
+    try:
+        rows = conn.execute(
+            "SELECT a.symbol AS symbol, -a.ratio AS off FROM adjust_event a "
+            "WHERE a.kind = 'negative_offset' AND a.ratio < 0 AND a.date = ("
+            "  SELECT MAX(b.date) FROM adjust_event b "
+            "  WHERE b.symbol = a.symbol AND b.kind = 'negative_offset')"
+        ).fetchall()
+    except sqlite3.Error:
+        return {}
+    return {r["symbol"]: float(r["off"]) for r in rows}
+
+
+def build_close_matrix(
+    long: pd.DataFrame, offsets: dict[str, float] | None = None
+) -> pd.DataFrame:
     """构建后复权收盘价宽矩阵（index=date, columns=symbol）。
 
     停牌日用前值填充（ffill）——停牌期间价格不变是合理的近似，
     否则整只股票的区间收益会被 NaN 污染成缺失。
 
-    **端点剔除**：低于 `config.ANOMALY_MIN_PRICE`（默认 1 元）的后复权价视为无效，
-    连同非正价一起置为 NaN。机理是后复权价 = 原始价 × scale + offset（offset 可为负）：
-    原始价接近变换零点时后复权价被压到极小，`close(t)/close(t−N)` 的比值会被放大到
+    **负偏移还原**：`offsets`（见 `negative_offsets`）里列出的股票先整列加上
+    |offset|。实测 5 只（000793/600076/600136/600180/600734）的收益**几乎整段失真**
+    （每周期 900~1,270 行偏差 >20pp，最大 1,640pp），且它们能拿到 `rps=100`
+    被回测买入 —— 加回偏移后比值口径就是原始价的真实涨幅。
+
+    **端点剔除**：低于 `config.ANOMALY_MIN_PRICE`（默认 1 元）的价视为无效，
+    连同非正价一起置为 NaN。机理与上面同一个：原始价接近变换零点时比值被放大到
     失真（实测 600076 的 `ret60 = +998%`，当天原始价只涨了约 8%）。
     区间收益只取决于两个端点，所以按端点剔除而不是「跨过异常日整段作废」；
     同一条规则同时覆盖 RPS、回测的前瞻收益与涨跌停判定的 `pct_change`。
@@ -102,6 +131,10 @@ def build_close_matrix(long: pd.DataFrame) -> pd.DataFrame:
     df["date"] = pd.to_datetime(df["date"])
     wide = df.pivot_table(index="date", columns="symbol", values="close", aggfunc="last")
     wide = wide.sort_index().ffill()
+    if offsets:
+        for sym, off in offsets.items():
+            if sym in wide.columns:
+                wide[sym] = wide[sym] + float(off)
     floor = max(config.ANOMALY_MIN_PRICE, 0.0)
     # 放在 ffill 之后：停牌日沿用前值，前值若已被剔除，停牌期间也不该「复活」
     return wide.where(wide >= floor) if floor > 0 else wide.where(wide > 0)

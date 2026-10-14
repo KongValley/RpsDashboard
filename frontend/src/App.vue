@@ -96,11 +96,17 @@ const updateError = ref('')
 const lastUpdate = ref('')
 let pollTimer = null
 
+// 阶段名必须与后端 run_update_pipeline 的 say(...) 一一对应：漏掉的阶段会把
+// 英文 key 直接显示给用户（industry / patterns / alerts 此前就是这样）。
 const PHASES = {
   starting: '准备中',
-  bars: '拉取日K（约 209 秒）',
+  bars: '拉取日K（约 7 分钟）',
   limits: '采集涨跌停（约 35 秒）',
-  rps: '重算 RPS（约 10 秒）',
+  industry: '补行业分类',
+  rps: '重算 RPS',
+  patterns: '识别三升底',
+  alerts: '评估预警规则',
+  quality: '复权异常扫描（约 20 秒）',
   done: '完成',
   failed: '失败',
 }
@@ -173,9 +179,23 @@ const statusText = computed(() => {
   const s = status.value
   if (!s) return '连接中…'
   if (!s.db_ready) return '数据库未初始化'
-  const d = s.last_bar_date || '—'
   const n = s.bar_rows || 0
-  return `日K ${d} · ${n.toLocaleString()} 行`
+  const parts = [`日K ${s.last_bar_date || '—'} · ${n.toLocaleString()} 行`]
+  // 数据质量跟顶栏一起显示（涨跌停实测覆盖 / 概念覆盖 / 复权异常计数）。
+  // 这些数字以前只在 CLI 里，页面用户不知道「回测为什么没剔涨停」、
+  // 「为什么有些概念没有 RPS」。缺数据时字段为 null，静默跳过即可。
+  const q = s.quality || {}
+  const lim = q.price_limit
+  if (lim?.days) {
+    parts.push(`涨跌停实测 ${lim.days}/${lim.total_days || lim.days} 天`)
+  }
+  if (q.concept?.total) parts.push(`概念 ${q.concept.with_rps}/${q.concept.total}`)
+  const ev = q.adjust_events || {}
+  const anomalies = (ev['internal/hfq_jump'] || 0)
+    + (ev['internal/tiny_price'] || 0)
+    + (ev['internal/nonpositive_price'] || 0)
+  if (anomalies) parts.push(`复权异常 ${anomalies.toLocaleString()} 处`)
+  return parts.join(' · ')
 })
 
 // 旧的 refresh（同步调用 collect）已被上面的异步版本取代：

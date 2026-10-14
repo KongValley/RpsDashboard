@@ -125,14 +125,15 @@ def materialize(
 
     df = compute_sanxingdi(ohlc, rules)
     with db.session() as c:
+        # 同事务：DELETE 与写入之间不 commit，否则中断会留下空的 pattern_daily；
+        # 收尾统一 commit，空结果同样要落库（否则旧形态会残留在表里）
         c.execute("DELETE FROM pattern_daily")
-        c.commit()
         if not df.empty:
             out = df.copy()
             out["date"] = out["date"].dt.strftime("%Y-%m-%d")
             out["base_date"] = pd.to_datetime(out["base_date"]).dt.strftime("%Y-%m-%d")
             out.to_sql("pattern_daily", c, if_exists="append", index=False)
-            c.commit()
+        c.commit()
     return len(df)
 
 

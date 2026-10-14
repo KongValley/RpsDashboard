@@ -16,6 +16,12 @@
         </div>
       </div>
 
+      <div v-if="anomalies.length" class="warnbar soft inset">
+        ⚠ 复权异常 {{ anomalies.length }} 条（{{ anomalyKinds }}，最近
+        {{ anomalies[0]?.date }}）：后复权价在该区间被压到极小或穿零，
+        <b>跨该点的区间收益已自动剔除</b>，不是数据缺失。详见 README「复权因子异常」。
+      </div>
+
       <div class="cards">
         <div v-for="p in periods" :key="p" class="panel card">
           <div class="muted label">RPS{{ p }}</div>
@@ -160,6 +166,14 @@ const EMPHASIS_PERIOD = 60
 const dataDate = ref(null)
 /** 接口错误提示：失败不能再伪装成「形态数据尚未计算」 */
 const errMsg = ref('')
+/** 复权异常（接口逐条返回）：不显示的话用户会把「收益被剔除」当成数据缺失 */
+const anomalies = ref([])
+const ANOMALY_LABELS = {
+  tiny_price: '极小价', nonpositive_price: '非正价', hfq_jump: '库内跳变',
+  negative_offset: '负偏移档位', factor_jump: '除权/送转', no_limit_day: '无涨跌幅限制日',
+}
+const anomalyKinds = computed(() => [...new Set(anomalies.value.map((a) => a.kind))]
+  .map((k) => ANOMALY_LABELS[k] || k).join('、'))
 watch(periodsError, (v) => { if (v) errMsg.value = v }, { immediate: true })
 // 切换股票/窗口天数时只认最后一次响应（旧响应会把新股票的数据写回来）
 const latestDetail = useLatestRequest()
@@ -175,6 +189,7 @@ async function loadDetail() {
     cur.value = d.current || {}
     pct.value = d.market_percentile || {}
     industryRps.value = d.industry_rps
+    anomalies.value = d.adjust_anomalies || []
     dataDate.value = cur.value?.date
   } catch (e) {
     if (!latestDetail.isCurrent(t)) return

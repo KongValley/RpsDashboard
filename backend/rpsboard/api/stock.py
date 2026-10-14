@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 
 import numpy as np
@@ -10,6 +11,8 @@ from fastapi import APIRouter, HTTPException
 
 from .. import config, db
 from . import jsonable, read_sql
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/stock", tags=["stock"])
 
@@ -72,6 +75,23 @@ def detail(symbol: str) -> dict:
         if not rps_row.empty:
             current = rps_row.iloc[0].to_dict()
 
+        # 复权异常：这只票若有「后复权价被压到极小/穿零」的行，页面上必须看得见 ——
+        # 那些区间收益会被放大（实测 600076 曾因此拿到全市场 rps60=100）。现在的口径
+        # 是**端点自动剔除**（见 matrix.build_close_matrix），但用户至少要知道
+        # 「这只票历史上有这个问题、哪一段时间受影响」。
+        anomalies: list[dict] = []
+        try:
+            anomalies = [
+                {"date": r["date"], "kind": r["kind"], "detail": r["detail"]}
+                for r in conn.execute(
+                    "SELECT date, kind, detail FROM adjust_event WHERE symbol = ? "
+                    "ORDER BY date DESC LIMIT 12",
+                    (symbol,),
+                )
+            ]
+        except Exception as exc:  # noqa: BLE001 - 旧库没有这张表
+            logger.debug("读取复权异常失败: %s", exc)
+
         # 各周期在全市场中的横向分位：**跑赢全市场百分之多少的股票**
         # = 该周期 RPS ≤ 我 的股票占比。旧实现算的是「≥ 我」的占比，
         # 语义正好反过来 —— 全市场第一（301234，rps60=100）显示成
@@ -116,6 +136,7 @@ def detail(symbol: str) -> dict:
             "current": _clean(current),
             "market_percentile": ranks,
             "industry_rps": _clean(industry_rps) if industry_rps else None,
+            "adjust_anomalies": anomalies,
         }
     finally:
         conn.close()

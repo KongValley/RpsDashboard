@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 
 from fastapi import APIRouter, Query
 
@@ -12,6 +13,82 @@ from . import latest_bar_date, read_sql
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/meta", tags=["meta"])
+
+#: 质量块的缓存 TTL：`/api/meta/status` 被前端轮询，而质量块要扫
+#: `price_limit_daily`（356 万行）与 `rps_daily`（626 万行）两棵索引的
+#: `COUNT(DISTINCT date)` —— 未缓存时整个接口实测 **2.1 ~ 3.4 秒**（磁盘压力大时更慢），
+#: 缓存命中后 **8 ms**。与 `db.count_rows_cached` 同样的取舍：数据每天才变一次，
+#: 5 分钟延迟无感，而把 TTL 从 60 秒提到 300 秒能把「冷一次」的概率压到 1/5。
+_QUALITY_TTL = 300.0
+_quality_cache: dict = {}
+
+
+def _compute_quality(conn) -> dict:
+    """涨跌停实测覆盖 / 复权异常计数 / 概念覆盖。
+
+    这些数字原先只有 CLI 看得到（cli status、cli quality），页面上完全不可见，
+    于是「回测为什么没剔涨停」「这只票为什么没有行业」都无从判断。
+    每一块单独 try：任何一块统计失败都要返回 None（而不是 0），
+    谎报「0 个异常」比不给数字更糟。
+    """
+    quality: dict = {}
+    try:
+        lim = conn.execute(
+            "SELECT COUNT(DISTINCT date) AS days, MIN(date) AS lo, MAX(date) AS hi "
+            "FROM price_limit_daily"
+        ).fetchone()
+        # 分母取 **RPS 交易日**而不是 daily_bar 的日期数：后者含 2018~2021 那些
+        # 只有少数停牌股有数据的稀疏日期（1,734 天），拿它当分母会把覆盖率
+        # 从 48% 稀释成 35%，而回测真正会用的日子就是 RPS 那 1,285 天。
+        total_days = conn.execute(
+            "SELECT COUNT(DISTINCT date) AS c FROM rps_daily"
+        ).fetchone()
+        quality["price_limit"] = {
+            "days": int(lim["days"]) if lim and lim["days"] else 0,
+            "total_days": int(total_days["c"]) if total_days and total_days["c"] else 0,
+            "first": lim["lo"] if lim else None,
+            "last": lim["hi"] if lim else None,
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("统计涨跌停覆盖失败: %s", exc)
+        quality["price_limit"] = None
+    try:
+        quality["adjust_events"] = {
+            f"{r['source']}/{r['kind']}": int(r["n"])
+            for r in conn.execute(
+                "SELECT source, kind, COUNT(*) AS n FROM adjust_event "
+                "GROUP BY source, kind"
+            )
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("统计复权异常失败: %s", exc)
+        quality["adjust_events"] = None
+    try:
+        with_rps = conn.execute(
+            "SELECT COUNT(DISTINCT concept) AS c FROM concept_rps_daily"
+        ).fetchone()
+        total = conn.execute(
+            "SELECT COUNT(DISTINCT concept) AS c FROM concept_map"
+        ).fetchone()
+        quality["concept"] = {
+            "with_rps": int(with_rps["c"]) if with_rps and with_rps["c"] else 0,
+            "total": int(total["c"]) if total and total["c"] else 0,
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("统计概念覆盖失败: %s", exc)
+        quality["concept"] = None
+    return quality
+
+
+def _quality(conn) -> dict:
+    key = str(config.DB_PATH)
+    now = time.monotonic()
+    hit = _quality_cache.get(key)
+    if hit is not None and now - hit[0] < _QUALITY_TTL:
+        return hit[1]
+    value = _compute_quality(conn)
+    _quality_cache[key] = (now, value)
+    return value
 
 
 @router.get("/status")
@@ -40,6 +117,8 @@ def status() -> dict:
             unmapped = None
 
         last = db.last_log(conn)
+        quality = _quality(conn)
+
         return {
             "db_ready": bar_rows > 0,
             "bar_rows": bar_rows,
@@ -47,6 +126,7 @@ def status() -> dict:
             "industry_rows": ind_rows,
             "last_bar_date": last_bar,
             "unmapped_symbols": unmapped,
+            "quality": quality,
             "source": config.DATA_SOURCE,
             "periods": list(config.PERIODS),
             "last_collect_log": last,

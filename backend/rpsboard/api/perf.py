@@ -35,6 +35,8 @@ _log_broken = False
 _EXCLUDE_PREFIX = "/api/meta/perf"
 #: 路径过长（恶意/异常 query）只留前 300 字符
 _PATH_MAX = 300
+#: 性能日志单文件上限：超过就滚动为 `.1`（只留一份历史），避免无限增长
+PERF_LOG_MAX_BYTES = 5 * 1024 * 1024
 
 
 def reset() -> None:
@@ -59,6 +61,10 @@ def _append_jsonl(entry: dict) -> None:
         try:
             path = _log_path()
             path.parent.mkdir(parents=True, exist_ok=True)
+            # 滚动：超过上限就改名为 `.1`（只留一份历史）。观测数据不做长期归档，
+            # 无上限增长的唯一后果是慢慢吃掉磁盘（实测 715 KB / 一天）。
+            if path.exists() and path.stat().st_size > PERF_LOG_MAX_BYTES:
+                path.replace(path.with_name(path.name + ".1"))
             with path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         except OSError as exc:

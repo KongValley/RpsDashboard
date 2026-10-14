@@ -84,13 +84,20 @@ def clean_inf(df: pd.DataFrame) -> pd.DataFrame:
     return df.replace([np.inf, -np.inf], np.nan)
 
 
-def drop_thin_dates(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
-    """丢掉横截面成员不足 2 个的日期。
+def drop_thin_dates(
+    df: pd.DataFrame, cols: list[str], min_members: int = 2
+) -> pd.DataFrame:
+    """丢掉横截面成员不足 `min_members` 的日期。
 
     只有 1 个成员时百分位恒等于 100 —— 那不是「强度」，只是没有可比对象
     （实测 2023-04~06 的数据爬坡期每天只有 1~3 只股票有 RPS，
     另有 41 个日期只有 1 个概念有值）。
-    个股 / 行业 / 概念三条路径都要过这一步，否则「假榜首」会从不同入口漏回来。
+
+    **个股路径传 `config.MIN_CROSS_SECTION`（默认 1000）**：RPS 是「全市场相对
+    强度」，几十只股票参与排名时第一名不代表强。窗口延长到 1300 根后，少数长期
+    停牌股的历史把日期回填到 2018~2021 年（横截面几到几百只），不设门槛就会让
+    2020 年的「RPS=100」与今天的「RPS=100」画在同一条曲线上。
+    行业/概念沿用默认 2：板块成员本来就少，且它们与个股共用同一批日期。
     """
     if df.empty or "date" not in df.columns:
         return df
@@ -98,7 +105,24 @@ def drop_thin_dates(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     if not cols:
         return df
     per_date = df[cols].notna().any(axis=1).groupby(df["date"]).sum()
-    return df[df["date"].isin(set(per_date[per_date >= 2].index))]
+    return df[df["date"].isin(set(per_date[per_date >= min_members].index))]
+
+
+def cross_section_dates(
+    frames: dict[str, pd.DataFrame], min_members: int
+) -> set[str]:
+    """宽矩阵帧里横截面 ≥ min_members 的日期（`YYYY-MM-DD` 字符串集合）。
+
+    概念 RPS 走的是宽帧（不是落库前的长表），需要同一套日期门槛才能与个股
+    对齐：任何周期达标即算达标（与 drop_thin_dates 的 `any` 语义一致）。
+    """
+    keep: set[str] = set()
+    for df in frames.values():
+        if df.empty:
+            continue
+        counts = df.notna().sum(axis=1)
+        keep |= set(counts[counts >= min_members].index.strftime("%Y-%m-%d"))
+    return keep
 
 
 def _leader_frames(
@@ -366,6 +390,7 @@ def materialize(
     periods: tuple[int, ...] = config.PERIODS,
     mode: str = "full",
     target_dates: list[str] | None = None,
+    min_cross_section: int | None = None,
 ) -> tuple[int, int]:
     """计算并写入 rps_daily / industry_rps_daily。返回 (个股行数, 板块行数)。
 
@@ -422,12 +447,15 @@ def materialize(
         # 板块表的 ret/rps/member_count 全是浮点，同一处清干净
         ind_df = clean_inf(ind_df)
 
-    # 横截面只有 1 个成员时百分位恒等于 100：那不是「强度」，只是没有可比对象。
-    # 个股与行业各按自己的横截面宽度判断（单行业自比同样没有意义）。
-    rps_df = drop_thin_dates(rps_df, rps_cols)
+    # 横截面太薄时百分位没有意义（个股 ≥ min_cross_section，缺省取
+    # config.MIN_CROSS_SECTION）；行业表复用个股的日期集合 —— 成分股来自同一批数据，
+    # 日期口径不一致会让同一天有的表有值、有的没值，看板上就会出现
+    # 「排行榜有行、板块没有」的怪状态。
+    min_members = (config.MIN_CROSS_SECTION if min_cross_section is None
+                   else int(min_cross_section))
+    rps_df = drop_thin_dates(rps_df, rps_cols, min_members)
     if not ind_df.empty:
-        ind_df = drop_thin_dates(
-            ind_df, [c for c in ind_df.columns if c.startswith("ret")])
+        ind_df = ind_df[ind_df["date"].isin(set(rps_df["date"]))]
 
     if mode == "incremental":
         wanted = set(target_dates or ())
@@ -453,9 +481,10 @@ def materialize(
         # 否则排行榜的排序会退化成临时 B-TREE。
         db.drop_period_index(conn)
         try:
+            # DELETE 与写入必须同一事务：中间 commit 一次的话，进程被杀/断电就停在
+            # 「已删未写」，排行榜整表空掉（同 2026-10-14 日 K 事故的病灶）。
             conn.execute("DELETE FROM rps_daily")
             conn.execute("DELETE FROM industry_rps_daily")
-            conn.commit()
 
             if not rps_df.empty:
                 rps_df.to_sql("rps_daily", conn, if_exists="append", index=False, chunksize=2000)

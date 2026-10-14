@@ -387,3 +387,36 @@ def test_anomaly_floor_zero_keeps_low_prices(monkeypatch):
     close = build_close_matrix(pd.DataFrame(rows))
     assert pd.notna(close.loc[dates[0], "000002"]), "门槛 0 时 0.5 元应保留"
     assert pd.isna(close.loc[dates[1], "000002"]), "非正价永远剔除"
+
+
+def test_negative_offset_restored_before_returns():
+    """负偏移股票必须还原成原始价比例后再算区间收益。
+
+    后复权价 = 原始价 × scale + offset，offset < 0 时原始价贴着变换零点，比值会被
+    放大到失真 —— 实测 5 只（000793/600076/600136/600180/600734）每周期有
+    900~1,270 行偏差 >20pp（最大 1,640pp），且它们的 RPS 能到 100，
+    回测会把「原始价 +10%」当成「+85%」买进去。
+
+    构造：零点 9 元（offset=-9），原始价 10.2 → 11.22 走 +10%，
+    对应后复权 1.2 → 2.22（两个端点都 ≥1 元，端点剔除挡不住）。
+    """
+    n = 16
+    raw = [10.2 * (1 + 0.10 / 15) ** i for i in range(n)]
+    df = pd.DataFrame([
+        {"symbol": "600734", "date": f"2026-01-{i + 1:02d}", "close": raw[i] - 9.0,
+         "pct_chg": 0.0, "tradestatus": 1, "is_st": 0}
+        for i in range(n)
+    ])
+
+    restored = rps.compute_rps_frames(
+        build_close_matrix(df, {"600734": 9.0}), periods=(15,))
+    distorted = rps.compute_rps_frames(build_close_matrix(df), periods=(15,))
+
+    expect_true = raw[-1] / raw[0] - 1            # 原始价口径的真实涨幅
+    expect_bad = (raw[-1] - 9.0) / (raw[0] - 9.0) - 1   # 后复权比值（贴着零点）
+
+    assert restored["ret15"].iloc[-1, 0] == pytest.approx(expect_true, abs=1e-12), (
+        "还原后 = 真实涨幅"
+    )
+    assert distorted["ret15"].iloc[-1, 0] == pytest.approx(expect_bad, abs=1e-12)
+    assert expect_bad > 5 * expect_true, "这正是生产库里发生的放大"

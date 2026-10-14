@@ -438,8 +438,9 @@ def upsert_master(conn: sqlite3.Connection, df: pd.DataFrame) -> int:
     """证券主数据：按 symbol 覆盖写。"""
     if df.empty:
         return 0
+    # DELETE 与写入同一事务：证券清单全市场重写，中间中断留下空表的话，
+    # 页面上所有股票的名字都会消失（且 backfill 一开头就调它）
     conn.execute("DELETE FROM security_master")
-    conn.commit()
     df.to_sql("security_master", conn, if_exists="append", index=False, chunksize=1000)
     conn.commit()
     return len(df)
