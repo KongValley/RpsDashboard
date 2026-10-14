@@ -143,6 +143,25 @@ CREATE TABLE IF NOT EXISTS pattern_daily (
 CREATE INDEX IF NOT EXISTS idx_pattern_date ON pattern_daily(date);
 CREATE INDEX IF NOT EXISTS idx_pattern_symbol ON pattern_daily(symbol, date);
 
+-- 复权因子异常事件（analytics/quality.py 检测）。**只报告，不改 RPS 口径**：
+-- 自动剔除会静默改变已公布的回测结论，必须由使用者判断。
+-- kind: negative_offset（变换含负偏移，历史价被整体下移）
+--       factor_jump（除权因子跳变，跨该日的区间收益含送转成分）
+--       hfq_jump（库内单日跳变超涨跌停上限，非上市初期/复牌日）
+--       no_limit_day（上市前 5 日或复牌日的正常无限制跳变）
+-- source: official（eltdx 官方复权因子）/ internal（daily_bar 离线扫描）
+CREATE TABLE IF NOT EXISTS adjust_event (
+  symbol     TEXT NOT NULL,
+  date       TEXT NOT NULL,
+  kind       TEXT NOT NULL,
+  ratio      REAL,
+  detail     TEXT,
+  source     TEXT NOT NULL,
+  updated_at TEXT,
+  PRIMARY KEY (symbol, date, kind, source)
+);
+CREATE INDEX IF NOT EXISTS idx_adjust_kind ON adjust_event(kind);
+
 -- ── 自选股池与条件预警（T6）──────────────────────────────────────
 -- 看板的写入面就这三张表（其余 handler 一律只读 SQLite）
 CREATE TABLE IF NOT EXISTS watchlist (

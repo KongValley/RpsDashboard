@@ -21,7 +21,9 @@
 
 from __future__ import annotations
 
+import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 
 import pandas as pd
@@ -94,3 +96,38 @@ def sync_price_limits(trade_date: str | None = None) -> int:
         return n
     finally:
         conn.close()
+
+
+def sync_price_limits_chunk(
+    dates: list[str], *, workers: int = 1
+) -> tuple[int, list[str], list[str]]:
+    """并发补齐一波交易日，返回 (写入行数, 失败日期, 返回 0 行的日期)。
+
+    每个 worker 调一次 `sync_price_limits(d)`：协议接口**每次调用都是冷启**
+    （实测单日 35 秒左右，服务端不缓存），网络是唯一的瓶颈，因此并发能近似线性地
+    缩短墙钟时间。写库仍由各调用自己的连接完成（`db.connect` 带 30 秒 busy timeout，
+    WAL 下并发写会退让重试）。
+
+    并发度交给调用方按波控制（一波 ≤ workers 天）：时间预算、进度与「还剩多少天」
+    都在调用方的波循环里判断，这里只负责跑完这一波。
+    """
+    total = 0
+    failed: list[str] = []
+    empty: list[str] = []
+    if not dates:
+        return 0, failed, empty
+    with ThreadPoolExecutor(max_workers=max(1, int(workers))) as pool:
+        futs = {pool.submit(sync_price_limits, d): d for d in dates}
+        for fut in as_completed(futs):
+            d = futs[fut]
+            try:
+                n = int(fut.result() or 0)
+            except Exception as exc:  # noqa: BLE001
+                n = 0
+                failed.append(d)
+                print(f"[limits] {d} 采集失败：{type(exc).__name__}: {exc}",
+                      file=sys.stderr)
+            total += n
+            if n == 0:
+                empty.append(d)
+    return total, failed, empty

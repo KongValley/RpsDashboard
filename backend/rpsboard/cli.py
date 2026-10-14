@@ -182,6 +182,16 @@ def cmd_compute_rps(args: argparse.Namespace) -> int:
                 f"mode={mode} 个股 {n_stock} 行 / 板块 {n_ind} 行",
             )
     print(f"[rps] 个股 {n_stock} 行，板块 {n_ind} 行（{mode}）")
+    # 复权异常会放大跨该日的区间收益：只提示，不自动剔除（那会静默改变结论）
+    with db.session() as conn:
+        if db.table_exists(conn, "adjust_event"):
+            n_bad = conn.execute(
+                "SELECT COUNT(*) AS n FROM adjust_event "
+                "WHERE kind IN ('hfq_jump', 'tiny_price', 'nonpositive_price')"
+            ).fetchone()["n"]
+            if n_bad:
+                print(f"[rps] ⚠ 库内已知复权异常 {n_bad} 处（跨该日的区间收益会被放大，"
+                      f"口径未改）：cli quality")
     # RPS 变了 → 回测的进程内矩阵/帧缓存必须失效（否则最长 300s 用旧值）
     from .analytics import backtest as bt_engine
     bt_engine.clear_context_cache()
@@ -283,44 +293,48 @@ def cmd_price_limits(args: argparse.Namespace) -> int:
         return 0 if fill else 1
 
     max_minutes = float(getattr(args, "max_minutes", 0.0) or 0.0)
+    workers = max(1, int(getattr(args, "workers", 1) or 1))
     with db.session() as conn:
         run_id = db.start_run(conn, task="price-limits", source=config.DATA_SOURCE)
     total = 0
     done_days = 0
     empty: list[str] = []
     failed: list[str] = []
+    skipped: list[str] = []
     t_all = time.monotonic()
-    for i, d in enumerate(dates, 1):
-        try:
-            n = limit_src.sync_price_limits(d)
-        except Exception as exc:  # noqa: BLE001
-            # 单天失败不能终止整轮：一次网络抖动就把剩下的日期全丢掉，
-            # 而且命令还会以「成功」退出。计入失败并继续。
-            failed.append(d)
-            print(f"[limits] {d} 采集失败：{type(exc).__name__}: {exc}", file=sys.stderr)
-            n = 0
-        total += n
-        done_days += 1
-        if n == 0:
-            # 服务器没数据或当天失败：本轮跳过（否则同一个空日期会反复重试，天荒地老）
-            empty.append(d)
+    # 按波推进：一波最多 workers 天，波与波之间检查时间预算。
+    # workers=1 时行为与串行完全一致（默认值，避免悄悄加大采集压力）。
+    for start in range(0, len(dates), workers):
         done = time.monotonic() - t_all
-        eta = done / i * (len(dates) - i)
-        print(f"[limits] {i}/{len(dates)} 累计 {total} 行"
-              f" | 已用 {done/60:.1f} 分钟 | 预计剩余 {eta/60:.1f} 分钟",
-              flush=True)
-        if max_minutes > 0 and done > max_minutes * 60:
-            print(f"[limits] 已用 {done/60:.1f} 分钟，补了 {i} 天，"
-                  f"还剩 {len(dates) - i} 天，可再跑一次续采")
+        # 第一波必须跑：否则预算很小/时钟刚起步时会出现「一天都不采就退出」
+        if start and max_minutes > 0 and done > max_minutes * 60:
+            skipped = dates[start:]
+            print(f"[limits] 已用 {done/60:.1f} 分钟，补了 {start} 天，"
+                  f"还剩 {len(skipped)} 天，可再跑一次续采")
             break
+        wave = dates[start:start + workers]
+        n, bad, zero = limit_src.sync_price_limits_chunk(wave, workers=len(wave))
+        total += n
+        failed += bad
+        empty += zero
+        done_days += len(wave)
+        i = start + len(wave)
+        elapsed = time.monotonic() - t_all
+        eta = elapsed / i * (len(dates) - i)
+        print(f"[limits] {i}/{len(dates)} 累计 {total} 行"
+              f" | 已用 {elapsed/60:.1f} 分钟 | 预计剩余 {eta/60:.1f} 分钟",
+              flush=True)
     ok_days = done_days - len(empty)
-    print(f"[limits] 成功 {ok_days} 天 / 空 {len(empty)} 天")
+    print(f"[limits] 成功 {ok_days} 天 / 空 {len(empty)} 天"
+          + (f" / 未处理 {len(skipped)} 天（时间预算）" if skipped else ""))
     if empty:
         print(f"[limits] 本轮 {len(empty)} 天返回 0 行（服务器无数据或失败）："
               f"{', '.join(empty[:10])}{' …' if len(empty) > 10 else ''}")
-    msg = f"补 {done_days} 天 / {total} 行（成功 {ok_days} 天）"
+    msg = f"补 {done_days} 天 / {total} 行（成功 {ok_days} 天，并发 {workers}）"
     if failed:
         msg += f"；失败 {len(failed)} 天：{', '.join(failed[:5])}"
+    if skipped:
+        msg += f"；时间预算到点，未处理 {len(skipped)} 天"
     with db.session() as conn:
         db.finish_run(conn, run_id, "success" if total else "failed", total, msg)
     if fill:
@@ -336,6 +350,84 @@ def cmd_price_limits(args: argparse.Namespace) -> int:
         print("[limits] 本轮没有采到任何涨跌停数据", file=sys.stderr)
         return 2
     return 0
+
+
+# ── quality（复权因子异常检测）──────────────────────────────────────
+def cmd_quality(args: argparse.Namespace) -> int:
+    """复权因子异常检测：官方因子 + 库内单日跳变。
+
+    **只报告不改口径**：自动剔除跨异常的区间收益会静默改变已公布的回测结论，
+    必须先由使用者判断（见 analytics/quality.py 的模块说明）。
+    """
+    from .analytics import quality
+
+    db.init_db()
+    offline = bool(getattr(args, "offline", False))
+    dry = bool(getattr(args, "dry_run", False))
+    threshold = float(getattr(args, "threshold", 0.0) or quality.HFQ_JUMP_THRESHOLD)
+    n_int = n_off = 0
+    with db.session() as conn:
+        run_id = db.start_run(
+            conn, task="quality", source="internal" if offline else config.DATA_SOURCE)
+    try:
+        # ① 离线：库内单日跳变 + 价格水平异常（覆盖全历史，不联网）
+        with db.session() as conn:
+            jumps = quality.scan_hfq_jumps(conn, threshold)
+            levels = quality.scan_price_levels(conn)
+            internal = pd.concat([jumps, levels], ignore_index=True)
+            n_int = quality.materialize(conn, internal, "internal") if not dry else len(internal)
+            focus = set(quality.tiny_price_symbols(conn))
+        suspects = jumps[jumps["kind"] == "hfq_jump"]
+        no_limit = int((jumps["kind"] == "no_limit_day").sum())
+        tiny = levels[levels["kind"] == "tiny_price"]
+        nonpos = levels[levels["kind"] == "nonpositive_price"]
+        print(f"[quality] 库内单日跳变：可疑 {len(suspects)} 处"
+              f"（另有 {no_limit} 处无涨跌幅限制日，正常）")
+        if not suspects.empty:
+            for _, r in suspects.sort_values("ratio", key=abs, ascending=False).head(10).iterrows():
+                print(f"    {r['symbol']} {r['date']} {float(r['ratio']) * 100:+.1f}%  {r['detail']}")
+        print(f"[quality] 价格水平：极小价(<{quality.TINY_PRICE} 元) {len(tiny)} 行 / "
+              f"非正价 {len(nonpos)} 行（RPS 已置空），涉及 {len(focus)} 只")
+        if focus:
+            print(f"    {', '.join(sorted(focus)[:12])}{' …' if len(focus) > 12 else ''}")
+
+        # ② 联网：官方复权因子（权威源，解释上面这些价格为什么被压低）
+        if not offline:
+            with db.session() as conn:
+                symbols = [r["symbol"] for r in conn.execute(
+                    "SELECT symbol FROM daily_bar GROUP BY symbol ORDER BY symbol")]
+                since = conn.execute(
+                    "SELECT MIN(date) AS d FROM daily_bar").fetchone()["d"]
+            print(f"[quality] 拉取官方复权因子：{len(symbols)} 只"
+                  f"（{quality.FACTOR_BATCH} 只/批；负偏移只对库内价格被压低的股票记录）")
+            factors = quality.fetch_factor_events(
+                symbols, since=since, focus_symbols=focus,
+                progress=lambda m: print(f"[quality] {m}", flush=True))
+            if not dry:
+                with db.session() as conn:
+                    n_off = quality.materialize(conn, factors, "official")
+            else:
+                n_off = len(factors)
+            neg = factors[factors["kind"] == "negative_offset"]
+            jmps = factors[factors["kind"] == "factor_jump"]
+            print(f"[quality] 官方因子：负偏移档位 {len(neg)} 处（{neg['symbol'].nunique()} 只）/ "
+                  f"因子跳变 {len(jmps)} 处（阈值 {quality.FACTOR_JUMP_THRESHOLD * 100:.0f}%）")
+            for _, r in neg.head(10).iterrows():
+                print(f"    {r['symbol']} {r['date']} hfq_offset={float(r['ratio']):.4f} {r['detail']}")
+
+        if dry:
+            print("[quality] --dry-run：未写库")
+        else:
+            print(f"[quality] 已写入 adjust_event：internal {n_int} 行 / official {n_off} 行")
+        with db.session() as conn:
+            db.finish_run(conn, run_id, "success", n_int + n_off,
+                          f"internal {n_int} / official {n_off}")
+        return 0
+    except Exception as exc:  # noqa: BLE001
+        with db.session() as conn:
+            db.finish_run(conn, run_id, "failed", 0, f"{type(exc).__name__}: {exc}")
+        print(f"[quality] 失败: {exc}", file=sys.stderr)
+        return 2
 
 
 # ── industry-map（行业分类）─────────────────────────────────────────
@@ -702,6 +794,23 @@ def cmd_status(_: argparse.Namespace) -> int:
             print(f"涨跌停覆盖  {lim_rows['lo']} ~ {lim_rows['hi']}")
         else:
             print("涨跌停覆盖  无（回测不会剔除涨停，可 cli price-limits --days N 回补）")
+        # 复权异常：跨异常日的区间收益会被放大，必须能看见（只提示，不改口径）
+        if not db.table_exists(conn, "adjust_event"):
+            print("复权异常    未检测（跑一次 cli quality）")
+        else:
+            c = {r["kind"]: r["n"] for r in conn.execute(
+                "SELECT kind, COUNT(*) AS n FROM adjust_event "
+                "WHERE source = 'internal' GROUP BY kind")}
+            o = {r["kind"]: r["n"] for r in conn.execute(
+                "SELECT kind, COUNT(*) AS n FROM adjust_event "
+                "WHERE source = 'official' GROUP BY kind")}
+            if sum(c.values()) or sum(o.values()):
+                print(f"复权异常    可疑跳变 {c.get('hfq_jump', 0)} 处 / "
+                      f"极小价 {c.get('tiny_price', 0)} 行 / 非正价 {c.get('nonpositive_price', 0)} 行 / "
+                      f"负偏移 {o.get('negative_offset', 0)} 只 / 因子跳变 {o.get('factor_jump', 0)} 处"
+                      f" → cli quality")
+            else:
+                print("复权异常    无")
     finally:
         conn.close()
     return 0
@@ -841,6 +950,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--dry-run", action="store_true", help="只打印会改多少行，不写库")
     sp.set_defaults(func=cmd_tradestatus)
 
+    sp = sub.add_parser("quality", help="复权因子异常检测（官方因子 + 库内单日跳变）")
+    sp.add_argument("--offline", action="store_true",
+                    help="只做离线扫描，不联网拉官方复权因子")
+    sp.add_argument("--dry-run", action="store_true", help="只打印，不写 adjust_event")
+    sp.add_argument("--threshold", type=float, default=0.0,
+                    help="库内单日跳变阈值（小数，默认 0.31 = 超过北交所 30%% 上限）")
+    sp.set_defaults(func=cmd_quality)
+
     sp = sub.add_parser("price-limits", help="采集涨跌停价")
     sp.add_argument("--days", type=int, default=0,
                     help="回补最近 N 个交易日（每次调用约 34 秒且服务端不缓存，"
@@ -850,6 +967,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--max-days", type=int, default=0, help="本轮最多补几天（0 = 不限）")
     sp.add_argument("--max-minutes", type=float, default=0.0,
                     help="本轮时间预算（分钟，0 = 不限）；到点后打印剩余天数并退出")
+    sp.add_argument("--workers", type=int, default=1,
+                    help="并发天数（默认 1 = 串行；接口单次 30~240 秒且服务端不缓存，"
+                         "补全历史建议 6 左右）")
     sp.set_defaults(func=cmd_price_limits)
 
     sp = sub.add_parser("concept", help="采集概念板块并计算概念 RPS")

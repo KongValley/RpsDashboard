@@ -316,17 +316,42 @@ def run_backtest(
     # 不在同一基准，直接比会算出 4303 家假涨停）。
     lim_up = lim_dn = None
     if use_price_limits:
-        from .limits import coverage, limit_mask, load_ratio_frames
+        from .limits import (
+            MODEL_VALIDATION_DAYS,
+            MODEL_VALIDATION_ROWS,
+            coverage,
+            derive_ratio_frames,
+            limit_mask,
+            load_ratio_frames,
+            merge_ratio_frames,
+        )
 
         dates = [d.strftime("%Y-%m-%d") for d in close_wide.index]
-        ratios, statuses = load_ratio_frames(conn, dates, list(close_wide.columns))
-        if not ratios.empty:
-            covered, total = coverage(conn, dates)
+        cols = list(close_wide.columns)
+        measured = load_ratio_frames(conn, dates, cols)
+        covered, total = coverage(conn, dates)
+        if covered:
+            ratios, statuses = measured
             if covered < total:
-                result.warnings.append(
-                    f"涨跌停数据仅覆盖 {covered}/{total} 个交易日，"
-                    f"未覆盖的日子不筛涨停（覆盖不足只影响过滤精度，不影响价格与 RPS）"
+                # 未覆盖的日子改用**板块规则推算**（有实测校验），而不是整段不筛涨停：
+                # 「这些天不筛涨停」会让回测静默地少一层过滤，用户无从知道。
+                ratios, statuses = merge_ratio_frames(
+                    measured, derive_ratio_frames(conn, dates, cols)
                 )
+                result.warnings.append(
+                    f"涨跌停：实测覆盖 {covered}/{total} 个交易日，其余 {total - covered} 天"
+                    f"按板块规则推算（与已采集的 {MODEL_VALIDATION_DAYS} 个交易日 / "
+                    f"{MODEL_VALIDATION_ROWS:,} 行逐行一致率 100%；新股前 5 日按"
+                    f"「无涨跌幅限制」处理）。用 `cli price-limits --fill --workers 6` 可继续补实测"
+                )
+        else:
+            # 一行实测都没有：整段用规则推算，并明确说出来（可校验性差一档）
+            ratios, statuses = derive_ratio_frames(conn, dates, cols)
+            result.warnings.append(
+                "price_limit_daily 为空：涨跌停按板块规则推算（无实测数据可校验），"
+                "请执行 cli price-limits 采集实测值"
+            )
+        if not ratios.empty:
             lim_up, lim_dn = limit_mask(close_wide, ratios, statuses)
             if exclude_limit_up:
                 mask &= ~lim_up.reindex(index=mask.index, columns=mask.columns) \
@@ -336,8 +361,7 @@ def run_backtest(
                 )
         else:
             result.warnings.append(
-                "price_limit_daily 为空，未应用「剔除涨停」过滤"
-                "（请先执行 cli price-limits）"
+                "涨跌停比例为空（推算也失败），未应用「剔除涨停」过滤"
             )
 
     if tradable is not None and not tradable.empty:

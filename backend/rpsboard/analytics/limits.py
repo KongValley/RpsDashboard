@@ -32,6 +32,103 @@ TOLERANCE_PCT = 0.2
 #: 这些状态表示「当日没有涨跌停约束」，**不能**当成涨停或跌停
 NO_LIMIT_STATUSES = ("no_price_limit", "missing_pre_close")
 
+#: 按板块规则推算涨跌停比例时的北交所代码段（含 920 新段）
+BSE_PREFIXES = ("43", "83", "87", "88", "92")
+
+#: 新股上市后**前若干个交易日**没有涨跌幅限制（创业板/科创板为前 5 日，主板也是 5 日）
+IPO_NO_LIMIT_DAYS = 5
+
+#: 规则推算与实测的逐行一致率（2026-10-14 用已采集的 135 个交易日校验）
+MODEL_VALIDATION_DAYS = 135
+MODEL_VALIDATION_ROWS = 743959
+
+
+def board_ratio(symbol: str) -> float:
+    """按板块规则给出涨跌停比例（百分数）。
+
+    实测校验（135 个交易日、743,959 行 `price_limit_daily`，非新股前 5 日）：
+    **逐行完全一致**（0 处不一致）。要点：
+    - 主板（含 ST/*ST，2024 新规后 ST 也是 10%）→ 10%
+    - 创业板 300/301/302、科创板 688 → 20%
+    - 科创板 689（CDR）→ 10%（实测 135 行全部是 10%，不要与 688 合并）
+    - 北交所 43/83/87/88/92 → 30%
+    """
+    if symbol.startswith("688"):
+        return 20.0
+    if symbol.startswith("689"):
+        return 10.0
+    if symbol.startswith(("300", "301", "302")):
+        return 20.0
+    if symbol[:2] in BSE_PREFIXES:
+        return 30.0
+    return 10.0
+
+
+def first_bar_dates(conn: sqlite3.Connection, symbols: list[str]) -> dict[str, list[str]]:
+    """每个 symbol 最早的 IPO_NO_LIMIT_DAYS 个交易日 → {symbol: [date, ...]}。
+
+    逐只走 (symbol, date) 主键索引 LIMIT 5：本机 5580 只实测不到 1 秒，
+    比对全表跑 ROW_NUMBER() 窗口函数（4.3M 行、数秒）划算。
+    """
+    out: dict[str, list[str]] = {}
+    for sym in symbols:
+        rows = conn.execute(
+            "SELECT date FROM daily_bar WHERE symbol = ? ORDER BY date LIMIT ?",
+            (sym, IPO_NO_LIMIT_DAYS),
+        ).fetchall()
+        if rows:
+            out[sym] = [r["date"] for r in rows]
+    return out
+
+
+def derive_ratio_frames(
+    conn: sqlite3.Connection, dates: list[str], columns: list[str]
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """按板块规则推算 date × symbol 的 (limit_ratio, status) 宽表。
+
+    用途：`price_limit_daily` 的实测覆盖不全（接口单日 30~240 秒、服务端不缓存，
+    全历史要几小时），未覆盖的日期以前是「整段不筛涨停」——回测照跑、结论照给，
+    用户无从知道过滤没生效。规则推算可以把这些日子补上，**并且有实测校验兜底**：
+    见 board_ratio 的 docstring。
+
+    比「编造数据」更保守的地方：新股前 5 日判为 `no_price_limit`（实测 508 行 100%
+    命中），因此不会被算成涨停；推算出的比例只用于「收益率是否触达限制」的判断。
+    """
+    if not dates or not columns:
+        empty = pd.DataFrame(index=pd.to_datetime(dates), columns=columns, dtype="float64")
+        return empty, empty.copy()
+
+    idx = pd.to_datetime(dates)
+    ratios = pd.DataFrame(
+        {sym: board_ratio(sym) for sym in columns},
+        index=idx, columns=columns, dtype="float64",
+    )
+    status = pd.DataFrame("normal", index=idx, columns=columns, dtype="object")
+    # 新股前 5 个交易日：无涨跌幅限制（与实测 status='no_price_limit' 同义）
+    for sym, first in first_bar_dates(conn, list(columns)).items():
+        cols = [d for d in first if d in set(dates)]
+        if cols:
+            status.loc[cols, sym] = "no_price_limit"
+    return ratios, status
+
+
+def merge_ratio_frames(
+    measured: tuple[pd.DataFrame, pd.DataFrame],
+    derived: tuple[pd.DataFrame, pd.DataFrame],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """实测优先、缺失处回落推算值（按位置对齐）。"""
+    m_ratio, m_status = measured
+    d_ratio, d_status = derived
+    if m_ratio.empty:
+        return d_ratio, d_status
+    if d_ratio.empty:
+        return m_ratio, m_status
+    d_ratio = d_ratio.reindex(index=m_ratio.index, columns=m_ratio.columns)
+    d_status = d_status.reindex_like(d_ratio)
+    ratio = m_ratio.where(m_ratio.notna(), d_ratio)
+    status = m_status.where(m_ratio.notna(), d_status)
+    return ratio, status
+
 
 def limit_mask(
     close_wide: pd.DataFrame,
