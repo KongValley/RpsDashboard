@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import csv
+import io
 import sqlite3
+import threading
+import time
 
 import pandas as pd
 import pytest
@@ -345,3 +349,225 @@ def test_ranking_export_full_result(seeded):
     total = client.get("/api/rps/ranking", params={"limit": 500}).json()["total"]
     # 表头 1 行 + 数据行；导出的是全量，行数应等于 total
     assert len(lines) - 1 == total, f"导出 {len(lines)-1} 行，应为全量 {total} 行"
+
+
+# ── 排序分页选行（2026-10-14 修复）───────────────────────────────────
+@pytest.mark.parametrize("sort,fkey,desc", [
+    ("amount", "amount", True),
+    ("close", "close", False),
+    ("pct_chg", "pct_chg", False),
+])
+def test_ranking_join_sort_picks_global_top(seeded, sort, fkey, desc):
+    """JOIN 列排序时选中的必须是**全市场**前 N 名（页面与 CSV 不再互相矛盾）。
+
+    旧实现让内层子查询固定带 `LIMIT ? OFFSET ?`：sort=amount 时内层按索引
+    扫描顺序切片，实测选中集合 MAX(rps15)=3.75（全市场倒数 3.75%），
+    而 CSV 导出走的是另一条路径 —— 同一筛选条件下两边结果对不上。
+    """
+    client, *_ = seeded
+    conn = dbmod.connect()
+    try:
+        last = conn.execute("SELECT MAX(date) AS d FROM rps_daily").fetchone()["d"]
+        ref = pd.read_sql_query(
+            f"SELECT b.symbol FROM daily_bar b "
+            f"JOIN rps_daily r ON r.symbol = b.symbol AND r.date = b.date "
+            f"WHERE b.date = ? AND r.rps60 IS NOT NULL AND b.{fkey} IS NOT NULL "
+            f"ORDER BY b.{fkey} {'DESC' if desc else 'ASC'}, b.symbol ASC LIMIT 15",
+            conn, params=(last,),
+        )
+    finally:
+        conn.close()
+    rows = client.get("/api/rps/ranking",
+                      params={"sort": sort, "limit": 15}).json()["rows"]
+    assert [x["symbol"] for x in rows] == ref["symbol"].tolist()
+
+
+def test_ranking_join_sort_matches_export(seeded):
+    """同一筛选条件下，页面第 1 页与 CSV 导出必须一致（修前两者矛盾）。"""
+    client, *_ = seeded
+    params = {"sort": "amount", "limit": 10, "period": 60}
+    page = client.get("/api/rps/ranking", params=params).json()["rows"]
+    text = client.get("/api/rps/ranking/export",
+                      params={"sort": "amount", "period": 60}).content.decode("utf-8-sig")
+    exported = [r[0] for r in list(csv.reader(io.StringIO(text)))[1:]]
+    assert [f'="{x["symbol"]}"' for x in page] == exported[:10]
+
+
+# ── 分位 / NULL / 空库 ──────────────────────────────────────────────
+def test_stock_market_percentile_top_is_100(seeded):
+    """全市场第一名「跑赢全市场」必须是 100%，不是 0%。"""
+    client, *_ = seeded
+    conn = dbmod.connect()
+    try:
+        row = conn.execute(
+            "SELECT symbol FROM rps_daily "
+            "WHERE date = (SELECT MAX(date) FROM rps_daily) "
+            "ORDER BY rps60 DESC LIMIT 1"
+        ).fetchone()
+    finally:
+        conn.close()
+    body = client.get(f"/api/stock/{row['symbol']}").json()
+    assert body["market_percentile"]["rps60"] == pytest.approx(100.0)
+
+
+def test_stock_null_period_returns_200(seeded):
+    """某周期为 NULL（新股/缺口）时必须 200 且该字段 null。
+
+    实测 157 行周期值是 NULL（688796 的 rps250），NaN 交给 Starlette 的
+    allow_nan=False 会直接 500。
+    """
+    client, df, _ = seeded
+    sym = df["symbol"].iloc[0]
+    conn = dbmod.connect()
+    try:
+        conn.execute("UPDATE rps_daily SET rps250 = NULL WHERE symbol = ?", (sym,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    r = client.get(f"/api/stock/{sym}")
+    assert r.status_code == 200
+    assert r.json()["current"]["rps250"] is None
+
+    c = client.get(f"/api/stock/{sym}/curve", params={"days": 60})
+    assert c.status_code == 200
+    assert all(v is None for v in c.json()["rps250"])
+
+
+def test_ranking_reports_empty_when_rps_missing(seeded):
+    """有日K但没算 RPS 时必须明说「数据库为空」，不能静默返回空表。"""
+    client, *_ = seeded
+    conn = dbmod.connect()
+    try:
+        conn.execute("DELETE FROM rps_daily")
+        conn.commit()
+    finally:
+        conn.close()
+    body = client.get("/api/rps/ranking").json()
+    assert body["data_date"] is None
+    assert body["rows"] == [] and body["total"] == 0
+    assert "compute-rps" in body.get("message", "")
+
+
+def test_sanxingdi_active_ignores_future_bars(seeded):
+    """截至查询日未跌破 base_low 的形态，不能因为之后的下跌被标成失效。
+
+    实测 2026-06-24~30 窗口 364 条命中里 196 条（54%）因为「有效性」用到了
+    查询日之后的 K 线而被标成失效。
+    """
+    client, df, _ = seeded
+    sym = df["symbol"].iloc[0]
+    conn = dbmod.connect()
+    try:
+        dates = [r["date"] for r in conn.execute(
+            "SELECT DISTINCT date FROM daily_bar WHERE symbol = ? ORDER BY date",
+            (sym,))]
+        d = dates[-6]        # 查询日（历史）
+        base = dates[-8]     # 形态确认日，落在「截至 d 的 5 个交易日」内
+        conn.execute(
+            "UPDATE daily_bar SET low = CASE WHEN date <= ? THEN 99.0 "
+            "  WHEN date <= ? THEN 50.0 ELSE 1.0 END WHERE symbol = ?",
+            (base, d, sym))
+        conn.execute(
+            "INSERT INTO pattern_daily(date, symbol, base_date, base_low, base_high, "
+            "strength, body_ratio) VALUES (?,?,?,50.0,60.0,0.2,0.1)",
+            (base, sym, base))
+        conn.commit()
+    finally:
+        conn.close()
+
+    rows = client.get("/api/rps/ranking", params={
+        "date": d, "sanxingdi": 5, "rps_min": 0, "limit": 500}).json()["rows"]
+    hit = [x for x in rows if x["symbol"] == sym]
+    assert hit, f"形态窗口内应筛出 {sym}"
+    assert hit[0]["sanxingdi_date"] == base
+    assert hit[0]["sanxingdi_active"] is True, "不得用查询日之后的 K 线判失效"
+
+
+# ── CSV 导出 ────────────────────────────────────────────────────────
+def test_export_csv_parses_and_guards_formulas(seeded):
+    """导出必须是可解析的 CSV、行数与 total 一致，且防公式注入。"""
+    client, df, _ = seeded
+    conn = dbmod.connect()
+    try:
+        conn.execute("UPDATE security_master SET name = '=1+1' WHERE symbol = ?",
+                     (df["symbol"].iloc[0],))
+        conn.commit()
+    finally:
+        conn.close()
+
+    total = client.get("/api/rps/ranking", params={"period": 60}).json()["total"]
+    r = client.get("/api/rps/ranking/export", params={"period": 60})
+    assert r.status_code == 200
+    rows = list(csv.reader(io.StringIO(r.content.decode("utf-8-sig"))))
+    assert rows[0] == ["代码", "名称", "行业", "RPS", "区间涨幅%", "当日涨跌%",
+                       "成交额", "全市场名次"]
+    assert len(rows) == total + 1
+    # 代码列包公式：Excel 打开时前导零不会丢
+    assert all(c.startswith('="') and c.endswith('"') for c in
+               (row[0] for row in rows[1:]))
+    assert any(row[1] == "'=1+1" for row in rows[1:]), "= 开头的名称必须加前缀"
+
+
+# ── 更新线程的收尾与互斥（修：start_run 在线程里 + 不收尾）────────────
+def test_admin_update_is_mutually_exclusive_and_closes_log(seeded, monkeypatch):
+    """后台更新：第二次 POST 必须被拒；线程结束后 collect_log 必须收尾。
+
+    修前两个问题叠在一起：锁只在启动瞬间持有、启动前也不看 running，
+    第二次 POST 会起**第二个**采集线程；线程里 start_run 的记录永远不写
+    finished_at，页面「最近更新」于是恒显示「进行中」。
+    """
+    client, *_ = seeded
+    from rpsboard.api import backtest as bt_api
+
+    release = threading.Event()
+
+    def fake_pipeline(progress=None, workers=None):
+        if progress:
+            progress("bars")
+        release.wait(timeout=5)
+        return {"ok": True, "price_limit_rows": 7, "alert_hits": 2}
+
+    monkeypatch.setattr(bt_api, "cli_run_update_pipeline", fake_pipeline)
+
+    first = client.post("/api/admin/update", json={"task": "update"}).json()
+    assert first["ok"] is True and first["run_id"], "响应必须带真实 run_id"
+    second = client.post("/api/admin/update", json={"task": "update"}).json()
+    assert second["ok"] is False and "已有更新任务" in second["error"]
+
+    release.set()
+    for _ in range(250):          # 有界等待，不用固定 sleep
+        if not bt_api._update_state["running"]:
+            break
+        time.sleep(0.02)
+    assert bt_api._update_state["running"] is False
+
+    conn = dbmod.connect()
+    try:
+        row = conn.execute(
+            "SELECT status, rows_affected FROM collect_log WHERE run_id = ?",
+            (first["run_id"],)).fetchone()
+    finally:
+        conn.close()
+    assert row is not None, "请求线程里就该写号 collect_log"
+    assert row["status"] == "success" and row["rows_affected"] == 7
+
+
+def test_cache_token_tracks_non_rps_updates(seeded):
+    """回测缓存指纹必须覆盖 rps 之外的更新（只补涨跌停也能让缓存失效）。
+
+    只用 rps_daily.MAX(date) 会漏掉「同日补采涨跌停 / 补基准 / 形态重算」，
+    同参数请求会继续返回旧结论。
+    """
+    from rpsboard.api.backtest import _cache_token
+
+    conn = dbmod.connect()
+    try:
+        before = _cache_token(conn)
+        conn.execute("INSERT INTO price_limit_daily(date, symbol, limit_ratio) "
+                     "VALUES ('2099-01-01','000001',10.0)")
+        conn.commit()
+        after = _cache_token(conn)
+    finally:
+        conn.close()
+    assert before and after and before != after

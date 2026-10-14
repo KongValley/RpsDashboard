@@ -38,8 +38,20 @@ def latest_bar_date(conn: sqlite3.Connection) -> str | None:
     return row["d"] if row and row["d"] else None
 
 
+def _latest_rps_date(conn: sqlite3.Connection) -> str | None:
+    """rps_daily 的最新日期；表不存在或没有行时返回 None。
+
+    用 table_has_rows 而不是 COUNT(*)：4 百万行的表上 COUNT 要 235ms，
+    而这个函数每个请求都会走到一次。
+    """
+    if not db.table_has_rows(conn, "rps_daily"):
+        return None
+    row = conn.execute("SELECT MAX(date) AS d FROM rps_daily").fetchone()
+    return row["d"] if row and row["d"] else None
+
+
 def resolve_date(conn: sqlite3.Connection, raw: str | None) -> str | None:
-    """把请求里的日期解析为一个**实际有数据的交易日**。
+    """把请求里的日期解析为一个**实际有 RPS 数据的交易日**。
 
     看板不能因为「周末请求」就报 400——回退到最近的有数据日期。
     前端接上日期下拉之后，这里必须校验传入日期是否真的存在：
@@ -49,8 +61,13 @@ def resolve_date(conn: sqlite3.Connection, raw: str | None) -> str | None:
     回退策略是**就近**：优先取不晚于该日的最近交易日（周末/长假向后落回），
     一个都没有才取更早的下一个交易日。直接退回「最新交易日」是错的——
     用户选 2024-05-05 会被无声地换成 2026-10-12，看到的完全是另一天的数据。
+
+    兜底日期取自 rps_daily，**不是** daily_bar：只拉了日K、还没算 RPS 时，
+    用 K 线日期兜底会让排行榜安静地返回空表，看起来像「今天没有强势股」。
+    返回 None 时调用方会给出「数据库为空，请先执行 cli init + backfill +
+    compute-rps」的明确提示。
     """
-    fallback = latest_bar_date(conn)
+    fallback = _latest_rps_date(conn)
     if not raw:
         return fallback
     raw = str(raw).strip()

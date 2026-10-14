@@ -240,3 +240,76 @@ def test_cli_alert_rm_removes_hits(tmp_path, monkeypatch):
     with dbmod.session() as conn:
         assert conn.execute("SELECT COUNT(*) FROM alert_rule").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM alert_hit").fetchone()[0] == 0
+
+
+def test_alert_rule_params_validated_by_kind(client):
+    """params 按 kind 校验并归一化：非法 422，合法值落库前被规范化。
+
+    非法的 params 以前会**原样存进 alert_rule**，直到 cli alert run 才出问题：
+    `{"min": null}` 让 float(None) 抛 TypeError，period 不在周期真源里会静默
+    筛错列，`window: 7` 会被引擎悄悄换回 5。
+    """
+    c, _ = client
+    bad = [
+        {"name": "空min", "kind": "rps_threshold",
+         "params": {"period": 60, "min": None}},
+        {"name": "错period", "kind": "rps_threshold", "params": {"period": 30}},
+        {"name": "区间倒序", "kind": "rps_threshold",
+         "params": {"min": 90, "max": 10}},
+        {"name": "非数字", "kind": "rps_threshold", "params": {"min": "abc"}},
+        {"name": "超范围", "kind": "rps_threshold", "params": {"max": 101}},
+        {"name": "错窗口", "kind": "sanxingdi", "params": {"window": 7}},
+    ]
+    for body in bad:
+        assert c.post("/api/alerts/rules", json=body).status_code == 422, body
+
+    ok = c.post("/api/alerts/rules", json={
+        "name": "涨停", "kind": "limit_up", "params": {"period": 60}}).json()
+    assert ok["ok"] is True
+    rules = {r["id"]: r for r in c.get("/api/alerts/rules").json()}
+    assert rules[ok["id"]]["params"] == {}, "limit_up 必须丢掉多余参数"
+
+    norm = c.post("/api/alerts/rules", json={
+        "name": "默认区间", "kind": "rps_threshold",
+        "params": {"period": "60"}}).json()
+    assert norm["ok"] is True
+    rules = {r["id"]: r for r in c.get("/api/alerts/rules").json()}
+    assert rules[norm["id"]]["params"] == {"period": 60, "min": 0.0, "max": 100.0}
+
+
+def test_run_rules_survives_bad_row_and_keeps_other_hits(client):
+    """库里已有坏规则行时，run_rules 不崩、后续规则照常命中并落库。
+
+    坏行直接写进库（跳过接口校验），模拟历史遗留数据：
+    - id=1 `params` 是 JSON 数组 → 跳过
+    - id=2 `min` 是 null → 容错为 0（旧实现 float(None) 抛 TypeError，
+      一条规则抛错还会把前面已写入的命中一起回滚）
+    - id=3 合法规则 → 命中必须在同一轮里持久化
+    """
+    c, path = client
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    conn.executemany(
+        "INSERT INTO alert_rule(name, kind, params, enabled, created_at) "
+        "VALUES (?,?,?,1,?)",
+        [
+            ("坏格式", "rps_threshold", "[1, 2]", "2026-01-01"),
+            ("空min", "rps_threshold", json.dumps({"period": 60, "min": None}),
+             "2026-01-01"),
+            ("RPS90", "rps_threshold",
+             json.dumps({"period": 60, "min": 90, "max": 100}), "2026-01-01"),
+        ],
+    )
+    conn.commit()
+    hits = alerts_engine.run_rules(conn)
+    stored = conn.execute(
+        "SELECT rule_id, symbol FROM alert_hit ORDER BY rule_id"
+    ).fetchall()
+    conn.close()
+    assert [h["symbol"] for h in hits if h["rule_id"] == 3] == ["000001"]
+    by_rule = {(r["rule_id"], r["symbol"]) for r in stored}
+    assert (3, "000001") in by_rule, \
+        "合法规则的命中必须在同一轮里落库（不被前面坏行回滚）"
+    assert all(rid != 1 for rid, _ in by_rule), "params 不是对象的规则必须被跳过"
+    assert (2, "000001") in by_rule and (2, "000002") in by_rule, \
+        "min=null 必须容错成 0~100（旧实现 float(None) 会抛 TypeError）"

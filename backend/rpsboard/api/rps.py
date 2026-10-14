@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import csv
+import io
+
 import pandas as pd
 from fastapi import APIRouter, Query
 from fastapi.responses import StreamingResponse
@@ -79,9 +82,11 @@ def sanxingdi_filter_sql(
     start = pat.window_start(conn, d, window)
     if not start:
         return "", []
+    # 上界必须写上：查询历史日期（date=2026-06-30）时，晚于它的形态
+    # 会让「当天筛出来的股票」带上未来 K 线才成立的信息。
     frag = (f" AND {alias}.symbol IN ("
-            f"SELECT symbol FROM pattern_daily WHERE date >= ?)")
-    return frag, [start]
+            f"SELECT symbol FROM pattern_daily WHERE date >= ? AND date <= ?)")
+    return frag, [start, d]
 
 
 def pattern_state(
@@ -107,9 +112,11 @@ def pattern_state(
         f"       p.strength, p.body_ratio, MIN(b.low) AS min_low_after "
         f"FROM pattern_daily p "
         f"LEFT JOIN daily_bar b ON b.symbol = p.symbol AND b.date > p.date "
+        f"     AND b.date <= ? "
         f"WHERE p.symbol IN ({ph}) AND p.date >= ? AND p.date <= ? "
         f"GROUP BY p.symbol, p.date",
-        tuple(symbols) + (start, date),
+        # 占位符顺序 = SQL 文本顺序：JOIN 条件在前，然后才是 IN 列表与窗口
+        (date,) + tuple(symbols) + (start, date),
     )
     if rows.empty:
         return out
@@ -197,10 +204,12 @@ def _ranking_fast(
         where.append(frag[5:])            # 去掉前导的 " AND "
         params += frag_params
 
-    # 排序：能在 rps_daily 单表上排的（rps / ret）放内层，让 LIMIT 先取 Top-N；
-    # 其余列必须 JOIN 之后才能拿到，只能排在外层。
+    # 排序：能在 rps_daily 单表上排的（rps / ret）放内层，让 LIMIT 走覆盖索引的
+    # 有序区间取 Top-N；其余列（成交额/收盘价/涨跌幅）必须 JOIN 之后才拿得到，
+    # 排序与**分页**都只能在外层做。
     inner_order = ""
     outer_sort_col = sort if sort in _SORTS else _SORTS["rps"]
+    outer_null_guard = ""
     if sort in ("rps", "ret"):
         direction = "DESC"
         col = f"r.{rps_col}" if sort == "rps" else f"r.{ret_col}"
@@ -209,26 +218,29 @@ def _ranking_fast(
         # 没有确定性次序时第 1 页和第 2 页会互相重复（实测翻到过重叠行）。
         inner_order = f" ORDER BY {col} {direction}, r.symbol ASC"
         outer_sort_col = alias
-        outer_null_guard = ""
+        paged_in_inner = True
     else:
         direction = "ASC" if sort in _ASC_SORTS else "DESC"
         outer_null_guard = (
             f"{outer_sort_col} IS NULL, " if outer_sort_col in _NULLABLE_SORTS else ""
         )
+        paged_in_inner = False
 
-    inner = (
+    inner_base = (
         "SELECT r.symbol, "
         f"r.{rps_col} AS rps, r.{ret_col} AS period_return "
         f"FROM rps_daily r WHERE {' AND '.join(where)}"
-        f"{inner_order} LIMIT ? OFFSET ?"
     )
+    inner = inner_base + (f"{inner_order} LIMIT ? OFFSET ?" if paged_in_inner else "")
+    # 分页参数只出现在真正分页的那一层。rps/ret 排序时内层已经取过 Top-N，
+    # 外层再夹一次只是防御性重复；其余排序**只能**在外层 LIMIT ——
+    # 早期实现让内层固定带 LIMIT，于是取到的是「索引扫描顺序那一批」，
+    # 实测 sort=amount&limit=200 的集合 MAX(rps15)=3.75（全市场倒数 3.75%），
+    # 页面与 CSV 导出互相矛盾。
+    slice_params = (limit, (page - 1) * limit)
 
     total_row = read_sql(
-        conn,
-        "SELECT COUNT(*) AS c FROM ("
-        + inner.replace(" LIMIT ? OFFSET ?", "")
-        + ") t",
-        tuple(params),
+        conn, "SELECT COUNT(*) AS c FROM (" + inner_base + ") t", tuple(params)
     )
     total_n = int(total_row["c"].iloc[0]) if not total_row.empty else 0
 
@@ -241,23 +253,25 @@ def _ranking_fast(
         "LEFT JOIN industry_map i ON i.symbol = t.symbol "
         "LEFT JOIN daily_bar b ON b.symbol = t.symbol AND b.date = ?"
     )
-    params_out = tuple(params) + (limit, (page - 1) * limit)
+    inner_slice = slice_params if paged_in_inner else ()
+    outer_slice = () if paged_in_inner else slice_params
     # 外层必须重复同样的 ORDER BY：SQL 不保证「子查询的排序」在
     # 外层 JOIN 之后被保留，不写就会随机换序、分页出现重复行。
     # symbol 必须写成 t.symbol：外层四张表都有同名列，不限定会 ambiguous。
     sql += f" ORDER BY {outer_null_guard}{outer_sort_col} {direction}, t.symbol ASC"
+    if outer_slice:
+        sql += " LIMIT ? OFFSET ?"
 
-    df = read_sql(
-        conn, sql,
-        params_out + (d,),
-    )
+    # 绑定顺序 = 占位符在 SQL 文本里的出现顺序：
+    # 内层 where → 内层 LIMIT/OFFSET → JOIN 的 b.date → 外层 LIMIT/OFFSET
+    df = read_sql(conn, sql, tuple(params) + inner_slice + (d,) + outer_slice)
     return df, total_n
 
 
 def _ranking_filtered(
     conn, d: str, period: int, sort: str,
     rps_min: float, rps_max: float,
-    exclude_st: bool, industries: str | None, min_amount: float,
+    exclude_st: bool, industry_names: list[str] | None, min_amount: float,
     limit: int, page: int, sanxingdi: int = 0,
 ) -> tuple[pd.DataFrame, int]:
     """慢路径：行业 / 成交额过滤必须先 JOIN 再排序分页。"""
@@ -268,11 +282,13 @@ def _ranking_filtered(
     params += [rps_min, rps_max]
     if exclude_st:
         where.append("(s.is_st IS NULL OR s.is_st = 0)")
-    if industries:
-        names = [x.strip() for x in industries.split(",") if x.strip()]
-        if names:
-            where.append(f"i.industry IN ({','.join('?' * len(names))})")
-            params += names
+    # 再截一次：导出的「200 个行业名」是 SQLite 999 变量上限的硬约束，
+    # 只在上层截断的话，任何新的调用方都会绕过它。
+    names = [str(x).strip() for x in (industry_names or []) if str(x).strip()]
+    names = names[:MAX_INDUSTRY_FILTER]
+    if names:
+        where.append(f"i.industry IN ({','.join('?' * len(names))})")
+        params += names
     if min_amount > 0:
         where.append("b.amount >= ?")
         params.append(min_amount)
@@ -357,7 +373,7 @@ def ranking(
         if heavy_filter:
             df, total_n = _ranking_filtered(
                 conn, d, period, sort, rps_min, rps_max,
-                exclude_st, industries, min_amount, limit, page, sanxingdi,
+                exclude_st, names_filter, min_amount, limit, page, sanxingdi,
             )
         else:
             df, total_n = _ranking_fast(
@@ -444,7 +460,7 @@ def ranking_export(
         if names_filter or min_amount > 0:
             df, _ = _ranking_filtered(
                 conn, d, period, sort, rps_min, rps_max,
-                exclude_st, industries, min_amount, limit, 1, sanxingdi,
+                exclude_st, names_filter, min_amount, limit, 1, sanxingdi,
             )
         else:
             df, _ = _ranking_fast(
@@ -473,31 +489,43 @@ def _csv_bytes(df: pd.DataFrame, headers: list[str] | None) -> bytes:
 
     Excel 打开 UTF-8 CSV 时若没有 BOM，中文会显示成乱码；
     带 BOM 后它会自动识别编码（代价是首列名前会多一个不可见字符）。
+
+    改用 csv.writer 而不是手工 `",".join`：
+    - 名称/行业里带逗号、引号或换行时，手写拼接会直接产出**列数错位**的文件；
+    - 「代码」列写成 `="000001"`：Excel 会把纯数字的 000001 显示成 1，代码的
+      前导零就丢了。代价是纯文本消费方会看到这层公式包装（README 已写明）；
+    - 以 `= + - @` 开头的文本一律加 `'` 前缀，否则 `=cmd|'/c calc'!A1` 这类
+      单元格会在 Excel/WPS 里被当公式执行（CSV 公式注入）。
     """
     if headers is None:
         return b"\xef\xbb\xbf"
-    if df is None or df.empty:
-        body = ",".join(headers)
-        return ("\ufeff" + body + "\r\n").encode("utf-8")
 
-    def fmt(v):
+    def cell(v) -> str:
         if v is None or (isinstance(v, float) and pd.isna(v)):
             return ""
         if isinstance(v, float):
             return f"{v:.4f}"
-        return str(v)
+        s = str(v)
+        return "'" + s if s[:1] in ("=", "+", "-", "@", "\t", "\r") else s
 
-    lines = [",".join(headers)]
-    for _, row in df.iterrows():
-        lines.append(",".join([
-            fmt(row.get("symbol")), fmt(row.get("name")),
-            fmt(row.get("industry")), fmt(row.get("rps")),
-            fmt(None if row.get("period_return") is None
-                else row["period_return"] * 100),
-            fmt(None if row.get("pct_chg") is None else row["pct_chg"] * 100),
-            fmt(row.get("amount")), fmt(row.get("rank_overall")),
-        ]))
-    return ("\ufeff" + "\r\n".join(lines) + "\r\n").encode("utf-8")
+    buf = io.StringIO()
+    writer = csv.writer(buf, quoting=csv.QUOTE_MINIMAL, lineterminator="\r\n")
+    writer.writerow(headers)
+    if df is not None and not df.empty:
+        for _, row in df.iterrows():
+            code = cell(row.get("symbol"))
+            writer.writerow([
+                f'="{code}"' if code else "",
+                cell(row.get("name")),
+                cell(row.get("industry")),
+                cell(row.get("rps")),
+                cell(None if row.get("period_return") is None
+                     else row["period_return"] * 100),
+                cell(None if row.get("pct_chg") is None else row["pct_chg"] * 100),
+                cell(row.get("amount")),
+                cell(row.get("rank_overall")),
+            ])
+    return buf.getvalue().encode("utf-8-sig")
 
 
 @router.get("/concepts")

@@ -8,12 +8,13 @@
 from __future__ import annotations
 
 import json
+import math
 
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .. import config, db
-from ..analytics.alerts import ALERT_KINDS
+from ..analytics.alerts import ALERT_KINDS, SANXINGDI_WINDOWS
 
 router = APIRouter(prefix="/api", tags=["watchlist"])
 
@@ -24,6 +25,26 @@ SYMBOL_PATTERN = r"^\d{6}$"
 class WatchItem(BaseModel):
     symbol: str = Field(pattern=SYMBOL_PATTERN, description="6 位股票代码")
     note: str | None = Field(default=None, max_length=120)
+
+
+def _to_float(raw, default: float | None) -> float | None:
+    """转 float；None/空串回落 default，非法或非有限返回 None（交给校验拒绝）。"""
+    if raw is None or raw == "":
+        return default
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return val if math.isfinite(val) else None
+
+
+def _to_int(raw, default: int) -> int:
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return -1          # 值域白名单会拒掉它
 
 
 class AlertRuleIn(BaseModel):
@@ -38,6 +59,38 @@ class AlertRuleIn(BaseModel):
         if v not in ALERT_KINDS:
             raise ValueError(f"kind 必须是 {ALERT_KINDS} 之一")
         return v
+
+    @model_validator(mode="after")
+    def _normalize_params(self) -> AlertRuleIn:
+        """按 kind 校验并归一化 params（非法即 422）。
+
+        参数直接决定 SQL 的 BETWEEN 边界与窗口大小：period 不在周期真源里会
+        静默筛错列，`min: null` 会让 float(None) 抛 TypeError —— 以前这些值
+        会原样存进 alert_rule，直到 cli alert run 才炸。
+        """
+        p = dict(self.params or {})
+        if self.kind == "rps_threshold":
+            period = _to_int(p.get("period"), config.DEFAULT_PERIOD)
+            if period not in config.PERIODS:
+                raise ValueError(f"period 必须是 {list(config.PERIODS)} 之一")
+            # 键缺省 → 用默认区间；显式给 null/非法值 → 报错（不静默替换用户输入）
+            lo = 0.0 if "min" not in p else _to_float(p.get("min"), None)
+            hi = 100.0 if "max" not in p else _to_float(p.get("max"), None)
+            if lo is None or hi is None:
+                raise ValueError("min / max 必须是数字（0~100）")
+            if not 0 <= lo <= hi <= 100:
+                raise ValueError("min / max 必须满足 0 ≤ min ≤ max ≤ 100")
+            p = {"period": period, "min": lo, "max": hi}
+        elif self.kind == "sanxingdi":
+            window = _to_int(p.get("window"), 5)
+            if window not in SANXINGDI_WINDOWS:
+                raise ValueError(
+                    f"window 必须是 {list(SANXINGDI_WINDOWS)} 之一")
+            p = {"window": window}
+        else:                                   # limit_up 不接参数
+            p = {}
+        self.params = p
+        return self
 
 
 @router.get("/watchlist")
