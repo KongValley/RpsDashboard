@@ -53,6 +53,7 @@
         <input v-model.trim="newRule.params" type="text"
                placeholder="参数 JSON，如 {&quot;period&quot;:60,&quot;min&quot;:90,&quot;max&quot;:100}"
                style="width:340px" />
+        <span class="muted">period 只能是 15/20/60/120/250；min/max 省略即 0~100</span>
         <button class="btn" @click="addRule">新增规则</button>
       </div>
 

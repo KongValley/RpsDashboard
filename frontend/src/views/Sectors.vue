@@ -82,6 +82,7 @@ import { ref, computed, onMounted, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { rpsApi, metaApi } from '../api'
 import { DEFAULT_PERIOD, usePeriods } from '../composables/usePeriods'
+import { useLatestRequest } from '../composables/useLatestRequest'
 import { useResizableColumns } from '../composables/useResizableColumns'
 
 const router = useRouter()
@@ -100,13 +101,18 @@ const sectorRows = ref([])
 /** 接口错误提示：失败时不能只是图表空白（用户会以为「没数据」） */
 const errMsg = ref('')
 watch(periodsError, (v) => { if (v) errMsg.value = v }, { immediate: true })
+// 快速切换日期/周期/口径时只认最后一次响应（旧响应会盖掉新结果）
+const latestHeat = useLatestRequest()
+const latestSector = useLatestRequest()
 
 async function loadHeatmap() {
+  const t = latestHeat.begin()
   try {
     const isConcept = mode.value === 'concept'
     const d = isConcept
       ? await rpsApi.conceptHeatmap({ date: date.value || undefined })
       : await rpsApi.heatmap({ date: date.value || undefined })
+    if (!latestHeat.isCurrent(t)) return
     if (d.error) throw new Error(d.error)
     dataDate.value = d.data_date
     // 概念热力图返回列名是 concept；各周期列整行透传，
@@ -116,22 +122,26 @@ async function loadHeatmap() {
       industry: isConcept ? r.concept : r.industry,
     }))
   } catch (e) {
+    if (!latestHeat.isCurrent(t)) return
     console.error(e)
     errMsg.value = `热力图加载失败：${e?.message || e}`
   }
 }
 
 async function loadSector() {
+  const t = latestSector.begin()
   try {
     const isConcept = mode.value === 'concept'
     const d = isConcept
       ? await rpsApi.conceptRanking({ period: period.value, date: date.value || undefined })
       : await rpsApi.sector({ period: period.value, date: date.value || undefined })
+    if (!latestSector.isCurrent(t)) return
     if (d.error) throw new Error(d.error)
     // 概念接口列名是 concept
     sectorRows.value = (d.rows || []).map((r) =>
       isConcept ? { ...r, industry: r.concept } : r)
   } catch (e) {
+    if (!latestSector.isCurrent(t)) return
     console.error(e)
     errMsg.value = `板块排行加载失败：${e?.message || e}`
   }

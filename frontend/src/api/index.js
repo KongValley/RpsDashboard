@@ -23,6 +23,24 @@ const since = (t0) => Math.round((performance.now() - t0) * 10) / 10
 /** 网络层失败（fetch reject）与 HTTP 错误的区分，供埋点标注 */
 const errLabel = (e) => (e?.name === 'TypeError' ? 'network' : e?.message || String(e))
 
+/**
+ * 默认超时。浏览器 fetch **没有**超时：连接被中间设备吞掉时会一直 pending，
+ * 页面就永久停在「加载中」。回测是同步算的（本机实测数秒，大库更久），
+ * 单独放宽到 3 分钟。
+ */
+const TIMEOUT_MS = 30_000
+const BACKTEST_TIMEOUT_MS = 180_000
+
+/** AbortController + 定时器；调用方负责 clear()，否则定时器会拖住事件循环 */
+function timeoutGuard(ms) {
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), ms)
+  return { signal: ctrl.signal, clear: () => clearTimeout(timer) }
+}
+
+const timeoutError = (ms, url) =>
+  new Error(`请求超时（${Math.round(ms / 1000)} 秒）：${url}`)
+
 /** 构造查询串，跳过 undefined / null / 空串 */
 function qs(params = {}) {
   const sp = new URLSearchParams()
@@ -33,22 +51,29 @@ function qs(params = {}) {
   return s ? `?${s}` : ''
 }
 
-async function request(path, params, init) {
+async function request(path, params, init, timeoutMs = TIMEOUT_MS) {
   const url = `/api${path}${qs(params)}`
   const t0 = performance.now()
+  const guard = timeoutGuard(timeoutMs)
   let res
   let error
   try {
     res = await fetch(url, {
       headers: { Accept: 'application/json' },
       ...(init || {}),
+      signal: guard.signal,
     })
     if (!res.ok) throw new Error(`HTTP ${res.status} ${url}`)
     return await res.json()
   } catch (e) {
+    if (e?.name === 'AbortError') {
+      error = `timeout ${timeoutMs}ms`
+      throw timeoutError(timeoutMs, url)
+    }
     error = errLabel(e)
     throw e
   } finally {
+    guard.clear()
     record({
       path: url, ms: since(t0), ok: res?.ok ?? false, status: res?.status ?? 0,
       server_ms: serverMs(res), error,
@@ -56,17 +81,18 @@ async function request(path, params, init) {
   }
 }
 
-const get = (path, params) => request(path, params)
+const get = (path, params, timeoutMs) => request(path, params, null, timeoutMs)
 
 /** 触发浏览器下载（导出 CSV 等） */
 async function download(path, params, fallbackName = 'export.csv') {
   const url = `/api${path}${qs(params)}`
   const t0 = performance.now()
+  const guard = timeoutGuard(TIMEOUT_MS)
   let res
   let error
   let size
   try {
-    res = await fetch(url, { headers: { Accept: 'text/csv' } })
+    res = await fetch(url, { headers: { Accept: 'text/csv' }, signal: guard.signal })
     if (!res.ok) throw new Error(`HTTP ${res.status} ${url}`)
     const blob = await res.blob()
     size = blob.size
@@ -76,9 +102,14 @@ async function download(path, params, fallbackName = 'export.csv') {
     a.click()
     URL.revokeObjectURL(a.href)
   } catch (e) {
+    if (e?.name === 'AbortError') {
+      error = `timeout ${TIMEOUT_MS}ms`
+      throw timeoutError(TIMEOUT_MS, url)
+    }
     error = errLabel(e)
     throw e
   } finally {
+    guard.clear()
     record({
       path: url, ms: since(t0), ok: res?.ok ?? false, status: res?.status ?? 0,
       server_ms: serverMs(res), bytes: size, error,
@@ -86,9 +117,10 @@ async function download(path, params, fallbackName = 'export.csv') {
   }
 }
 
-async function post(path, body) {
+async function post(path, body, timeoutMs = TIMEOUT_MS) {
   const url = `/api${path}`
   const t0 = performance.now()
+  const guard = timeoutGuard(timeoutMs)
   let res
   let error
   try {
@@ -96,13 +128,19 @@ async function post(path, body) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
+      signal: guard.signal,
     })
     if (!res.ok) throw new Error(`HTTP ${res.status} ${path}`)
     return await res.json()
   } catch (e) {
+    if (e?.name === 'AbortError') {
+      error = `timeout ${timeoutMs}ms`
+      throw timeoutError(timeoutMs, url)
+    }
     error = errLabel(e)
     throw e
   } finally {
+    guard.clear()
     record({
       path: url, ms: since(t0), ok: res?.ok ?? false, status: res?.status ?? 0,
       server_ms: serverMs(res), error,
@@ -133,7 +171,8 @@ export const stockApi = {
 }
 
 export const backtestApi = {
-  run: (params) => get('/backtest/run', params),
+  // 回测是同步算的（大库上可达数十秒），单独放宽超时
+  run: (params) => get('/backtest/run', params, BACKTEST_TIMEOUT_MS),
 }
 
 export const adminApi = {

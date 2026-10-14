@@ -139,6 +139,7 @@ import { ref, computed, onMounted, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { stockApi } from '../api'
 import { usePeriods } from '../composables/usePeriods'
+import { useLatestRequest } from '../composables/useLatestRequest'
 
 const route = useRoute()
 const { periods, error: periodsError } = usePeriods()
@@ -160,34 +161,49 @@ const dataDate = ref(null)
 /** 接口错误提示：失败不能再伪装成「形态数据尚未计算」 */
 const errMsg = ref('')
 watch(periodsError, (v) => { if (v) errMsg.value = v }, { immediate: true })
+// 切换股票/窗口天数时只认最后一次响应（旧响应会把新股票的数据写回来）
+const latestDetail = useLatestRequest()
+const latestCurve = useLatestRequest()
+const latestPatterns = useLatestRequest()
 
 async function loadDetail() {
+  const t = latestDetail.begin()
   try {
     const d = await stockApi.detail(symbol.value)
+    if (!latestDetail.isCurrent(t)) return
     info.value = d.info
     cur.value = d.current || {}
     pct.value = d.market_percentile || {}
     industryRps.value = d.industry_rps
     dataDate.value = cur.value?.date
   } catch (e) {
+    if (!latestDetail.isCurrent(t)) return
     console.error(e)
     errMsg.value = `个股信息加载失败：${e?.message || e}`
   }
 }
 
 async function loadCurve() {
+  const t = latestCurve.begin()
   try {
-    curve.value = await stockApi.curve(symbol.value, days.value)
+    const d = await stockApi.curve(symbol.value, days.value)
+    if (!latestCurve.isCurrent(t)) return
+    curve.value = d
   } catch (e) {
+    if (!latestCurve.isCurrent(t)) return
     console.error(e)
     errMsg.value = `曲线加载失败：${e?.message || e}`
   }
 }
 
 async function loadPatterns() {
+  const t = latestPatterns.begin()
   try {
-    pattern.value = await stockApi.patterns(symbol.value, days.value)
+    const d = await stockApi.patterns(symbol.value, days.value)
+    if (!latestPatterns.isCurrent(t)) return
+    pattern.value = d
   } catch (e) {
+    if (!latestPatterns.isCurrent(t)) return
     // 网络/500 是「加载失败」，与后端明确告知的「形态还没算」是两回事：
     // 以前这里把两者都写成 pattern_missing ，用户看到「形态数据尚未计算」会去重算，
     // 但真正的原因是接口挂了。

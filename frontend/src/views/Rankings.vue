@@ -109,6 +109,7 @@ import { ref, watch, onMounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { rpsApi, metaApi, watchApi } from '../api'
 import { DEFAULT_PERIOD, usePeriods } from '../composables/usePeriods'
+import { useLatestRequest } from '../composables/useLatestRequest'
 import RpsTable from '../components/RpsTable.vue'
 
 const router = useRouter()
@@ -116,10 +117,16 @@ const route = useRoute()
 
 /** 自选股代码集合（行首星标用） */
 const watched = ref([])
+// 快速连点周期/拖滑块时会有多个请求同时在飞，只认最后一次的响应
+const latest = useLatestRequest()
+const latestWatch = useLatestRequest()
 
 async function loadWatchlist() {
+  const t = latestWatch.begin()
   try {
-    watched.value = (await watchApi.list()).map((r) => r.symbol)
+    const list = (await watchApi.list()).map((r) => r.symbol)
+    if (!latestWatch.isCurrent(t)) return
+    watched.value = list
   } catch (e) {
     console.error('自选列表加载失败', e)
   }
@@ -169,6 +176,7 @@ const errMsg = ref('')
 watch(periodsError, (v) => { if (v) errMsg.value = v }, { immediate: true })
 
 async function load() {
+  const t = latest.begin()
   loading.value = true
   errMsg.value = ''
   try {
@@ -185,6 +193,8 @@ async function load() {
       delta_days: deltaDays.value || undefined,
       sanxingdi: sanxingdi.value || undefined,
     })
+    // 期间又发了新请求 → 这次结果已过期，丢弃（否则旧响应会盖掉新参数的结果）
+    if (!latest.isCurrent(t)) return
     if (!data || typeof data !== 'object' || !('rows' in data)) {
       throw new Error(`响应结构异常: ${JSON.stringify(data).slice(0, 120)}`)
     }
@@ -197,10 +207,12 @@ async function load() {
     // 否则用户会以为「市场里根本没有三升底」。
     patternMissing.value = !!data.pattern_missing
   } catch (e) {
+    if (!latest.isCurrent(t)) return
     console.error(e)
     errMsg.value = e?.message || String(e)
   } finally {
-    loading.value = false
+    // loading 也必须只由最后一次请求关掉，否则旧请求返回时会把转圈提前收掉
+    if (latest.isCurrent(t)) loading.value = false
   }
 }
 
@@ -235,7 +247,8 @@ async function exportCsv() {
       sanxingdi: sanxingdi.value || undefined,
     }, `rps${period.value}_${dataDate.value || 'latest'}.csv`)
   } catch (e) {
-    alert(`导出失败：${e.message}`)
+    // 不用 alert：它会打断浏览器主线程、且在自动化浏览器里根本看不见
+    errMsg.value = `导出失败：${e?.message || e}`
   } finally {
     exporting.value = false
   }

@@ -45,6 +45,8 @@
       </div>
     </div>
 
+    <div v-if="errMsg" class="warnbar soft inset">{{ errMsg }}</div>
+
     <div v-if="warnings.length" class="warnbar-panel">
       <div v-for="(w, i) in warnings" :key="i">⚠ {{ w }}</div>
     </div>
@@ -145,6 +147,7 @@
 import { ref, computed, onMounted, watch } from 'vue'
 import { backtestApi } from '../api'
 import { DEFAULT_PERIOD, usePeriods } from '../composables/usePeriods'
+import { useLatestRequest } from '../composables/useLatestRequest'
 
 const { periods, error: periodsError } = usePeriods()
 const period = ref(DEFAULT_PERIOD)
@@ -158,7 +161,11 @@ const useCost = ref(true)
 const loading = ref(false)
 const result = ref(null)
 const warnings = ref([])
+/** 请求失败时页面内的错误条（不用 alert：会打断主线程、自动化里也看不见） */
+const errMsg = ref('')
 watch(periodsError, (v) => { if (v) warnings.value = [...warnings.value, v] })
+// 连点「运行回测」时只认最后一次响应
+const latest = useLatestRequest()
 
 /**
  * 大盘择时。欧奈尔的原方法是**只在强势市场做多**，而纯价格 RPS 回测
@@ -174,7 +181,9 @@ const MARKET_FILTERS = {
 const marketFilter = ref('none')
 
 async function run() {
+  const t = latest.begin()
   loading.value = true
+  errMsg.value = ''
   try {
     const d = await backtestApi.run({
       period: period.value, threshold: threshold.value, hold: hold.value,
@@ -182,12 +191,14 @@ async function run() {
       resonance: resonance.value, market_filter: marketFilter.value,
       use_cost: useCost.value,
     })
+    if (!latest.isCurrent(t)) return
     result.value = d
     warnings.value = d.warnings || []
   } catch (e) {
-    alert(`回测失败：${e.message}`)
+    if (!latest.isCurrent(t)) return
+    errMsg.value = `回测失败：${e?.message || e}`
   } finally {
-    loading.value = false
+    if (latest.isCurrent(t)) loading.value = false
   }
 }
 

@@ -24,6 +24,8 @@ const local = []
 const pending = []
 let lastFlush = 0
 let installed = false
+/** 正在上报中：同一批 pending 不能被并发上报两次 */
+let inflight = false
 
 function debugOn() {
   try {
@@ -61,7 +63,7 @@ export function record(entry) {
 
 /** 上报一批（最多 FLUSH_EVERY 条）。失败保留 pending 下次再试，绝不抛出。 */
 export function flush({ beacon = false } = {}) {
-  if (!pending.length) return
+  if (!pending.length || inflight) return
   const batch = pending.slice(0, FLUSH_EVERY)
   const body = JSON.stringify({ entries: batch })
 
@@ -76,6 +78,10 @@ export function flush({ beacon = false } = {}) {
     return
   }
 
+  // 同一批 pending 不能被上报两次：请求还没回来时 flush 会被再次触发
+  // （每 20 条一次 + 每 10 秒一次 + pagehide/visibilitychange），
+  // 不去重就会在服务端统计里把同一批请求算两遍。
+  inflight = true
   lastFlush = Date.now()
   fetch(ENDPOINT, {
     method: 'POST',
@@ -85,6 +91,7 @@ export function flush({ beacon = false } = {}) {
   })
     .then((res) => { if (res.ok) drop(batch) })
     .catch(() => { /* 网络抖动：留着下次一起报 */ })
+    .finally(() => { inflight = false })
 }
 
 /** 按引用移除已上报条目——期间规则可能又追加/截断，按下标删会错位 */
