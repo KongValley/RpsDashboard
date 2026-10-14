@@ -459,9 +459,10 @@ cd frontend; npm run lint; npm run build             # 前端 lint + 构建
 全部测试离线运行，使用合成数据，不触网。
 
 - **覆盖率**：`pytest` 默认带 `--cov=rpsboard --cov-report=term-missing`；**门槛
-  `--cov-fail-under=50` 只写在 CI 命令里**（全套 **166 项测试、实测 TOTAL 57%**，门槛按实测值
+  `--cov-fail-under=50` 只写在 CI 命令里**（全套 **176 项测试、实测 TOTAL 59%**，门槛按实测值
   向下取整）——放进 `addopts` 会让「只跑一个测试文件」也因总覆盖率不足而失败。`cli.py` 与
-  `sources/*` 目前接近零覆盖，门槛按实测值设，不虚设高线。
+  `sources/*` 目前覆盖较少（本次补了 tradestatus 与 price-limits 的用例），门槛按实测值设，
+  不虚设高线。
 - **lint**：ruff（`select = E,F,W,I,UP,B`，`ignore` 里三条都在 pyproject 注明理由）；
   一次性调研脚本（`probe_*` / `debug_*` / `diag_*` / `verify_*`）用
   `extend-exclude` 排除在外 —— 它们是现场临时脚本，重排风格只会淹没真实改动。
