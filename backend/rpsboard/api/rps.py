@@ -183,7 +183,7 @@ def _ranking_fast(
     if exclude_st:
         # 必须用 NOT EXISTS，不能写成
         #   `r.symbol IN (SELECT symbol FROM security_master WHERE ...)`
-        # IN 子查询会让优化器放弃 idx_rps_date、改用主键 (symbol, date) 逐只查找，
+        # IN 子查询会让优化器放弃 idx_rps_date_period、改用主键 (symbol, date) 逐只查找，
         # 实测 72.4ms → 4.9ms。security_master.symbol 是主键，LEFT JOIN 版本
         # 同样快（3.9ms）但会改变连接结构，NOT EXISTS 语义最干净。
         where.append(

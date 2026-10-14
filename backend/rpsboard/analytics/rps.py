@@ -378,19 +378,26 @@ def materialize(
                 conn, "industry_rps_daily", target_dates, ind_df
             )
     else:
-        conn.execute("DELETE FROM rps_daily")
-        conn.execute("DELETE FROM industry_rps_daily")
-        conn.commit()
+        # 覆盖索引先删后建：394 万行逐行维护 B 树要 90 s（cProfile 实测），
+        # 写完再建只扫一遍表。try/finally 保证异常或中断时索引也会回来，
+        # 否则排行榜的排序会退化成临时 B-TREE。
+        db.drop_period_index(conn)
+        try:
+            conn.execute("DELETE FROM rps_daily")
+            conn.execute("DELETE FROM industry_rps_daily")
+            conn.commit()
 
-        if not rps_df.empty:
-            rps_df.to_sql("rps_daily", conn, if_exists="append", index=False, chunksize=2000)
-            n_stock = len(rps_df)
-        if not ind_df.empty:
-            ind_df.to_sql(
-                "industry_rps_daily", conn, if_exists="append", index=False, chunksize=2000
-            )
-            n_ind = len(ind_df)
-        conn.commit()
+            if not rps_df.empty:
+                rps_df.to_sql("rps_daily", conn, if_exists="append", index=False, chunksize=2000)
+                n_stock = len(rps_df)
+            if not ind_df.empty:
+                ind_df.to_sql(
+                    "industry_rps_daily", conn, if_exists="append", index=False, chunksize=2000
+                )
+                n_ind = len(ind_df)
+            conn.commit()
+        finally:
+            db.rebuild_period_index(conn)
 
     n_dates = len(target_dates) if (mode == "incremental" and target_dates) else 0
     db.finish_run(conn, run_id, "success", n_stock + n_ind,

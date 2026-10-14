@@ -61,12 +61,12 @@ CREATE TABLE IF NOT EXISTS rps_daily (
   ret15  REAL, ret20 REAL, ret60 REAL, ret120 REAL, ret250 REAL,
   PRIMARY KEY (symbol, date)
 );
-CREATE INDEX IF NOT EXISTS idx_rps_date ON rps_daily(date);
 -- 覆盖索引：排行榜的核心查询是
 --   WHERE date=? AND rps60 BETWEEN ? AND ? ORDER BY rps60 DESC
--- 单列的 idx_rps_date 只能定位到日期，再用 TEMP B-TREE 临时排序 5000+ 行。
--- 把**全部**周期都放进索引后可以直接走有序区间扫描，排序与筛选都在索引里完成。
--- 列清单必须与 config.PERIODS 一致：ensure_period_columns() 会按真源重建它。
+-- 单列 date 索引只能定位到日期，再用 TEMP B-TREE 临时排序 5000+ 行。
+-- 把**全部**周期都放进索引后可以直接走有序区间扫描，排序与筛选都在索引里完成；
+-- 它的前缀就是 date，所以历史上那个单列 idx_rps_date 是纯冗余（81 MB +
+-- 每次写入多维护一棵 B 树），已从建表语句里删掉、旧库由 init_db → ensure_indexes DROP。
 CREATE INDEX IF NOT EXISTS idx_rps_date_period
   ON rps_daily(date, rps15, rps20, rps60, rps120, rps250);
 
@@ -219,6 +219,8 @@ def init_db(path: Path | str | None = None) -> None:
         added = ensure_period_columns(conn)
         if added:
             print(f"[db] 新增周期列 {', '.join(added)}（需 cli compute-rps --full 填值）")
+        if ensure_indexes(conn):
+            print("[db] 已重建 rps_daily 覆盖索引（并删除冗余的 idx_rps_date）")
 
 
 #: 带周期列的三张表（列名由 config.PERIODS 决定，见 config.period_columns）
@@ -226,13 +228,11 @@ PERIOD_TABLES = ("rps_daily", "industry_rps_daily", "concept_rps_daily")
 
 
 def ensure_period_columns(conn: sqlite3.Connection) -> list[str]:
-    """给既有库补上 config.PERIODS 里的周期列，并重建 rps_daily 的覆盖索引。
+    """给既有库补上 config.PERIODS 里的周期列。
 
     幂等：列已存在就跳过。返回本次新增的列名（形如 ``rps_daily.rps15``）。
     只做 ALTER TABLE ADD COLUMN —— 纯元数据操作，不重建表、不动数据。
-
-    索引必须 drop 后重建：``CREATE INDEX IF NOT EXISTS`` 对已存在的同名索引
-    什么都不做，留在库里的是旧的四列版本。
+    索引由 ``ensure_indexes()`` 负责。
     """
     added: list[str] = []
     wanted = config.period_columns() + config.period_columns("ret")
@@ -244,14 +244,48 @@ def ensure_period_columns(conn: sqlite3.Connection) -> list[str]:
             if col not in have:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} REAL")
                 added.append(f"{table}.{col}")
-    if any(a.startswith("rps_daily.") for a in added):
-        conn.execute("DROP INDEX IF EXISTS idx_rps_date_period")
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_rps_date_period"
-            f" ON rps_daily(date, {', '.join(config.period_columns())})"
-        )
     conn.commit()
     return added
+
+
+def drop_period_index(conn: sqlite3.Connection) -> None:
+    """删掉 rps_daily 的覆盖索引（全量重写前调用：394 万行逐行维护 B 树要 90 s）。"""
+    conn.execute("DROP INDEX IF EXISTS idx_rps_date_period")
+    conn.commit()
+
+
+def rebuild_period_index(conn: sqlite3.Connection) -> None:
+    """按 config.PERIODS 重建覆盖索引：写完再建只扫一遍表，比逐行维护快得多。
+
+    必须先 DROP：``CREATE INDEX IF NOT EXISTS`` 遇到同名旧索引什么都不做，
+    留下的还是旧列清单（这正是 rps15 那次迁移踩过的坑）。
+    """
+    conn.execute("DROP INDEX IF EXISTS idx_rps_date_period")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_rps_date_period"
+        f" ON rps_daily(date, {', '.join(config.period_columns())})"
+    )
+    conn.commit()
+
+
+def ensure_indexes(conn: sqlite3.Connection) -> list[str]:
+    """确保覆盖索引存在且列清单与 config.PERIODS 一致，并删掉冗余的 idx_rps_date。
+
+    幂等；无动作时只查一次 sqlite_master。返回值非空表示重建过索引。
+    全量重算会先 DROP 覆盖索引（写完再建），进程被中途杀掉就会留下「索引没了」的
+    状态 —— 靠这里自愈，否则排行榜会退化成临时排序。
+    """
+    conn.execute("DROP INDEX IF EXISTS idx_rps_date")
+    # 不假设连接设了 row_factory：裸 sqlite3 连接的 fetchone() 返回 tuple
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_rps_date_period'"
+    ).fetchone()
+    index_sql = (row[0] or "") if row else ""
+    if all(c in index_sql for c in config.period_columns()):
+        conn.commit()
+        return []
+    rebuild_period_index(conn)
+    return ["idx_rps_date_period"]
 
 
 def table_exists(conn: sqlite3.Connection, name: str) -> bool:
