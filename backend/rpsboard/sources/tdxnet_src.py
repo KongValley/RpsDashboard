@@ -85,11 +85,30 @@ class TdxSource:
         return df
 
     # ── 后复权日K ────────────────────────────────────────────────
-    def hfq_bars(self, symbol: str, count: int = MAX_COUNT) -> pd.DataFrame:
-        bars = self._client.bars.get(
-            to_full_code(symbol), period="day", adjust="hfq", count=count
-        )
-        bars = getattr(bars, "bars", bars) or []
+    def _bar_pages(self, code: str, count: int) -> list:
+        """按 `start` 偏移翻页取日 K（单页上限 800 根）。
+
+        `start` 是**距最新一根的回退偏移**（实测 count=800,start=800 → 2020-03~2023-06）。
+        第二页比第一页更早，所以调用方必须自己按日期排序。
+        """
+        out: list = []
+        start = 0
+        while len(out) < count:
+            n = min(MAX_COUNT, count - len(out))
+            page = self._client.bars.get(
+                code, period="day", adjust="hfq", count=n, start=start
+            )
+            bars = getattr(page, "bars", page) or []
+            if not bars:
+                break
+            out.extend(bars)
+            start += len(bars)
+            if len(bars) < n:  # 已到该标的上市首日
+                break
+        return out
+
+    def hfq_bars(self, symbol: str, count: int = config.BARS_LIMIT) -> pd.DataFrame:
+        bars = self._bar_pages(to_full_code(symbol), count)
         if not bars:
             return pd.DataFrame()
         recs = []
@@ -111,18 +130,25 @@ class TdxSource:
         )
         for c in ("open", "high", "low", "close", "volume", "amount"):
             df[c] = pd.to_numeric(df[c], errors="coerce")
-        return df.dropna(subset=["close"]).reset_index(drop=True)
+        df = df.dropna(subset=["close"]).drop_duplicates(subset=["date"], keep="last")
+        # 排序是硬要求：分页取回来的顺序是「新→旧」，而 tradestatus 的判定
+        # （sources/base.py）要求 (symbol, date) 升序，顺序不对会直接报错。
+        return df.sort_values("date").reset_index(drop=True)
 
     # ── 指数 ─────────────────────────────────────────────────────
-    def index_bars(self, symbol: str, count: int = MAX_COUNT) -> pd.DataFrame:
-        bars = self._client.bars.get(
-            symbol, period="day", adjust="hfq", count=count
-        )
-        bars = getattr(bars, "bars", bars) or []
+    def index_bars(self, symbol: str, count: int = config.BARS_LIMIT) -> pd.DataFrame:
+        bars = self._bar_pages(symbol, count)
+        if not bars:
+            return pd.DataFrame()
         recs = [(b.time.strftime("%Y-%m-%d"), getattr(b, "close", None)) for b in bars]
         df = pd.DataFrame(recs, columns=["date", "close"])
         df["close"] = pd.to_numeric(df["close"], errors="coerce")
-        return df.dropna(subset=["close"]).reset_index(drop=True)
+        return (
+            df.dropna(subset=["close"])
+            .drop_duplicates(subset=["date"], keep="last")
+            .sort_values("date")
+            .reset_index(drop=True)
+        )
 
 
 # ── 全市场回填 ──────────────────────────────────────────────────────
@@ -130,7 +156,7 @@ def backfill_bars(
     conn: sqlite3.Connection,
     symbols: list[str] | None = None,
     *,
-    count: int = MAX_COUNT,
+    count: int = config.BARS_LIMIT,
     workers: int = config.TDX_WORKERS,
     progress_every: int = 300,
 ) -> tuple[int, int, list[str]]:
@@ -226,10 +252,35 @@ def backfill_bars(
                 "volume", "amount", "pct_chg", "is_st", "tradestatus"]
         df = df[cols]
 
-        pairs = list(zip(df["symbol"], df["date"]))
-        conn.executemany("DELETE FROM daily_bar WHERE symbol=? AND date=?", pairs)
+        # 写入必须是**单事务 upsert**：(symbol, date) 是主键，INSERT OR REPLACE 天然幂等。
+        # 旧写法是「先把 4.47M 个 (symbol,date) 对逐个 DELETE 并 commit，再 to_sql 插入
+        # 并 commit」——两次提交之间有一个**真实的空窗**：这中间被杀/断电/磁盘满，
+        # 数据库就停在「已删未写」的状态，全市场日 K 直接蒸发（2026-10-14 实测发生：
+        # 435 万行只剩 1 万行，且因为删除已提交，取数进程被中断后无法回滚）。
+        # 现在改成先写临时表，最后一条 INSERT OR REPLACE ... SELECT 在同一条事务里
+        # 完成替换：要么全是旧数据，要么全是新数据，中途中断不留空窗。
+        # 另外不再按 (symbol,date) 删旧行 —— 那样会把超出 800 根窗口的**历史**（早期
+        # 少数股票只在这里有 2023-02~06 的 bar）也一并删掉，而 upsert 不会。
+        stage = "_bars_stage"
+        col_list = ", ".join(cols)
+        df[cols].to_sql(stage, conn, if_exists="replace", index=False, chunksize=5000)
         conn.commit()
-        df.to_sql("daily_bar", conn, if_exists="append", index=False, chunksize=5000)
+        # 按 symbol 分批 upsert，每批一次提交。相比「一条大语句写完所有行」：
+        # (a) 任何时刻都不会出现「已删未写」的空窗 —— 每批提交只是新增/覆盖若干股票；
+        # (b) 写锁不会被一条几分钟的长事务占住（实测旁路命令直接 database is locked）；
+        # (c) 中途被杀只需重跑，已写入的批不受影响。
+        conn.execute(f"CREATE INDEX IF NOT EXISTS ix_bars_stage_symbol ON {stage}(symbol)")
+        symbols = list(df["symbol"].drop_duplicates())
+        for i in range(0, len(symbols), 400):
+            chunk = symbols[i:i + 400]
+            marks = ",".join("?" * len(chunk))
+            conn.execute(
+                f"INSERT OR REPLACE INTO daily_bar({col_list}) "
+                f"SELECT {col_list} FROM {stage} WHERE symbol IN ({marks})",
+                tuple(chunk),
+            )
+            conn.commit()
+        conn.execute(f"DROP TABLE {stage}")
         conn.commit()
 
         # 组内**首行**的 pct_chg 必为 NaN，而首行正是本帧最早的那一天：
