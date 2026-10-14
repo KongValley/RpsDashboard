@@ -571,3 +571,61 @@ def test_cache_token_tracks_non_rps_updates(seeded):
     finally:
         conn.close()
     assert before and after and before != after
+
+
+# ── 排序方向（2026-10-14 新增控件）────────────────────────────────────
+@pytest.mark.parametrize("sort,fkey", [
+    ("rps", "rps"), ("ret", "period_return"), ("amount", "amount"),
+    ("pct_chg", "pct_chg"), ("close", "close"),
+])
+def test_ranking_direction_is_honored(seeded, sort, fkey):
+    """direction=asc/desc 必须真的生效，且分页与排序键同向。
+
+    `sort=pct_chg` 的默认方向是**升序**（跌幅榜），所以控件必须能显式指定方向 ——
+    否则用户点「涨跌幅」看到的会是跌得最多的那一批。
+    """
+    client, *_ = seeded
+    desc = client.get("/api/rps/ranking",
+                      params={"sort": sort, "direction": "desc", "limit": 500}).json()
+    asc = client.get("/api/rps/ranking",
+                     params={"sort": sort, "direction": "asc", "limit": 500}).json()
+    assert desc["direction"] == "desc" and asc["direction"] == "asc"
+    assert desc["total"] == asc["total"]
+    assert {r["symbol"] for r in desc["rows"]} == {r["symbol"] for r in asc["rows"]}
+
+    d_vals = [r[fkey] for r in desc["rows"] if r[fkey] is not None]
+    a_vals = [r[fkey] for r in asc["rows"] if r[fkey] is not None]
+    assert d_vals == sorted(d_vals, reverse=True), f"{sort} 降序不单调"
+    assert a_vals == sorted(a_vals), f"{sort} 升序不单调"
+
+
+def test_ranking_direction_edges_match_database(seeded):
+    """升序首行/降序首行必须分别是全市场的最小/最大值（用取值唯一的 close 校验）。"""
+    client, *_ = seeded
+    conn = dbmod.connect()
+    try:
+        last = conn.execute("SELECT MAX(date) AS d FROM rps_daily").fetchone()["d"]
+        row = conn.execute(
+            "SELECT MIN(b.close) AS lo, MAX(b.close) AS hi FROM daily_bar b "
+            "JOIN rps_daily r ON r.symbol = b.symbol AND r.date = b.date "
+            "WHERE b.date = ? AND r.rps60 IS NOT NULL", (last,)).fetchone()
+    finally:
+        conn.close()
+    asc = client.get("/api/rps/ranking",
+                     params={"sort": "close", "direction": "asc", "limit": 5}).json()
+    desc = client.get("/api/rps/ranking",
+                      params={"sort": "close", "direction": "desc", "limit": 5}).json()
+    assert asc["rows"][0]["close"] == pytest.approx(row["lo"])
+    assert desc["rows"][0]["close"] == pytest.approx(row["hi"])
+
+
+def test_ranking_direction_with_inner_paging(seeded):
+    """rps/ret 走内层 LIMIT 快路径：方向必须一路传进子查询，翻页也不重不漏。"""
+    client, *_ = seeded
+    p1 = client.get("/api/rps/ranking",
+                    params={"sort": "rps", "direction": "asc", "limit": 10, "page": 1}).json()
+    p2 = client.get("/api/rps/ranking",
+                    params={"sort": "rps", "direction": "asc", "limit": 10, "page": 2}).json()
+    assert {r["symbol"] for r in p1["rows"]}.isdisjoint({r["symbol"] for r in p2["rows"]})
+    joined = [r["rps"] for r in p1["rows"]] + [r["rps"] for r in p2["rows"]]
+    assert joined == sorted(joined), "内层分页没有跟着方向走"

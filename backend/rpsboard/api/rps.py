@@ -33,8 +33,22 @@ _SORTS = {
     "close": "close",
 }
 
-#: 排序方向为 ASC 的键
+#: 排序方向为 ASC 的默认键（涨跌幅/收盘价看的是「最低/最便宜」那一端）
 _ASC_SORTS = {"pct_chg", "close"}
+
+#: 允许显式指定的排序方向
+_DIRECTIONS = ("asc", "desc")
+
+
+def _order_dir(sort: str, direction: str | None) -> str:
+    """排序方向 SQL 片段：显式 asc/desc 优先，否则用排序键的默认方向。
+
+    方向必须可指定：`pct_chg` 默认升序是「跌幅榜」，而用户点「涨跌幅」多半想看
+    涨幅榜 —— 只给键不给方向的话，控件反而会做出一件让人意外的事。
+    """
+    if direction in _DIRECTIONS:
+        return direction.upper()
+    return "ASC" if sort in _ASC_SORTS else "DESC"
 
 #: 这些列来自 LEFT JOIN 的表，可能为 NULL，排序时需要把 NULL 沉底。
 #: rps / period_return 不在其中——WHERE 里已经要求 `rps IS NOT NULL`，
@@ -170,6 +184,7 @@ def _ranking_fast(
     conn, d: str, period: int, sort: str,
     rps_min: float, rps_max: float,
     exclude_st: bool, limit: int, page: int, sanxingdi: int = 0,
+    direction: str | None = None,
 ) -> tuple[pd.DataFrame, int]:
     """快路径：先在 rps_daily 上取 Top-N，再只对这 N 行做 JOIN。
 
@@ -210,8 +225,8 @@ def _ranking_fast(
     inner_order = ""
     outer_sort_col = sort if sort in _SORTS else _SORTS["rps"]
     outer_null_guard = ""
+    direction = _order_dir(sort, direction)
     if sort in ("rps", "ret"):
-        direction = "DESC"
         col = f"r.{rps_col}" if sort == "rps" else f"r.{ret_col}"
         alias = "rps" if sort == "rps" else "period_return"
         # 必须补 symbol 作次级排序键：RPS 是百分位，**大量股票取值相同**，
@@ -220,7 +235,6 @@ def _ranking_fast(
         outer_sort_col = alias
         paged_in_inner = True
     else:
-        direction = "ASC" if sort in _ASC_SORTS else "DESC"
         outer_null_guard = (
             f"{outer_sort_col} IS NULL, " if outer_sort_col in _NULLABLE_SORTS else ""
         )
@@ -273,6 +287,7 @@ def _ranking_filtered(
     rps_min: float, rps_max: float,
     exclude_st: bool, industry_names: list[str] | None, min_amount: float,
     limit: int, page: int, sanxingdi: int = 0,
+    direction: str | None = None,
 ) -> tuple[pd.DataFrame, int]:
     """慢路径：行业 / 成交额过滤必须先 JOIN 再排序分页。"""
     where = ["r.date = ?"]
@@ -315,7 +330,7 @@ def _ranking_filtered(
 
     # 排序列必须用子查询包裹：外层多张表都有 `symbol` 列，
     # 直接 ORDER BY amount 会被 SQLite 判为 ambiguous column name。
-    order = "ASC" if sort in _ASC_SORTS else "DESC"
+    order = _order_dir(sort, direction)
     null_guard = f"{sort_col} IS NULL, " if sort_col in _NULLABLE_SORTS else ""
     # symbol 作为次级排序键，保证分页稳定（百分位取值大量相同，
     # 没有确定性次序时相邻页会互相重复）
@@ -335,6 +350,9 @@ def ranking(
     exclude_st: bool = True,
     min_amount: float = 0.0,
     sort: str = "rps",
+    direction: str | None = Query(
+        None, description="排序方向 asc/desc；缺省按排序键的默认方向（涨跌幅/收盘价默认升序）",
+    ),
     limit: int = DEFAULT_PAGE_LIMIT,
     page: int = 1,
     delta_days: int = 0,
@@ -356,6 +374,9 @@ def ranking(
             sanxingdi = 0
         # 归一化 RPS 区间：min > max 时原来会静默返回空结果，用户以为「今天没有强势股」
         rps_min, rps_max = _clamp_rps_range(rps_min, rps_max)
+        direction = direction.lower() if isinstance(direction, str) else None
+        if direction not in _DIRECTIONS:
+            direction = None
         # 单页上限保护：不设限时 limit=100000 会把全市场一次性返回
         limit = max(1, min(int(limit), MAX_PAGE_LIMIT))
         page = max(1, int(page))
@@ -374,11 +395,12 @@ def ranking(
             df, total_n = _ranking_filtered(
                 conn, d, period, sort, rps_min, rps_max,
                 exclude_st, names_filter, min_amount, limit, page, sanxingdi,
+                direction,
             )
         else:
             df, total_n = _ranking_fast(
                 conn, d, period, sort, rps_min, rps_max,
-                exclude_st, limit, page, sanxingdi,
+                exclude_st, limit, page, sanxingdi, direction,
             )
 
         if df.empty:
@@ -414,6 +436,8 @@ def ranking(
             "period": period,
             "page": page,
             "limit": limit,
+            "sort": sort if sort in _SORTS else _SORTS["rps"],
+            "direction": _order_dir(sort, direction).lower(),
             "delta_days": delta_days,
             "rank_delta_base_date": prev_date,
             "sanxingdi": sanxingdi,
@@ -433,6 +457,9 @@ def ranking_export(
     exclude_st: bool = True,
     min_amount: float = 0.0,
     sort: str = "rps",
+    direction: str | None = Query(
+        None, description="排序方向 asc/desc；缺省按排序键的默认方向",
+    ),
     sanxingdi: int = Query(
         0, description="三升底筛选窗口（交易日）：0 不筛选，可选 1/5/10/20",
     ),
@@ -448,6 +475,10 @@ def ranking_export(
     if sanxingdi and sanxingdi not in SANXINGDI_WINDOWS:
         sanxingdi = 0
     rps_min, rps_max = _clamp_rps_range(rps_min, rps_max)
+    # 导出必须与页面同一套排序，否则「看到的第 1 名」和「导出的第 1 行」又不是同一只
+    direction = direction.lower() if isinstance(direction, str) else None
+    if direction not in _DIRECTIONS:
+        direction = None
     conn = db.connect()
     try:
         d = resolve_date(conn, date)
@@ -460,12 +491,12 @@ def ranking_export(
         if names_filter or min_amount > 0:
             df, _ = _ranking_filtered(
                 conn, d, period, sort, rps_min, rps_max,
-                exclude_st, names_filter, min_amount, limit, 1, sanxingdi,
+                exclude_st, names_filter, min_amount, limit, 1, sanxingdi, direction,
             )
         else:
             df, _ = _ranking_fast(
                 conn, d, period, sort, rps_min, rps_max, exclude_st, limit, 1,
-                sanxingdi,
+                sanxingdi, direction,
             )
         if not df.empty:
             ranks = market_ranks(conn, d, period)

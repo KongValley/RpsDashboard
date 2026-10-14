@@ -24,6 +24,21 @@
         </div>
 
         <div class="group">
+          <label>排序</label>
+          <select v-model="sort" style="min-width:112px">
+            <option value="rps">RPS</option>
+            <option value="ret">区间涨幅</option>
+            <option value="pct_chg">当日涨跌</option>
+            <option value="amount">成交额</option>
+            <option value="close">收盘价</option>
+          </select>
+          <select v-model="direction" style="min-width:96px">
+            <option value="desc">降序 大→小</option>
+            <option value="asc">升序 小→大</option>
+          </select>
+        </div>
+
+        <div class="group">
           <label>行业</label>
           <select v-model="industry" style="min-width:140px">
             <option value="">全部行业</option>
@@ -152,6 +167,9 @@ async function toggleWatch(symbol) {
 const { periods, error: periodsError } = usePeriods()
 const period = ref(DEFAULT_PERIOD)
 const rpsMin = ref(80)
+/** 排序键与方向：后端 sort 支持 rps/ret/pct_chg/amount/close，direction 支持 asc/desc。 */
+const sort = ref('rps')
+const direction = ref('desc')
 const industry = ref('')
 const minAmount = ref(0)
 const excludeSt = ref(true)
@@ -188,6 +206,8 @@ async function load() {
       industries: industry.value || undefined,
       exclude_st: excludeSt.value,
       min_amount: minAmount.value || undefined,
+      sort: sort.value,
+      direction: direction.value,
       limit: pageSize,
       page: page.value,
       delta_days: deltaDays.value || undefined,
@@ -242,7 +262,9 @@ async function exportCsv() {
       industries: industry.value || undefined,
       exclude_st: excludeSt.value,
       min_amount: minAmount.value || undefined,
-      sort: 'rps',
+      // 导出必须与页面同一套排序，否则「看到的第 1 名」和「导出的第 1 行」不是同一只
+      sort: sort.value,
+      direction: direction.value,
       // 形态筛选必须一起传：否则用户开着「三升底」点导出，拿到的是未过滤的文件
       sanxingdi: sanxingdi.value || undefined,
     }, `rps${period.value}_${dataDate.value || 'latest'}.csv`)
@@ -255,6 +277,7 @@ async function exportCsv() {
 }
 
 watch([industry, minAmount, excludeSt], () => { page.value = 1; load() })
+watch([sort, direction], () => { page.value = 1; load() })
 watch(rpsMin, () => { page.value = 1; load() })
 watch(date, () => { page.value = 1; load() })
 watch(deltaDays, () => { page.value = 1; load() })
@@ -281,6 +304,9 @@ onMounted(() => {
   if (q.date) date.value = String(q.date)
   if (q.period) period.value = Number(q.period)
   if (q.rps_min) rpsMin.value = Number(q.rps_min)
+  // 排序也可以带过来（分享/收藏一个「成交额榜」链接）
+  if (q.sort) sort.value = String(q.sort)
+  if (q.direction) direction.value = String(q.direction)
 })
 </script>
 
