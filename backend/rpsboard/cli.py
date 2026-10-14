@@ -182,16 +182,20 @@ def cmd_compute_rps(args: argparse.Namespace) -> int:
                 f"mode={mode} 个股 {n_stock} 行 / 板块 {n_ind} 行",
             )
     print(f"[rps] 个股 {n_stock} 行，板块 {n_ind} 行（{mode}）")
-    # 复权异常会放大跨该日的区间收益：只提示，不自动剔除（那会静默改变结论）
+    # 复权异常端点已自动剔除（收益为 NULL）：这里报出被剔除的行数，其余异常见 cli quality
     with db.session() as conn:
-        if db.table_exists(conn, "adjust_event"):
-            n_bad = conn.execute(
-                "SELECT COUNT(*) AS n FROM adjust_event "
-                "WHERE kind IN ('hfq_jump', 'tiny_price', 'nonpositive_price')"
-            ).fetchone()["n"]
-            if n_bad:
-                print(f"[rps] ⚠ 库内已知复权异常 {n_bad} 处（跨该日的区间收益会被放大，"
-                      f"口径未改）：cli quality")
+        floor = config.ANOMALY_MIN_PRICE
+        if floor > 0:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM daily_bar WHERE close < ?",
+                (floor,)).fetchone()
+        else:                       # 门槛为 0 时只剔除非正价（旧行为）
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM daily_bar WHERE close <= 0").fetchone()
+        n_excl = row["n"]
+        if n_excl:
+            print(f"[rps] 复权异常：{n_excl} 行端点价 < {floor:g} 元（含穿零）已置空，"
+                  f"跨这些点的区间收益不计：cli quality")
     # RPS 变了 → 回测的进程内矩阵/帧缓存必须失效（否则最长 300s 用旧值）
     from .analytics import backtest as bt_engine
     bt_engine.clear_context_cache()

@@ -57,6 +57,20 @@ os.environ.setdefault("ELTDX_BOARD_DATA_DIR", str(DOWNLOAD_DIR))
 PERIODS: tuple[int, ...] = (15, 20, 60, 120, 250)
 DEFAULT_PERIOD = 60
 
+# ── 复权异常剔除门槛 ────────────────────────────────────────────────
+#: 后复权价低于该值（元）时，**该端点不参与收益计算**。
+#:
+#: 机理：后复权价 = 原始价 × scale + offset，offset 可以为负。原始价接近「变换零点」
+#: (‑offset/scale) 时后复权价被压成极小值，而 close(t)/close(t−N) 在接近零的分母上
+#: 会被放大到失真 —— 实测 600076 在 2024-12-18 的 ret60 = +998%，而它当天的原始价
+#: 只涨了约 8%。区间收益只取决于**两个端点**，所以这里按端点剔除，而不是「跨过
+#: 某个异常日就整段作废」。
+#:
+#: 0 表示只剔除非正价（historic 行为）；想更保守可以调高（如 2.0）。
+#:   Windows:     set RPSBOARD_ANOMALY_MIN_PRICE=2.0
+#:   Linux/macOS: export RPSBOARD_ANOMALY_MIN_PRICE=2.0
+ANOMALY_MIN_PRICE = float(os.environ.get("RPSBOARD_ANOMALY_MIN_PRICE", "1.0"))
+
 
 def period_columns(prefix: str = "rps") -> list[str]:
     """按 PERIODS 生成列名，例如 period_columns() -> ['rps15', ..., 'rps250']。"""

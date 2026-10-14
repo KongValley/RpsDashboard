@@ -10,6 +10,8 @@ import sqlite3
 
 import pandas as pd
 
+from .. import config
+
 #: 窗口占比超过这个比例时改走顺序扫描（见 load_long 的说明）
 SEQ_SCAN_RATIO = 0.2
 
@@ -86,13 +88,23 @@ def build_close_matrix(long: pd.DataFrame) -> pd.DataFrame:
 
     停牌日用前值填充（ffill）——停牌期间价格不变是合理的近似，
     否则整只股票的区间收益会被 NaN 污染成缺失。
+
+    **端点剔除**：低于 `config.ANOMALY_MIN_PRICE`（默认 1 元）的后复权价视为无效，
+    连同非正价一起置为 NaN。机理是后复权价 = 原始价 × scale + offset（offset 可为负）：
+    原始价接近变换零点时后复权价被压到极小，`close(t)/close(t−N)` 的比值会被放大到
+    失真（实测 600076 的 `ret60 = +998%`，当天原始价只涨了约 8%）。
+    区间收益只取决于两个端点，所以按端点剔除而不是「跨过异常日整段作废」；
+    同一条规则同时覆盖 RPS、回测的前瞻收益与涨跌停判定的 `pct_change`。
     """
     if long.empty:
         return pd.DataFrame()
     df = long.copy()
     df["date"] = pd.to_datetime(df["date"])
     wide = df.pivot_table(index="date", columns="symbol", values="close", aggfunc="last")
-    return wide.sort_index().ffill()
+    wide = wide.sort_index().ffill()
+    floor = max(config.ANOMALY_MIN_PRICE, 0.0)
+    # 放在 ffill 之后：停牌日沿用前值，前值若已被剔除，停牌期间也不该「复活」
+    return wide.where(wide >= floor) if floor > 0 else wide.where(wide > 0)
 
 
 def build_tradable_matrix(long: pd.DataFrame) -> pd.DataFrame:

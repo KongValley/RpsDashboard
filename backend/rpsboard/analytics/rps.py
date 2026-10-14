@@ -15,6 +15,13 @@
 - **复牌当天参与排名**：`tradestatus=0` 只表示「这根 bar 之前缺了交易日」，
   复牌日本身是真实成交日，旧实现把它剔出去会漏掉复牌补涨的龙头（见
   matrix.build_tradable_matrix）。
+- **异常端点不进入收益率**：后复权价 `≤0`（穿零）或 `< config.ANOMALY_MIN_PRICE`
+  （默认 1 元，环境变量 `RPSBOARD_ANOMALY_MIN_PRICE` 可调）的端点视为无效 ——
+  close/prev 只在两边都可信时有意义：负分母会翻转比值符号、0 分母得 ±inf
+  （rank() 把 +inf 当最大值排到榜首，实测 600076 因此拿到过全市场 rps60=100），
+  而接近零的分母会把正常的原始价涨幅放大成几百个百分点（同一只股票的 ret60 曾是
+  +998%，当天原始价只涨了约 8%）。规则由 matrix.build_close_matrix 统一执行，
+  因此 RPS、回测前瞻收益、涨跌停判定的 pct_change 用的是同一套端点。
 - **ST 默认剔除**：避免 ST 股因连续涨停霸榜，可通过 exclude_st 放开。
 """
 
@@ -43,10 +50,9 @@ def compute_rps_frames(
     if close_wide.empty:
         return {}
 
-    # 后复权价在长期高分红/重组后会穿零（实测 3 只 23 行 close<=0）。close/prev 只在
-    # 两边都为正时有意义：prev 为负会让比值符号翻转、prev=0 得 ±inf，而 rank() 会把
-    # +inf 当最大值排到榜首（实测 600076 因此拿到全市场 rps60=100，把 C20木材加工
-    # 拖到 rps120=1.2）。
+    # 防御性重复：正常路径下 build_close_matrix 已按 config.ANOMALY_MIN_PRICE 剔除
+    # 异常端点；但本函数也可能被测试/脚本直接喂原始矩阵，非正价在这里再兜一次
+    # （负分母翻转符号、0 分母得 ±inf，rank() 会把 +inf 排到榜首）。
     close_wide = close_wide.where(close_wide > 0)
 
     # 有效掩码：停牌日、ST 日标记为无效

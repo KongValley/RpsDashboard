@@ -18,10 +18,18 @@
 | official | `factor_jump`      | 官方复权因子相邻档位 `hfq_scale` 变化超阈值（除权/送转，跨该日的区间收益含送转成分） |
 | official | `negative_offset`  | 官方因子中**在本库数据区间内生效**且负偏移的档位，**只对库内价格确实被压到极小的股票记录**（否则 789 只里绝大多数根本没受影响） |
 
-**刻意不做的事**：不自动把跨异常的区间收益置空。那是会**静默改变已公布回测结论**
-的口径改动（与「非正价置空」不同，后者是数学上无意义的比值），必须先由使用者判断。
-本模块只负责把异常摆到台面上：`cli quality` 打印、结果进 `adjust_event`、
-`cli status` 显示一行汇总、`cli compute-rps` 提醒一句。
+**自动剔除的边界**（写死在这里，避免口径漂移）：
+
+- **自动**：区间收益的**端点价**低于 `config.ANOMALY_MIN_PRICE`（默认 1 元，含 ≤0）
+  时，`close(t)/close(t−N)` 直接不算 —— 见 `matrix.build_close_matrix`。
+  比值只取决于两个端点，所以「端点落在被放大的价位」才是真正的失真条件；
+  实测 600076 在 2024-12-18 的 `ret60` 因此在重算后变为 NULL。
+- **不自动**：端点价都正常、只是窗口「跨过」了某个负偏移档位或因子跳变日 ——
+  这类窗口里的收益是**真实价格**与**送转成分**的混合，按什么比例裁剪是判断而不是事实，
+  自动处理会静默改变已公布的回测结论。这类情况只报告（本模块 + `cli quality`）。
+
+本模块负责把两类异常摆到台面上：`cli quality` 打印、结果进 `adjust_event`、
+`cli status` 显示一行汇总、`cli compute-rps` 结束时提醒一句。
 """
 
 from __future__ import annotations
@@ -30,6 +38,7 @@ import sqlite3
 
 import pandas as pd
 
+from .. import config
 from .limits import BSE_PREFIXES, IPO_NO_LIMIT_DAYS
 
 #: 因子跳变告警阈值：scale 相对变化超过该比例（如 10 送 10 = 100%）才记录
@@ -38,8 +47,9 @@ FACTOR_JUMP_THRESHOLD = 0.3
 #: 库内单日跳变阈值（小数）：超过任何板块的涨跌停上限（北交所 30%）
 HFQ_JUMP_THRESHOLD = 0.31
 
-#: 「极小后复权价」阈值（元）：低于它，百分比收益会被显著放大
-TINY_PRICE = 1.0
+#: 「极小后复权价」阈值（元）：与 RPS / 回测的**端点剔除**共用同一个开关
+#: （`config.ANOMALY_MIN_PRICE`，环境变量 RPSBOARD_ANOMALY_MIN_PRICE 可调）
+TINY_PRICE = config.ANOMALY_MIN_PRICE
 
 #: kind → 人话（CLI / README 共用）
 KIND_LABELS = {
@@ -112,12 +122,13 @@ def scan_price_levels(
 ) -> pd.DataFrame:
     """库内后复权价极小 / 非正的 (symbol, date) 明细。
 
-    `0 < close < tiny` 是**真正需要人工判断**的那一类：它既不是脏数据（值算得出来），
-    也不是正常价位（百分比收益被放大到失真）。`close <= 0` 已在 RPS 里置空，
-    这里留档只为说明影响面。
+    判据与自动剔除**同界**（`close < tiny`，默认 1 元）：`0 < close < tiny` 是真正
+    需要人工判断的那一类 —— 既不是脏数据（值算得出来），也不是正常价位（百分比收益
+    被放大到失真）；`close <= 0` 已在 RPS 里置空，这里留档只为说明影响面。
+    恰好等于门槛（如 1.00 元整）的行**保留**，所以不在这里报。
     """
     df = pd.read_sql_query(
-        "SELECT symbol, date, close FROM daily_bar WHERE close <= ? ORDER BY symbol, date",
+        "SELECT symbol, date, close FROM daily_bar WHERE close < ? ORDER BY symbol, date",
         conn, params=(tiny,),
     )
     if df.empty:
@@ -241,8 +252,8 @@ def summary(conn: sqlite3.Connection) -> dict:
 
 
 def tiny_price_symbols(conn: sqlite3.Connection, tiny: float = TINY_PRICE) -> list[str]:
-    """库内 `close <= 0` 或 `0 < close < tiny` 的股票（异常的实际落点）。"""
+    """库内 `close < tiny`（含穿零）的股票 —— 与自动剔除同界。"""
     rows = conn.execute(
-        "SELECT DISTINCT symbol FROM daily_bar WHERE close <= ? ORDER BY symbol",
+        "SELECT DISTINCT symbol FROM daily_bar WHERE close < ? ORDER BY symbol",
         (tiny,)).fetchall()
     return [r["symbol"] for r in rows]

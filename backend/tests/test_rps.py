@@ -326,3 +326,64 @@ def test_thin_cross_section_dates_dropped(tmp_path):
         ).fetchone()["n"] > 0, "双股票那段仍应有行"
     finally:
         conn.close()
+
+
+def test_tiny_price_endpoints_excluded(monkeypatch):
+    """端点价 < 门槛（默认 1 元）时该区间收益不算 —— 这是两处失真的共同来源：
+
+    - 分母极小 → 正常的原始价涨幅被放大成几百个百分点（600076 的 ret60 = +998%，
+      当天原始价只涨了约 8%）；
+    - 分子极小 → 比值接近 −100%，同样不是「区间涨幅」。
+
+    区间收益只取决于**两个端点**，所以按端点剔除，而不是「跨过异常日整段作废」。
+    """
+    from rpsboard import config as cfg
+    from rpsboard.analytics.backtest import _forward_return
+
+    monkeypatch.setattr(cfg, "ANOMALY_MIN_PRICE", 1.0)
+    dates = pd.bdate_range("2026-01-05", periods=8)
+    prices = {
+        "000001": [10.0] * 8,                                   # 正常
+        "000002": [5.0, 5.0, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],     # 第 3 根起穿到 1 元以下
+        "000003": [1.0, 1.2, 1.5, 1.1, 1.3, 1.4, 1.6, 1.8],     # 刚好 1 元 → 仍在门槛内
+    }
+    rows = [{"symbol": s, "date": d, "close": c, "pct_chg": 0.0,
+             "tradestatus": 1, "is_st": 0}
+            for s, arr in prices.items() for d, c in zip(dates, arr)]
+    df = pd.DataFrame(rows)
+
+    close = build_close_matrix(df)
+    assert pd.isna(close.loc[dates[2], "000002"]), "极小价端点应被置空"
+    assert pd.notna(close.loc[dates[0], "000003"]), "1 元整不该被剔除"
+
+    frames = rps.compute_rps_frames(
+        close, build_tradable_matrix(df), build_st_flags(df),
+        exclude_st=False, periods=(2,),
+    )
+    ret2 = frames["ret2"]
+    # 000002：第 3 根起分子 <1 元、第 7 根的分母也 <1 元 → 全部不可算
+    for i in range(2, 8):
+        assert pd.isna(ret2.loc[dates[i], "000002"]), f"{dates[i]} 端点异常却没置空"
+    # 000003：两端都 ≥1 元 → 正常算得出来（证明没有整体误伤）
+    assert ret2.loc[dates[2], "000003"] == pytest.approx(1.5 / 1.0 - 1.0)
+    assert ret2.loc[dates[-1], "000003"] == pytest.approx(1.8 / 1.4 - 1.0)
+
+    # 回测的前瞻收益用同一个 close 矩阵 → 同一套端点规则
+    fwd = _forward_return(close, 2)
+    assert pd.isna(fwd.loc[dates[2], "000002"]), "卖出端点也是极小价 → 不可算"
+    assert pd.isna(fwd.loc[dates[0], "000002"]), "买入端点极小 → 不可算"
+    assert fwd.loc[dates[0], "000003"] == pytest.approx(1.5 / 1.0 - 1.0)
+
+
+def test_anomaly_floor_zero_keeps_low_prices(monkeypatch):
+    """门槛设为 0 时只剔除非正价（旧行为），低价股照常参与。"""
+    from rpsboard import config as cfg
+
+    monkeypatch.setattr(cfg, "ANOMALY_MIN_PRICE", 0.0)
+    dates = pd.bdate_range("2026-01-05", periods=4)
+    rows = [{"symbol": "000002", "date": d, "close": c, "pct_chg": 0.0,
+             "tradestatus": 1, "is_st": 0}
+            for d, c in zip(dates, [0.5, -0.1, 0.6, 0.7])]
+    close = build_close_matrix(pd.DataFrame(rows))
+    assert pd.notna(close.loc[dates[0], "000002"]), "门槛 0 时 0.5 元应保留"
+    assert pd.isna(close.loc[dates[1], "000002"]), "非正价永远剔除"
