@@ -33,6 +33,22 @@ def _small_cross_section(monkeypatch):
     monkeypatch.setattr(config, "MIN_CROSS_SECTION", 2)
 
 
+@pytest.fixture(autouse=True)
+def _no_real_push(monkeypatch):
+    """测试期间一律不发真推送（同进程与子进程都挡）。
+
+    `config` 在导入时就把仓库根 `.env.local` 的真实专属地址读进了 `os.environ`
+    与 `config.SHOWDOC_PUSH_URL`。而 `broker.exec._notify_disconnect()` 只看
+    `notify.configured()`，所以断线用例一跑就会**真的**把测试消息推到开发者手机上
+    （2026-10-15 实测：一次全量 pytest 收到两条）。
+
+    要测真实 HTTP 路径的用例（`test_notify_http.py`）在自己的 fixture 里重新设成
+    本地临时服务地址，覆盖这里的空串。
+    """
+    monkeypatch.setattr(config, "SHOWDOC_PUSH_URL", "")
+    monkeypatch.setenv("SHOWDOC_PUSH_URL", "")
+
+
 @pytest.fixture()
 def trade_db(tmp_path, monkeypatch):
     """交易链路的合成库：40 只 × 320 天，含 rps_daily 与宽松的实测涨跌停价。

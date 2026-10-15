@@ -252,7 +252,10 @@ def test_disconnect_during_execution_marks_plan_halted(trade_db, placed, no_halt
     path, plan_date, _ = trade_db
 
     def drop_then_place(**kw):
-        monkeypatch.setattr(qmt, "LAST_DISCONNECT_AT", datetime.now(), raising=False)
+        # 断线时间必须落在本次执行窗口内。用注入的 now（IN_HOURS）而不是
+        # datetime.now()：后者取机器时区（CI runner 是 UTC，本机是 UTC+8），
+        # 会让同一条断言在两个环境给出相反结果。
+        monkeypatch.setattr(qmt, "LAST_DISCONNECT_AT", IN_HOURS, raising=False)
         return 900001
 
     monkeypatch.setattr(qmt, "place", drop_then_place)

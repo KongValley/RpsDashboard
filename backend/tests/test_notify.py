@@ -29,6 +29,17 @@ def test_push_requires_configuration(monkeypatch):
     assert ".env.local" in str(exc.value)
 
 
+def test_whole_suite_cannot_reach_the_real_push_channel():
+    """全局守卫（conftest._no_real_push）：本机上配了真地址，跑测试也发不出去。
+
+    没有这道守卫时，断线用例会走 `_notify_disconnect()` 把测试消息真的推到开发者
+    微信上（2026-10-15 实测），而且只有手工去 `.env.local` 删掉才停得下来。
+    """
+    assert notify.configured() is False
+    with pytest.raises(notify.NotifyError):
+        notify.push("t", "c")
+
+
 def test_format_summary_lists_details_and_truncates():
     """超过上限的明细要折叠成「还有 N 条」，标题带条数与日期。"""
     hits = [_hit(f"{i:06d}") for i in range(notify.MAX_DETAIL + 5)]
