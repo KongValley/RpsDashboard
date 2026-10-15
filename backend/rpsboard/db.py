@@ -203,6 +203,127 @@ CREATE TABLE IF NOT EXISTS collect_log (
   rows_affected INTEGER,
   message       TEXT
 );
+
+-- ── QMT 交易（T 只读 / P2 影子 / P3 券商模拟盘；**没有实盘**）─────────
+-- 计划：口径来自回测的 entry_mask，等权目标仓位；mode 只有 paper / sim
+CREATE TABLE IF NOT EXISTS trade_plan (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  plan_date   TEXT NOT NULL,
+  mode        TEXT NOT NULL,
+  params      TEXT NOT NULL,
+  cash_budget REAL NOT NULL,
+  status      TEXT NOT NULL,          -- planned / executed / halted / partial
+  note        TEXT,
+  created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_trade_plan_date ON trade_plan(plan_date);
+
+CREATE TABLE IF NOT EXISTS trade_plan_item (
+  plan_id       INTEGER NOT NULL,
+  symbol        TEXT NOT NULL,
+  target_volume INTEGER NOT NULL,          -- 绝对目标股数（对账直接比它）
+  ref_price     REAL NOT NULL,
+  plan_price    REAL,
+  side          TEXT NOT NULL,        -- buy / sell / hold（相对建计划时的现状）
+  reason        TEXT NOT NULL,        -- ok / suspended / price_out_of_limit / no_tick …
+  -- 建计划那一刻的持股数：用来判断「计划建好之后账户有没有被别人动过」，
+  -- 否则执行前无从区分「按计划补足差额」与「计划已过期」。
+  held          INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (plan_id, symbol)
+);
+
+-- 委托：幂等键 (trade_date, symbol, side, plan_id) —— 重跑不会重复发单
+CREATE TABLE IF NOT EXISTS trade_order (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  plan_id         INTEGER,
+  trade_date      TEXT NOT NULL,
+  symbol          TEXT NOT NULL,
+  side            TEXT NOT NULL,
+  volume          INTEGER NOT NULL,
+  price           REAL NOT NULL,
+  status          TEXT NOT NULL,      -- pending/submitted/canceling/part/filled/canceled/rejected/unknown
+  broker_order_id INTEGER,
+  err_id          INTEGER,
+  err_msg         TEXT,
+  created_at      TEXT NOT NULL,
+  updated_at      TEXT NOT NULL,
+  UNIQUE (trade_date, symbol, side, plan_id)
+);
+CREATE INDEX IF NOT EXISTS idx_trade_order_date ON trade_order(trade_date);
+
+-- 成交：主键用 (broker_order_id, broker_trade_id)；影子成交用**负的**
+-- broker_order_id（-plan_id），因此影子行与真实成交天然不冲突。
+CREATE TABLE IF NOT EXISTS trade_fill (
+  trade_date      TEXT NOT NULL,
+  broker_order_id INTEGER NOT NULL,
+  broker_trade_id INTEGER NOT NULL,
+  symbol          TEXT NOT NULL,
+  side            TEXT NOT NULL,
+  volume          INTEGER NOT NULL,
+  price           REAL NOT NULL,
+  traded_at       TEXT NOT NULL,
+  PRIMARY KEY (broker_order_id, broker_trade_id)
+);
+CREATE INDEX IF NOT EXISTS idx_trade_fill_date ON trade_fill(trade_date);
+
+-- 持仓快照：只由 `cli trade status/snapshot` 写入，页面与对账都只读它
+CREATE TABLE IF NOT EXISTS position_snapshot (
+  snap_date      TEXT NOT NULL,
+  taken_at       TEXT NOT NULL,
+  symbol         TEXT NOT NULL,
+  volume         INTEGER NOT NULL,
+  can_use_volume INTEGER,
+  avg_price      REAL,
+  market_value   REAL,
+  PRIMARY KEY (snap_date, symbol)
+);
+CREATE INDEX IF NOT EXISTS idx_position_snapshot_taken ON position_snapshot(taken_at);
+
+-- ── 自建模拟盘（mode='local'；**不连任何券商**）────────────────────
+-- 撮合用库内后复权日 K：T 日收盘后下单 → T+1 日内按限价判定成交。
+-- 现金是账户的**当前**余额（单行），持仓与净值按日留档，便于事后审计。
+CREATE TABLE IF NOT EXISTS paper_account (
+  id          INTEGER PRIMARY KEY CHECK (id = 1),   -- 只有一个模拟账户
+  cash        REAL NOT NULL,                        -- 可用现金（元）
+  created_at  TEXT NOT NULL,
+  updated_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS paper_position (
+  trade_date  TEXT NOT NULL,       -- 该日收盘时的持仓快照
+  symbol      TEXT NOT NULL,
+  volume      INTEGER NOT NULL,
+  avg_price   REAL NOT NULL,       -- 累计成本（含费用）/ 股
+  close       REAL NOT NULL,       -- 该日后复权收盘价
+  market_value REAL NOT NULL,
+  PRIMARY KEY (trade_date, symbol)
+);
+CREATE INDEX IF NOT EXISTS idx_paper_position_date ON paper_position(trade_date);
+
+-- 净值曲线：initial_cash 固定一次，之后用 total / nav（倍数）看
+CREATE TABLE IF NOT EXISTS paper_nav (
+  trade_date    TEXT NOT NULL,
+  cash          REAL NOT NULL,
+  market_value  REAL NOT NULL,
+  total         REAL NOT NULL,
+  nav           REAL NOT NULL,     -- total / initial_cash
+  n_positions   INTEGER NOT NULL,
+  filled_orders INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (trade_date)
+);
+CREATE TABLE IF NOT EXISTS paper_meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
+-- 因子评估结果：每次 `cli factors` 一行，payload 是完整 JSON（约 30 KB）。
+-- 页面只读最新一行；保留历史是为了能对比「改过因子之后 IC 变了多少」。
+-- 因子矩阵本身**不落库**（13 × 1285 × 5574 × 8B ≈ 750 MB），落库的只有这份结果。
+CREATE TABLE IF NOT EXISTS factor_eval (
+  run_at  TEXT PRIMARY KEY,
+  params  TEXT NOT NULL,
+  payload TEXT NOT NULL
+);
 """
 
 

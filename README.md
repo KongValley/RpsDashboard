@@ -14,8 +14,11 @@ RPS 把全市场个股按区间涨幅做**横截面百分位排名**：RPS=90 �
 | **Δ名次** | 与 N 个交易日前的名次对比，看「这只票是最近在走强还是掉队」 |
 | **板块强弱** | **证监会行业 / 概念题材**两套口径，等权涨幅的横截面 RPS + 领涨股 + 行业×周期热力图（**行按当前周期独立排序**） |
 | **个股详情** | 单只股票的多周期 RPS 曲线 vs 后复权价格双轴图、跑赢全市场分位、所属行业强弱 |
-| **策略回测** | 净值 vs 沪深300、风险指标、**RPS 分档前瞻收益**（自动解读单调方向）、**大盘择时**、**交易成本**、**涨跌停可交易性** |
+| **策略回测** | 净值 vs 沪深300、风险指标、**RPS 分档前瞻收益**（自动解读单调方向）、**大盘择时**、**交易成本**、**涨跌停可交易性**；可选 **Top-N 选股**与**多因子合成分**信号源 |
+| **因子研究** | 13 个价量/板块因子的**全样本 IC/IR、5 档分层收益、自相关、相关矩阵**（`cli factors` 落库 + 页面只读）；合成分（方向取自滚动训练窗的 IC 符号）可直接当回测与模拟盘的信号源 |
 | **自选预警** | 自选股池（行首 ☆ 即加入）+ 条件预警规则（RPS 阈值 / 三升底 / 涨停）与命中记录；命中可**手动**推送到微信 |
+| **自建模拟盘** | 不连任何券商的撮合引擎：按回测口径出计划、按日 K 逐笔撮合、产出净值曲线与持仓；**不需要券商账号**，详见「自建模拟盘」 |
+| **QMT 接入** | 迅投 miniQMT **只读 / 影子 / 券商模拟盘**：账户与持仓快照、交易计划、影子成交与成本校准；**没有实盘分支**，详见「QMT 交易接入」 |
 | **性能监测** | 后端 ASGI 中间件逐请求计时（`x-perf-ms`）+ 前端上报，两端在同一接口里对照；详见「性能监测点」 |
 | **一键更新** | 页面按钮触发后台线程串起「日K → 涨跌停 → 行业分类（仅空表）→ RPS → 形态 → 预警」，实时显示阶段与失败原因；命令行入口 `update.bat` |
 
@@ -64,6 +67,9 @@ uv sync --extra dev            # 按 uv.lock 装出可复现的环境（推荐�
 # 三升底形态
 .venv\Scripts\python.exe -m rpsboard.cli patterns
 
+# 多因子评估（13 个因子的 IC/IR/分层/相关矩阵；写 factor_eval 表，页面只读它）
+.venv\Scripts\python.exe -m rpsboard.cli factors --period 60 --hold 20
+
 # 复权因子异常检测（只报告不改口径；--offline 可跳过联网）
 .venv\Scripts\python.exe -m rpsboard.cli quality
 
@@ -75,7 +81,14 @@ uv sync --extra dev            # 按 uv.lock 装出可复现的环境（推荐�
 命令行回测：
 
 ```powershell
+# 现状口径：RPS60 ≥ 80 的全市场等权
 .venv\Scripts\python.exe -m rpsboard.cli backtest --period 60 --threshold 80 --hold 20
+
+# Top-N 选股（--select-top 与 --threshold **叠加**：阈值 0 = 全池前 N）
+.venv\Scripts\python.exe -m rpsboard.cli backtest --period 60 --threshold 0 --hold 20 --select-top 20
+
+# 多因子合成分（13 因子等权合成，方向取自滚动训练窗的 IC 符号）
+.venv\Scripts\python.exe -m rpsboard.cli backtest --period 60 --threshold 0 --hold 20 --select-top 20 --signal composite
 ```
 
 ### 3. 启动
@@ -466,6 +479,72 @@ RPS 与回测的前瞻收益共用同一个矩阵）：
 > 零成本口径的历次修正（+5.92% → +5.48% → +5.49% → **−25.33%**）见上一节的注，
 > 每一条都在 git 历史里有对应提交。
 
+### 多因子合成分 · Top-N 选股（2026-10-15 新增，同一窗口实测）
+
+同一窗口、同一持有期（60/20）、零成本与含成本各跑一遍。**`--select-top` 与
+`--threshold` 是叠加关系**：阈值 0 = 全池前 N 只。
+
+| 策略 | 总收益（零成本） | 总收益（含成本） | 年化（含成本） | 最大回撤（含成本） | 夏普 |
+|---|---|---|---|---|---|
+| RPS60 ≥ 80 **全市场**等权（现状） | −25.33% | **−63.15%** | −17.49% | −70.59% | −4.80 |
+| RPS 打分 **Top-20** 等权 | −94.02% | **−94.84%** | −43.52% | −95.07% | −9.41 |
+| **合成分 Top-20** 等权 | +37.36% | **+19.67%** | +3.57% | −31.18% | 0.88 |
+
+三件事值得单独说：
+
+1. **RPS 的「前 20 名」比全市场更差**（−63%→−95%）。这不是新 bug：上一节的分档表
+   已经给出机理——**RPS 最高档的 20 日前瞻收益最低（−0.32%）**，所以只买最靠前的
+   20 只，等于把这个反转效应集中下注。单因子 RPS 在任何一种选股方式下都不是好信号。
+2. **合成分 Top-20 转正**（含成本 +19.67%）不是「调出来的」：因子方向由**滚动训练窗的
+   IC 符号**决定（窗口整体落在 `t-hold` 之前，零幅度拟合），权重等权，**这一轮没有为了
+   好看回头改因子池或权重**。它转正的直接原因是**方向反转**——11 个因子的全样本 IC
+   全是负的（下表），于是合成后买的是「低波动 / 低振幅 / 低成交额 / 弱动量」那一侧，
+   即**反转策略**，与分档表的反转向下完全一致。
+3. 合成分的分档（零成本，五档）：+1.24% / +1.34% / +1.42% / +1.37% / **+0.74%**——
+   顶部四档基本持平、最低档明显更低，是**弱正向**而非强单调；Top-20 拿到的收益
+   更多来自「只持有分数最高的那一小撮」，而不是整条曲线的斜率。
+
+因子评估台（`cli factors`，全样本研究口径）：
+
+| 因子 | IC 均值 | IC_IR | 胜率 | 样本 | 自相关 |
+|---|---|---|---|---|---|
+| amt20（20 日平均成交额） | −0.1165 | −0.76 | 22.1% | 1,280 | 0.999 |
+| amp20（20 日平均振幅） | −0.1003 | −0.43 | 32.9% | 1,272 | 0.996 |
+| vol20（20 日波动率） | −0.0985 | −0.45 | 31.7% | 1,271 | 0.986 |
+| mom（区间动量，= ret60） | −0.0848 | −0.50 | 29.6% | 1,231 | 0.975 |
+| rev20 / amt_ratio / bias20 / ind_rps / rev5 / near_high250 / con_rps | −0.0760 ~ −0.0220 | −0.60 ~ −0.16 | 29%~47% | 1,042~1,286 | 0.91~0.99 |
+| age / triple | — | — | — | **0** | — |
+
+**11 个可用因子的 IC 全为负、胜率全部低于 50%** —— 这正是上表「反转」二字的来源，
+也解释了为什么「按 RPS 排在最前」是最差的选法。`age` 与 `triple` 在本库上退化为
+全 NaN（当天超过半数股票同值 → MAD = 0），见「未完成项」一节的说明。
+
+相关矩阵里三对 `|corr| ≥ 0.7` 的是：`vol20 × amp20 = 0.92`、`bias20 × rev20 = 0.82`、
+`bias20 × rev5 = 0.72` —— 合成时它们其实在重复押同一个注（等权合成没有去重，
+这是已知取舍）。`ind_rps × mom = 0.37` 说明行业 RPS 与个股动量确实不是同一件事。
+
+**必须一起读的边界**：① 幸存者偏差（当前证券池回溯，20 只持仓的集中度会放大它）；
+② 窗口只有 5.19 年、64 个调仓点，一个反转风格的两三年就能解释大部分差异；
+③ 成本已按**实际持仓只数**计（20 只时时最低佣金 5 元摊到每只 0.005%，比千只组合更重），
+所以 +19.67% 不是「成本口径放宽」换来的；④ 因子清单与等权方案是**这一轮选的**
+（研究者自由度），方向与权重没有拟合，但清单本身就是选择。
+**结论按「三组数字并排记录」处理，不预设方向，也不为了让合成分好看而回头调参。**
+
+### 自建模拟盘的三组对照（2026-10-15 实测）
+
+同一区间（2026-06-01 ~ 2026-10-14，91 个交易日，100 万初始资金，`trade run --max-positions 20`）：
+
+| 信号源 | 期末权益 | 收益 | 最大回撤 | 期末持仓 | 计划/委托/成交 | 累计费用 |
+|---|---|---|---|---|---|---|
+| 合成分 | 967,924 | **−3.21%** | 11.21% | 20 只 | 5 / 179 / 176 | 7,509 |
+| RPS（对照） | 755,396 | **−24.46%** | 43.20% | 22 只 | 5 / 133 / 126 | 4,076 |
+
+模拟盘是**逐笔撮合**出来的（限价挂不进去就不成交、涨停买不进、停牌顺延、最低佣金与
+印花税逐笔计），与回测的「按前瞻收益复利」不是同一套算法，所以两者的绝对数字不可比；
+可比的是**方向与相对关系**：这 91 天里合成分明显优于 RPS，与回测的结论一致。
+「期末持仓 22 只 > max_positions 20」是撮合侧的既有事实（未成交的买单不会立刻补），
+已在上一轮用 `liquidate_orphans` 收口，不再是「只进不出」的滚雪球。
+
 **成本口径**（`backend/rpsboard/analytics/costs.py`）：
 
 | 项 | 费率 | 方向 |
@@ -631,7 +710,7 @@ cd frontend; npm run lint; npm run build             # 前端 lint + 构建
 全部测试离线运行，使用合成数据，不触网。
 
 - **覆盖率**：`pytest` 默认带 `--cov=rpsboard --cov-report=term-missing`；**门槛
-  `--cov-fail-under=50` 只写在 CI 命令里**（全套 **196 项测试、实测 TOTAL 66%**，门槛按实测值
+  `--cov-fail-under=50` 只写在 CI 命令里**（全套 **304 项测试、实测 TOTAL 67%**，门槛按实测值
   向下取整）——放进 `addopts` 会让「只跑一个测试文件」也因总覆盖率不足而失败。`cli.py` 与
   `sources/*` 目前覆盖较少（本轮补了 tradestatus / price-limits / backfill 退出码的用例），
   门槛按实测值设，不虚设高线。
@@ -841,6 +920,17 @@ conn.commit()
 
 ## 未完成项与已知边界
 
+- **多因子库的边界（2026-10-15 新增）**：13 个因子**全部由现有表推导**，不新增数据源。
+  库里没有股本 / 财报（`security_master` 只有 symbol/name/exchange/ipo_date/is_st），
+  所以市值 / PE / PB 这类基本面因子**不在范围内**；也**不做行业中性化**（那会把
+  「行业 RPS」这个因子本身中性化掉，与它的初衷冲突）。其中 `age`（上市交易日数）与
+  `triple`（三升底确认日）在现有数据上**退化为全 NaN**：一个横截面里超过半数的股票
+  取同一个值（窗口起点统一 → 老股上市天数完全相同；形态当天命中数远少于半数）
+  → MAD = 0 → 该行没有区分度、不参与合成（页面显示 `—`、样本 0，`cli factors` 照常
+  打印整张表）。要救它们得换口径（例如按上市年份分桶），或从 `FACTOR_LABELS` 里摘掉；
+  本轮按「显示真实情况、不假装有信号」处理。因子矩阵**不落库**
+  （13 × 1285 × 5574 × 8B ≈ 750 MB），落库的只有评估结果（约 30 KB 的 JSON，
+  `factor_eval` 表，页面只读最新一行）。
 - **P3 · 交易日历覆盖**：`/api/meta/dates` 取自 `rps_daily`（不是 `trade_calendar`，
   后者已删除）。实测 RPS 覆盖 **1,285** 个交易日（`daily_bar` 有 1,734 个不同日期）：
   差的 449 天里 **433 天横截面不足 1,000 只股票**（`config.MIN_CROSS_SECTION`，
@@ -892,27 +982,38 @@ backend/rpsboard/
   config.py              周期（PERIODS / period_columns）、路径、数据源选择、交易所判定
   db.py                  SQLite schema、旧库迁移（ensure_period_columns / ensure_indexes）与幂等写入
   cli.py                 init / status / backfill(=sync) / update / tradestatus / quality
-                         / price-limits / concept / patterns / compute-rps / backtest
-                         / watch / alert / notify
+                         / price-limits / concept / patterns / factors / compute-rps
+                         / backtest / watch / alert / notify / trade（含自建模拟盘 run/paper）
   sources/
     tdxnet_src.py        【唯一数据源】eltdx 通达信协议，TCP 直连，209 秒全市场
     board_src.py         概念/题材板块清单与成分股
     limit_src.py         涨跌停价（eltdx daily_price_limits）+ 并发续采
     base.py              SourceError 等公共定义
+  broker/                QMT 接入（纯标准库；项目里只有 qmt.py 知道要另起 3.11 进程）
+    qmt.py               子进程 + 一行 JSON 协议，8 个 op 的薄封装，断线标记
+    bridge.py            3.11 侧：导入客户端 xtquant，stdout 只回一行 JSON（限价单）
+    plan.py              交易计划（候选取自 backtest.entry_mask）+ 影子成交与成本校准
+    risk.py              发单前三道闸（halt / 时段 / 现金 / 集中度 / 换手）
+    exec.py              券商模拟盘执行（幂等 + 对账 + 回报同步 + 断线中止）
+    sim.py               自建撮合引擎（mode=local）：限价/涨跌停/停牌/费用 + 逐日循环
   analytics/
     matrix.py            daily_bar → 日期×股票 宽矩阵
     rps.py               RPS 引擎 + 板块/概念 RPS
-    backtest.py          横截面动量回测（共振掩码 resonance_mask）
+    backtest.py          横截面动量回测（entry_mask / resonance_mask；计划与回测共用选股口径）
+    factors.py           13 个因子的库 + 标准化 + IC/分层/相关矩阵 + 等权合成分（含滚动训练窗）
     costs.py             交易成本模型
     limits.py            涨跌停规则 + 板块比例推算（实测缺失时兜底）
     quality.py           复权因子异常检测（官方因子 + 库内跳变，只报告）
     alerts.py            预警规则评估
     patterns.py          三升底等形态
-  api/                   FastAPI 路由（除 watchlist.py 外只读 SQLite，不联网）+ perf.py 性能监测
-    watchlist.py         **全 API 唯一的写入口**（watchlist / alert_rule / alert_hit）
+  api/                   FastAPI 路由（除 watchlist.py / trade.py 的两个写入口外只读 SQLite，不联网）
+                         + perf.py 性能监测
+    watchlist.py         自选 / 预警规则的写入口
+    factors.py           因子评估只读接口（读 factor_eval 最新一行，不现算）
+    trade.py             交易只读接口 + halt 开关 + 后台重取快照（唯一连客户端的端点）
 frontend/src/
   api/index.js           唯一网络出口（顺带计时上报、超时中止）
-  views/                 Rankings / Sectors / StockDetail / Backtest / Watchlist
+  views/                 Rankings / Sectors / StockDetail / Backtest / Factors / Watchlist / Trade
   components/RpsTable.vue  排行榜表格（RPS 列随 period 参数变化）
   composables/           usePeriods.js（周期清单唯一来源）/ useLatestRequest.js（竞态守卫）
                          / useResizableColumns.js
@@ -979,6 +1080,150 @@ POST `title`/`content` 到你的专属地址，消息进微信）。**只手动�
 - `.env.local` 由 `backend/rpsboard/config.py` 在导入时读取（已存在的环境变量优先），
   其它 `RPSBOARD_*` 变量也可以放这个文件里。
 
+## 自建模拟盘（mode=local）：不连任何券商
+
+QMT 的**股票**模拟账户是券商提供的（客户端自带的 11 个「模拟」通道全是期货），
+拿不到就没有交易对手。但 RPS 策略要验的东西 —— 限价挂不挂得进去、整手取整吃掉
+多少、停牌顺延几次、最低佣金对小资金的惩罚 —— 用**库里已有的后复权日 K** 就能回答，
+而且这份数据就是回测用的同一份，结论可以直接对照。
+
+```powershell
+# 在区间上逐日「出计划 → 次日撮合 → 盯市」
+.venv\Scripts\python.exe -m rpsboard.cli trade run --from 2026-01-01 --cash 1000000 \
+    --period 60 --threshold 80 --hold 20 --max-positions 20
+
+.venv\Scripts\python.exe -m rpsboard.cli trade paper   # 打印净值与持仓
+```
+
+页面上「交易 → 自建模拟盘」有净值曲线与持仓明细。**不需要任何券商账号，
+也不连 QMT**（参考价直接取库内 `daily_bar.close`）。
+
+### 撮合规则（刻意保守，宁可少成交也不高估）
+
+| 规则 | 内容 |
+|---|---|
+| 下单 | T 日收盘后按 `close(T) ∓0.5%` 生成**限价单**，T+1 日内撮合 |
+| 成交 | 买单 `low(T+1) ≤ 限价`、卖单 `high(T+1) ≥ 限价` 才算挂进去，成交价取**限价本身** |
+| 涨跌停 | 涨停日买不进、跌停日卖不掉（收益率比法，与 `analytics/limits.py` 同一条规则） |
+| 停牌 | 当日无 bar 或 `tradestatus=0` → 订单**顺延**到下一交易日，不撤单 |
+| 资金 | 现金/持仓不够时按**整手**缩减，全不够则拒单，绝不下成零股或透支 |
+| 费用 | 逐笔走 `analytics/costs.py` 的 `CostModel`（佣金最低 5 元、印花税按日期分段、过户费、滑点） |
+| 调仓 | 每 `hold` 个交易日重平衡一次；**掉出候选的持仓清仓**（否则组合只进不出） |
+| 仓位 | 等权 `max_positions` 只；每期预算是**总权益 × 0.95**（现金 + 持仓市值，不是只有现金） |
+
+### 实测（2026-10-15，100 万本金）
+
+| 口径 | 结果 |
+|---|---|
+| 区间 | 2026-06-01 ~ 2026-10-14，91 个交易日，5 次调仓 |
+| 委托 / 成交 | 133 笔 / 126 笔（7 笔限价未触及，0 笔被涨停或停牌顺延） |
+| 期末 | 755,396 元（**−24.46%**），最大回撤 **43.20%**，期末持仓 22 只 |
+| 累计费用 | 4,075.53 元（约本金的 0.41%） |
+
+对照：同一策略的**零成本全市场等权**回测在完整 5.19 年窗口上是 **−25.33%**，
+含成本 **−63.15%**。模拟盘的 −24.46% 与之同量级，且这里每一笔都是真实撮合出来的
+（限价挂不上就真的没成交，费用逐笔扣），不是把前瞻收益乘进净值。
+
+## QMT 交易接入（只读 / 影子 / 券商模拟盘）
+
+接的是迅投 QMT 客户端的 **miniQMT** 交易接口（`xtquant`）。三档递进：
+
+| 档 | 做什么 | 会发单吗 |
+|---|---|---|
+| **P1 只读** | `trade status` 拉账户与持仓、落 `position_snapshot`；交易页展示；halt 总开关 | 否 |
+| **P2 影子** | `trade plan` 按**回测口径**生成交易计划；`trade shadow` 模拟成交并校准成本假设 | 否 |
+| **P3 券商模拟盘** | `trade execute --plan-id N` 真发**限价单**到券商**模拟**账户 | 是 |
+
+**没有实盘分支**：代码里不存在 `live` 模式，`TRADE_MODE` 只接受 `paper` / `local` /
+`sim`（`local` 是自建模拟盘，不连券商），
+且 `execute` 必须显式带 `--i-know-this-is-sim`。⚠️ **本项目无法识别客户端登的是
+不是实盘资金账户**——若 QMT 客户端登的是实盘账户，误配会发出实盘单。
+触发方式全部手动执行，**不引入守护进程或定时器**。
+
+### 为什么要有子进程
+
+`xtquant` 随客户端自带，且**只提供 cp36~cp311 的编译扩展**
+（`xtpythonclient.pyd` / `IPythonApiClient.pyd`），而项目 venv 是 **Python 3.12**
+→ 直接 `import xtquant.xttrader` 就是 ImportError。所以项目里只有一层知道这件事：
+
+```
+cli / api  →  broker/qmt.py  ──subprocess(一行 JSON)──▶  QMT_PYTHON(=3.11)
+                                                          └─ rpsboard/broker/bridge.py
+                                                             └─ 客户端 site-packages 里的 xtquant
+```
+
+桥只用标准库，那个 3.11 环境**不需要装任何包**；协议是 stdin/stdout 各一行 JSON，
+xtquant 自己的日志被重定向到 stderr，断线事件也从 stderr 走
+（`{"event":"disconnected"}`），绝不污染响应行。
+
+### 配置
+
+全部读 `RPSBOARD_*` 环境变量或仓库根 `.env.local`（已 gitignore）：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `RPSBOARD_QMT_DIR` | `D:\software\QMT` | 客户端根目录 |
+| `RPSBOARD_QMT_USERDATA_MINI` | `<QMT_DIR>\userdata_mini` | 传给 `XtQuantTrader` 的登录态目录 |
+| `RPSBOARD_QMT_PYTHON` | 无（**用到 QMT 时必填**） | 跑桥的解释器，**ABI 必须与 .pyd 一致**。默认留空是刻意的：写死某个用户目录会把本机路径带进公开仓库。用 `uv venv --python 3.11 backend/.venv-qmt` 建一个空环境，再指到 `.venv-qmt\Scripts\python.exe` |
+| `RPSBOARD_QMT_ACCOUNT` | 无（必填） | 资金账号。**凭据级**：日志、接口、页面一律只留后 4 位 |
+| `RPSBOARD_TRADE_MODE` | `paper` | 只允许 `paper` / `local` / `sim`（`local` = 自建模拟盘，见上一节） |
+| `RPSBOARD_TRADE_HALT_FILE` | `data/trade.halt` | halt 哨兵；存在即禁止一切发单 |
+
+客户端必须**保持登录**（`userdata_mini` 的本地 IPC 就是行情与交易网关）。
+`connect()` 返回非 0 即失败——官方接口不会自动重连，也没有自动重连。
+
+### 命令
+
+```powershell
+# P1 只读
+.venv\Scripts\python.exe -m rpsboard.cli trade status      # 账号/现金/持仓 → position_snapshot
+.venv\Scripts\python.exe -m rpsboard.cli trade snapshot    # 只刷持仓快照
+
+# P2 影子
+.venv\Scripts\python.exe -m rpsboard.cli trade plan --period 60 --threshold 80 --hold 20 `
+    --max-positions 20 --mode paper                         # --date 缺省 = rps_daily 最新日
+.venv\Scripts\python.exe -m rpsboard.cli trade shadow --plan-id 1
+.venv\Scripts\python.exe -m rpsboard.cli trade calibrate --days 20
+
+# P3 券商模拟盘（**限价单**；市价单只在实盘生效，模拟环境不支持）
+$env:RPSBOARD_TRADE_MODE = "sim"
+.venv\Scripts\python.exe -m rpsboard.cli trade execute --plan-id 1 --i-know-this-is-sim
+.venv\Scripts\python.exe -m rpsboard.cli trade reconcile   # 现持 vs 计划目标，有差异退出码 3
+.venv\Scripts\python.exe -m rpsboard.cli trade halt --on    # 总开关；--off 解除
+```
+
+退出码：`0` 正常 / `2` 配置或连接失败 / `3` 有差异或有跳过项 / `4` 部分委托失败。
+
+### 计划口径（与回测共用同一份选股代码）
+
+`trade_plan` 的候选来自 `analytics.backtest.entry_mask` —— **回测与交易计划共用
+同一个函数**，否则最先坏掉的是「回测显示买得进、计划却空手」这类没法排查的偏差。
+在回测口径之上，计划额外做了三件事，并把偏差写进 `trade_plan.note`：
+
+| 差异 | 说明 |
+|---|---|
+| 持仓数 | 回测是**全市场等权**（几百只）；计划只取前 `--max-positions` 只 |
+| 委托价 | 回测按滑点率建模成交；计划用 **QMT 最新价 ∓0.5% 的限价**（保守） |
+| 可交易性 | 逐票校验：停牌（`tradestatus=0`）、无实测涨跌停行、越界、取不到价、买不起一手 → 记 reason 并**跳过**（绝不推算一个猜的价位去下单） |
+
+影子成交按**限价**全额成交，用来校准回测里的往返成本假设：
+计划预埋的价格摩擦是 **0.5% × 2 = 1%**，而 `costs.CostModel` 的滑点只有
+**0.05% × 2 = 0.1%**（其 1.14% 里另外含佣金/印花税/过户费）。
+`trade calibrate` 把三栏并排打出来 —— 结论是**回测的滑点假设比计划实际预埋的乐观 10 倍**。
+
+### 发单前的三道闸
+
+1. **风控**（`broker/risk.py`）：halt 哨兵、`mode` 必须是 `sim`、交易时段
+   09:35–11:30 / 13:00–14:57、现金占用 ≤ 95%、单票 ≤ 20% 预算、笔数 ≤ 60、
+   换手 ≤ 4× 预算。**刻意没有绕过开关**（没有 `--force` / `--now`）。
+   单笔金额 < 5000 元的票只剔除自身，其余照发。
+2. **对账**：账户在建计划之后是否被外部动过（手工买卖等）。有差异整批拒绝，
+   **不自动补单**。
+3. **幂等**：`(trade_date, symbol, side, plan_id)` 唯一，重跑不会重复发单。
+
+执行途中连接断开 → 计划标 `halted` 并（若已配置推送）推一条提醒。
+委托/成交全程落库（`trade_order` / `trade_fill`），重跑对账安全。
+
 ## 接口一览
 
 全部挂在 FastAPI 上，`http://127.0.0.1:8000/docs` 有可调试的 Swagger。除
@@ -1000,6 +1245,11 @@ POST `title`/`content` 到你的专属地址，消息进微信）。**只手动�
 | `POST /api/admin/update` · `GET /api/admin/update/status` | 页面「更新数据」：后台线程 + 轮询阶段 |
 | `GET/POST/DELETE /api/watchlist[/{symbol}]` | 自选股（写库） |
 | `GET/POST/DELETE /api/alerts/rules[/{id}]`、`GET /api/alerts/hits`、`/kinds` | 预警规则与命中（写库） |
+| `GET /api/trade/summary` | 交易页一屏数据：模式 / halt / 上次连接状态 / 脱敏账号 / 资金 / 持仓 / 计划 / 委托 / 成交 / 对账。**只读库，不连客户端** |
+| `GET /api/trade/positions` · `/orders?date=` · `/fills?date=` · `/plans?limit=` | 持仓快照 / 当日委托 / 成交 / 计划列表（只读） |
+| `POST /api/trade/halt` | 发单总开关（只增删 `data/trade.halt` 哨兵文件，不连客户端） |
+| `POST /api/trade/snapshot` · `GET /api/trade/snapshot/status` | 页面「重取持仓快照」：后台线程连 QMT + 轮询 |
+| `GET /api/trade/paper` | 自建模拟盘：净值曲线 + 权益摘要 + 当前持仓（**只读库，不连券商**） |
 
 ## 许可证
 

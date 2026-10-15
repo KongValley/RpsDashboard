@@ -88,6 +88,8 @@ def run(
     use_cost: bool = True,
     use_price_limits: bool = True,
     lookback_days: int | None = None,
+    signal: str = "rps",
+    select_top: int | None = None,
 ) -> dict:
     """执行 RPS 策略回测。
 
@@ -111,11 +113,15 @@ def run(
     # 负数会算出「未来」的起始日 → 空窗口 + 空曲线，静默返回没有意义的结果
     if lookback_days is not None:
         lookback_days = max(1, min(int(lookback_days), 2000))
+    if signal not in engine.SIGNALS:
+        signal = "rps"
+    if select_top is not None:
+        select_top = max(1, min(int(select_top), 500))
 
     key = (
         period, round(threshold, 4), hold, rebalance, resonance,
         exclude_st, exclude_limit_up, benchmark, market_filter,
-        use_cost, use_price_limits, lookback_days,
+        use_cost, use_price_limits, lookback_days, signal, select_top,
     )
 
     conn = db.connect()
@@ -139,6 +145,8 @@ def run(
             use_price_limits=use_price_limits,
             cost_model=engine_cost_model(use_cost),
             lookback_days=lookback_days,
+            signal=signal,
+            select_top=select_top,
         )
         payload = {
             "equity_curve": res.equity_curve,

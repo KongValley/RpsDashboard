@@ -160,6 +160,33 @@ def exchange_of(symbol: str) -> str:
     return "sz"
 
 
+# ── QMT 交易接入（只读 / 影子 / 券商模拟盘；**没有实盘分支**）──────
+# 客户端目录。xtquant 随客户端自带，且只提供 cp36~cp311 的编译扩展，
+# 而项目 venv 是 3.12 → QMT 调用必须发生在 3.11 子进程里（见 broker/bridge.py）。
+QMT_DIR = Path(os.environ.get("RPSBOARD_QMT_DIR", r"D:\software\QMT"))
+#: 桥传给 XtQuantTrader(path, …) 的目录（客户端登录态与行情服务都在这里）
+QMT_USERDATA_MINI = Path(os.environ.get(
+    "RPSBOARD_QMT_USERDATA_MINI", QMT_DIR / "userdata_mini"))
+#: 跑桥的解释器。**必须与客户端 .pyd 的 ABI 一致**（客户端只提供到 cp311，
+#: 而项目 venv 是 3.12）。该环境不需要装任何包（桥只用标准库 + 客户端 site-packages）。
+#: **默认值刻意留空**：写死某个用户目录会把本机路径带进公开仓库（换机器也一定是错的）。
+#: 按提示建一个空环境再指过来：`uv venv --python 3.11 backend/.venv-qmt`。
+#: Windows 上 uv 的虚拟环境解释器在 `.venv-qmt\Scripts\python.exe`。
+QMT_PYTHON: Path | None = None
+if (_qmt_python := os.environ.get("RPSBOARD_QMT_PYTHON", "").strip()):
+    QMT_PYTHON = Path(_qmt_python)
+#: 资金账号。**凭据级**：只从环境变量 / `.env.local` 读，日志/接口/页面只留后 4 位。
+QMT_ACCOUNT = os.environ.get("RPSBOARD_QMT_ACCOUNT", "").strip()
+#: 交易模式：paper=影子（按限价模拟成交）、local=**自建模拟盘**（本项目自己撮合，
+#: 不连任何券商）、sim=券商模拟盘（QMT）。
+#: 没有 live —— 实盘不在本项目范围内，见 README「QMT 自动化边界」。
+TRADE_MODE = os.environ.get("RPSBOARD_TRADE_MODE", "paper").strip().lower()
+TRADE_MODES = ("paper", "local", "sim")
+#: halt 哨兵文件：存在即禁止任何发单（CLI `trade halt --on`、页面上的开关都只碰它）
+TRADE_HALT_FILE = Path(os.environ.get(
+    "RPSBOARD_TRADE_HALT_FILE", DATA_DIR / "trade.halt"))
+
+
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import sqlite3
 import threading
 import time
@@ -629,3 +630,234 @@ def test_ranking_direction_with_inner_paging(seeded):
     assert {r["symbol"] for r in p1["rows"]}.isdisjoint({r["symbol"] for r in p2["rows"]})
     joined = [r["rps"] for r in p1["rows"]] + [r["rps"] for r in p2["rows"]]
     assert joined == sorted(joined), "内层分页没有跟着方向走"
+
+
+# ── QMT 交易接口（只读库，不连客户端）──────────────────────────────
+@pytest.fixture()
+def trade_client(seeded, tmp_path, monkeypatch):
+    """交易端点专用：halt 哨兵指到临时目录，summary 缓存每个用例清一次。"""
+    from rpsboard.api import trade as trade_api
+
+    monkeypatch.setattr(config, "TRADE_HALT_FILE", tmp_path / "trade.halt")
+    monkeypatch.setattr(config, "TRADE_MODE", "paper")
+    monkeypatch.setattr(trade_api, "_summary_cache", {})
+    return seeded[0]
+
+
+def _seed_trade_rows(conn, plan_date="2026-01-01"):
+    cur = conn.execute(
+        "INSERT INTO trade_plan(plan_date, mode, params, cash_budget, status, note,"
+        " created_at) VALUES (?,?,?,?,?,?,?)",
+        (plan_date, "paper", '{"max_positions": 1}', 100000.0, "planned",
+         "口径说明", dbmod.now()))
+    pid = int(cur.lastrowid)
+    conn.execute(
+        "INSERT INTO trade_plan_item(plan_id, symbol, target_volume, ref_price, plan_price,"
+        " side, reason, held) VALUES (?,?,?,?,?,?,?,0)",
+        (pid, "000001", 1000, 12.0, 12.1, "buy", "ok"))
+    conn.execute(
+        "INSERT INTO trade_order(plan_id, trade_date, symbol, side, volume, price, status,"
+        " broker_order_id, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (pid, plan_date, "000001", "buy", 1000, 12.1, "submitted", 900001,
+         dbmod.now(), dbmod.now()))
+    conn.execute(
+        "INSERT INTO trade_fill(trade_date, broker_order_id, broker_trade_id, symbol, side,"
+        " volume, price, traded_at) VALUES (?,?,?,?,?,?,?,?)",
+        (plan_date, 900001, 1, "000001", "buy", 1000, 12.1, dbmod.now()))
+    conn.execute(
+        "INSERT INTO position_snapshot(snap_date, taken_at, symbol, volume, can_use_volume,"
+        " avg_price, market_value) VALUES (?,?,?,?,?,?,?)",
+        (plan_date, dbmod.now(), "000001", 500, 500, 12.0, 6000.0))
+    conn.commit()
+    return pid
+
+
+def test_trade_summary_shape_and_no_qmt_call(trade_client, monkeypatch):
+    """summary 必须**只读库**：给 QMT 打桩，一旦被调用就让用例失败。"""
+    import rpsboard.broker.qmt as qmt_mod
+
+    def boom(*_a, **_k):
+        raise AssertionError("summary 不该连 QMT")
+
+    monkeypatch.setattr(qmt_mod, "status", boom)
+    monkeypatch.setattr(qmt_mod, "positions", boom)
+    client = trade_client
+    with dbmod.connect() as conn:
+        _seed_trade_rows(conn)
+    s = client.get("/api/trade/summary").json()
+    assert s["mode"] == "paper" and s["halt"] is False
+    assert s["connected"] is False          # 从没跑过 cli trade status
+    assert s["account_masked"] is None
+    assert s["plan"]["id"] >= 1 and s["plan"]["params"]["max_positions"] == 1
+    assert s["plan"]["items"][0]["symbol"] == "000001"
+    assert s["positions"][0]["volume"] == 500
+    assert s["orders"][0]["status"] == "submitted"
+    assert s["fills"][0]["volume"] == 1000
+    # 现持 500 ≠ 目标 1000 → 报一条差额 500
+    assert s["reconcile"] == [
+        {"symbol": "000001", "side": "buy", "have": 500, "target": 1000, "delta": 500}]
+
+
+def test_trade_summary_reads_last_status_run(trade_client):
+    """账号/资金来自最近一次 cli trade status（message 里的 JSON），且已脱敏。"""
+    import json
+
+    client = trade_client
+    with dbmod.connect() as conn:
+        conn.execute(
+            "INSERT INTO collect_log(run_id, task, source, status, started_at, finished_at,"
+            " message) VALUES ('r1','trade','qmt','success',?,?,?)",
+            (dbmod.now(), dbmod.now(), json.dumps(
+                {"account_masked": "****0123", "asset": {"cash": 5000.0}}, ensure_ascii=False)))
+        conn.commit()
+    s = client.get("/api/trade/summary").json()
+    assert s["connected"] is True
+    assert s["account_masked"] == "****0123"
+    assert s["asset"]["cash"] == 5000.0
+
+
+def test_trade_list_endpoints(trade_client):
+    client = trade_client
+    with dbmod.connect() as conn:
+        _seed_trade_rows(conn, "2026-01-02")
+    assert client.get("/api/trade/positions").json()["rows"][0]["symbol"] == "000001"
+    assert client.get("/api/trade/orders").json()["rows"][0]["broker_order_id"] == 900001
+    assert client.get("/api/trade/fills").json()["rows"][0]["volume"] == 1000
+    assert client.get("/api/trade/plans?limit=5").json()["rows"][0]["mode"] == "paper"
+    # 按日期过滤：换一个没有数据的日期必须返回空，而不是全量
+    assert client.get("/api/trade/orders",
+                      params={"date": "2020-01-01"}).json()["rows"] == []
+    assert client.get("/api/trade/fills",
+                      params={"date": "2026-01-02"}).json()["rows"][0]["symbol"] == "000001"
+
+
+def test_trade_halt_toggles_sentinel_file(trade_client):
+    client = trade_client
+    halt_file = config.TRADE_HALT_FILE
+    assert not halt_file.exists()
+    on = client.post("/api/trade/halt", json={"on": True}).json()
+    assert on == {"ok": True, "halt": True} and halt_file.exists()
+    assert client.get("/api/trade/summary").json()["halt"] is True
+    off = client.post("/api/trade/halt", json={"on": False}).json()
+    assert off == {"ok": True, "halt": False} and not halt_file.exists()
+    with dbmod.connect() as conn:
+        n = conn.execute(
+            "SELECT COUNT(*) AS c FROM collect_log WHERE task='trade-halt'"
+        ).fetchone()["c"]
+    assert n == 2, "开关动作要留审计记录"
+
+
+def test_trade_endpoints_tolerate_empty_db(trade_client):
+    """一张交易数据都没有时必须返回空结构而不是 500。"""
+    client = trade_client
+    for ep in ("/api/trade/summary", "/api/trade/positions", "/api/trade/orders",
+               "/api/trade/fills", "/api/trade/plans"):
+        body = client.get(ep).json()
+        assert isinstance(body, dict)
+    s = client.get("/api/trade/summary").json()
+    assert s["plan"] is None and s["positions"] == [] and s["reconcile"] == []
+
+
+def test_trade_paper_endpoint_shape(seeded, tmp_path, monkeypatch):
+    """自建模拟盘端点：空库返回空结构（days=0），不 500。"""
+    client, *_ = seeded
+    body = client.get("/api/trade/paper").json()
+    assert body["days"] == 0 and body["curve"] == [] and body["positions"] == []
+
+
+def test_trade_paper_endpoint_returns_nav_and_positions(seeded, tmp_path, monkeypatch):
+    client, *_ = seeded
+    with dbmod.connect() as conn:
+        conn.execute(
+            "INSERT INTO paper_account(id, cash, created_at, updated_at)"
+            " VALUES (1, 500000, '2026-01-01', '2026-01-02')")
+        conn.executemany(
+            "INSERT INTO paper_nav(trade_date, cash, market_value, total, nav, n_positions)"
+            " VALUES (?,?,?,?,?,?)",
+            [("2026-01-01", 900000, 100000, 1000000, 1.0, 1),
+             ("2026-01-02", 920000, 80000, 1000000, 1.0, 1)])
+        conn.execute(
+            "INSERT INTO paper_position(trade_date, symbol, volume, avg_price, close,"
+            " market_value) VALUES ('2026-01-02','000001',1000,10.0,10.5,10500)")
+        conn.commit()
+    body = client.get("/api/trade/paper").json()
+    assert body["days"] == 2 and body["from"] == "2026-01-01"
+    assert [p["symbol"] for p in body["positions"]] == ["000001"]
+    assert len(body["curve"]) == 2
+
+
+# ── 因子评估 ────────────────────────────────────────────────────────
+def test_factors_empty_returns_full_structure(seeded):
+    """还没跑过 `cli factors` 时返回**同构**的空结构，不是 404/500。"""
+    client, *_ = seeded
+    r = client.get("/api/factors")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["run_at"] is None and body["params"] == {}
+    assert body["factors"] == [] and body["corr"] == {"names": [], "matrix": []}
+    assert body["notes"], "口径说明必须始终带上"
+
+
+def test_factors_returns_latest_payload(seeded):
+    client, *_ = seeded
+    payload = {
+        "factors": [{"name": "mom", "label": "动量", "ic_mean": 0.02, "samples": 900}],
+        "corr": {"names": ["mom"], "matrix": [[1.0]]},
+        "params": {"period": 60, "hold": 20, "train_days": 250},
+        "notes": ["IC 为全样本口径"],
+    }
+    with dbmod.connect() as conn:
+        conn.executemany(
+            "INSERT INTO factor_eval(run_at, params, payload) VALUES (?,?,?)",
+            [("2026-01-01T00:00:00", "{}", json.dumps({"factors": []})),
+             ("2026-02-01T00:00:00", "{}", json.dumps(payload))])
+        conn.commit()
+    body = client.get("/api/factors").json()
+    assert body["run_at"] == "2026-02-01T00:00:00", "必须取最新一次评估"
+    assert body["factors"] == payload["factors"]
+    assert body["corr"]["matrix"] == [[1.0]]
+
+
+def test_backtest_signal_bogus_falls_back_to_rps(seeded):
+    """白名单外的信号源回落成 rps（与 market_filter 同款兜底，不 500）。"""
+    client, *_ = seeded
+    body = client.get("/api/backtest/run", params={"signal": "bogus"}).json()
+    assert body["params"]["signal"] == "rps"
+    assert body["params"]["select_top"] is None
+
+
+def test_backtest_composite_select_top(seeded, monkeypatch):
+    from rpsboard.analytics import factors as fac
+
+    monkeypatch.setattr(fac, "MIN_CROSS_IC", 3)     # 合成库只有 40 只票
+    client, *_ = seeded
+    r = client.get("/api/backtest/run", params={
+        "period": 20, "hold": 20, "threshold": 0,
+        "signal": "composite", "select_top": 5})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["params"]["signal"] == "composite"
+    assert body["params"]["select_top"] == 5
+    assert all(c.get("holdings", 0) <= 5 for c in body["equity_curve"])
+
+
+def test_backtest_cache_key_includes_signal(seeded, monkeypatch):
+    """锁住「缓存串味」：先 rps 后 composite，两次必须各拿各的结果。
+
+    缓存键漏掉 signal 时，第二次请求会直接返回第一次的 params（signal='rps'）。
+    """
+    from rpsboard.analytics import factors as fac
+    from rpsboard.api import backtest as bt_api
+
+    monkeypatch.setattr(fac, "MIN_CROSS_IC", 3)
+    client, *_ = seeded
+    bt_api.clear_backtest_cache()
+    first = client.get("/api/backtest/run",
+                       params={"period": 20, "threshold": 80, "signal": "rps"}).json()
+    second = client.get("/api/backtest/run", params={
+        "period": 20, "threshold": 0, "signal": "composite", "select_top": 3}).json()
+    assert first["params"]["signal"] == "rps"
+    assert second["params"]["signal"] == "composite"
+    assert second["params"]["select_top"] == 3
+    assert first.get("cached") is False, "第一次不该命中缓存"
+    assert second.get("cached") is False, "参数不同就不该命中同一条缓存"

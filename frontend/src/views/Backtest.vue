@@ -18,6 +18,19 @@
           </select>
         </div>
         <div class="group">
+          <label>信号源</label>
+          <select v-model="signal" @change="run">
+            <option value="rps">RPS 单因子</option>
+            <option value="composite">多因子合成分</option>
+          </select>
+        </div>
+        <div class="group">
+          <label>选股只数</label>
+          <input type="number" min="1" max="500" v-model.number="selectTop" style="width:120px"
+                 placeholder="空 = 全掩码等权" title="按打分取前 N 只；配合阈值 0 即「全池前 N」"
+                 @change="run" />
+        </div>
+        <div class="group">
           <label>持有</label>
           <select v-model.number="hold" @change="run">
             <option :value="5">5 日</option>
@@ -83,8 +96,11 @@
         <h3 style="margin-top:0">策略净值 vs 沪深300</h3>
         <VChart class="chart" :option="equityOption" autoresize />
         <div class="muted note">
-          策略：每 {{ result.params.rebalance }} 个交易日调仓，持有当日 RPS{{ result.params.period }} ≥
-          {{ result.params.threshold }} 的股票，等权持仓。
+          策略：每 {{ result.params.rebalance }} 个交易日调仓，信号源
+          <b>{{ result.params.signal === 'composite' ? '多因子合成分' : `RPS 单因子（${result.params.period} 日）` }}</b>；
+          入选 {{ sigName }} ≥ {{ result.params.threshold }}，
+          <template v-if="result.params.select_top == null">掩码内全部等权持有</template>
+          <template v-else>按打分取前 {{ result.params.select_top }} 只等权持有</template>。
           <span v-if="result.params.resonance">
             （已开启多周期共振，要求
             {{ periods.filter((p) => p !== result.params.period).join('/') }} 日同时达标）
@@ -103,9 +119,9 @@
       </div>
 
       <div class="panel" style="margin-top:12px">
-        <h3 style="margin-top:0">RPS 分档前瞻收益 —— 这是 RPS 是否有预测力的直接检验</h3>
+        <h3 style="margin-top:0">{{ sigName }} 分档前瞻收益 —— 这是信号是否有预测力的直接检验</h3>
         <p class="muted note" style="margin-top:0">
-          按信号日 RPS 把全市场股票分档，统计各档在接下来 {{ result.params.hold }}
+          按信号日 {{ sigName }} 把全市场股票分档，统计各档在接下来 {{ result.params.hold }}
           个交易日内的平均收益与上涨概率。样本量在百万级，可直接看出是否存在单调关系。
           <span v-if="result.buckets_note" style="display:block;margin-top:4px">
             ⚠ {{ result.buckets_note }}
@@ -158,11 +174,21 @@ const excludeLimitUp = ref(true)
 const resonance = ref(false)
 /** 是否计入交易成本。默认开启——零摩擦回测会系统性高估可执行结果。 */
 const useCost = ref(true)
+/**
+ * 信号源：rps 单因子 / composite 多因子等权合成。
+ * 合成分的方向取自**滚动训练窗的 IC 符号**（零幅度拟合），训练窗整体落在 t-hold 之前。
+ */
+const signal = ref('rps')
+/** 只取打分最高的 N 只；空 = 掩码内全选等权 */
+const selectTop = ref(null)
 const loading = ref(false)
 const result = ref(null)
 const warnings = ref([])
 /** 请求失败时页面内的错误条（不用 alert：会打断主线程、自动化里也看不见） */
 const errMsg = ref('')
+/** 当前结果用的信号名（分档图、结论文案都跟着它走） */
+const sigName = computed(
+  () => (result.value?.params?.signal === 'composite' ? '合成分' : 'RPS'))
 watch(periodsError, (v) => { if (v) warnings.value = [...warnings.value, v] })
 // 连点「运行回测」时只认最后一次响应
 const latest = useLatestRequest()
@@ -180,6 +206,12 @@ const MARKET_FILTERS = {
 }
 const marketFilter = ref('none')
 
+/** 选股只数：空/非法 → 不发这个参数（qs 会跳过 null），后端按「全掩码等权」处理 */
+function topParam() {
+  const n = Math.floor(Number(selectTop.value))
+  return Number.isFinite(n) && n >= 1 ? Math.min(n, 500) : null
+}
+
 async function run() {
   const t = latest.begin()
   loading.value = true
@@ -189,8 +221,11 @@ async function run() {
       period: period.value, threshold: threshold.value, hold: hold.value,
       exclude_st: excludeSt.value, exclude_limit_up: excludeLimitUp.value,
       resonance: resonance.value, market_filter: marketFilter.value,
-      use_cost: useCost.value,
-    })
+      use_cost: useCost.value, signal: signal.value, select_top: topParam(),
+    },
+    // 合成分要先建 13 个全市场因子矩阵（缓存冷时实测 3~4 分钟），
+    // 沿用回测默认的 3 分钟会必然超时
+    signal.value === 'composite' ? 600_000 : undefined)
     if (!latest.isCurrent(t)) return
     result.value = d
     warnings.value = d.warnings || []
@@ -317,8 +352,8 @@ const findingTitle = computed(() => {
   const h = result.value.params.hold
   if (!s) return ''
   return s.positive
-    ? `✓ 分档呈正向：RPS 越高，未来 ${h} 日收益越高`
-    : `⚠ 实测为反向：RPS 越高，未来 ${h} 日收益反而越低（短期反转）`
+    ? `✓ 分档呈正向：${sigName.value}越高，未来 ${h} 日收益越高`
+    : `⚠ 实测为反向：${sigName.value}越高，未来 ${h} 日收益反而越低（短期反转）`
 })
 
 const findingBody = computed(() => {
@@ -326,11 +361,17 @@ const findingBody = computed(() => {
   if (!s) return ''
   const p = result.value.params
   const gap = Math.abs(s.gap).toFixed(2)
-  const head = `最高档 RPS90-100 平均前瞻收益 ${pct(s.hiRps.avg_forward_return)}，` +
-               `最低档 RPS0-50 为 ${pct(s.loRps.avg_forward_return)}，相差 ${gap} 个百分点；` +
+  const head = `最高档 90-100 平均前瞻收益 ${pct(s.hiRps.avg_forward_return)}，` +
+               `最低档 <50 为 ${pct(s.loRps.avg_forward_return)}，相差 ${gap} 个百分点；` +
                `样本量在百万级，方向单调明确。`
   if (s.positive) {
-    return head + `RPS 在 ${p.hold} 日持有期上具备正向预测力。`
+    return head + `${sigName.value}在 ${p.hold} 日持有期上具备正向预测力。`
+  }
+  if (p.signal === 'composite') {
+    return head +
+      `合成分是 13 个价量/板块因子的等权合成，方向由滚动训练窗的 IC 符号决定；` +
+      `实测为反向说明**当前这套因子在 ${p.hold} 日持有期上没有正向预测力**，` +
+      `这本身就是结论（本项目已记录过一次负面回测结论），不要靠回头调因子池或权重把它调好看。`
   }
   return head +
     `这与欧奈尔的直觉相反，但**不是计算错误**：60 日 RPS 在 20 日持有期上呈现短期反转。` +

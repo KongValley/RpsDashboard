@@ -10,6 +10,8 @@
         <router-link to="/sectors" :class="{ active: $route.path === '/sectors' }">板块强弱</router-link>
         <router-link to="/backtest" :class="{ active: $route.path === '/backtest' }">策略回测</router-link>
         <router-link to="/watchlist" :class="{ active: $route.path === '/watchlist' }">自选预警</router-link>
+        <router-link to="/factors" :class="{ active: $route.path === '/factors' }">因子研究</router-link>
+        <router-link to="/trade" :class="{ active: $route.path === '/trade' }">交易</router-link>
       </nav>
       <div class="status">
         <span class="dot" :class="statusDot"></span>

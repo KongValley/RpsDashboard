@@ -171,8 +171,9 @@ export const stockApi = {
 }
 
 export const backtestApi = {
-  // 回测是同步算的（大库上可达数十秒），单独放宽超时
-  run: (params) => get('/backtest/run', params, BACKTEST_TIMEOUT_MS),
+  // 回测是同步算的（大库上可达数十秒），单独放宽超时；
+  // 合成分还要多走一遍全市场因子矩阵，调用方可再放宽（见 Backtest.vue 的 signal）
+  run: (params, timeoutMs) => get('/backtest/run', params, timeoutMs ?? BACKTEST_TIMEOUT_MS),
 }
 
 export const adminApi = {
@@ -193,4 +194,24 @@ export const alertApi = {
   addRule: (rule) => post('/alerts/rules', rule),
   removeRule: (id) => request(`/alerts/rules/${id}`, undefined, { method: 'DELETE' }),
   hits: (params) => get('/alerts/hits', params),
+}
+
+/** QMT 交易（只读库 + 两个写入口；summary 不连客户端，见 api/trade.py） */
+export const tradeApi = {
+  summary: () => get('/trade/summary'),
+  positions: () => get('/trade/positions'),
+  orders: (params) => get('/trade/orders', params),
+  fills: (params) => get('/trade/fills', params),
+  plans: (params) => get('/trade/plans', params),
+  setHalt: (on) => post('/trade/halt', { on }),
+  // 重取快照会起子进程连 QMT，单独放宽超时
+  snapshot: () => post('/trade/snapshot', {}, 120_000),
+  snapshotStatus: () => get('/trade/snapshot/status'),
+  // 自建模拟盘：净值曲线 + 持仓（只读库）
+  paper: () => get('/trade/paper'),
+}
+
+/** 因子研究：最近一次 `cli factors` 的评估结果（只读库，见 api/factors.py） */
+export const factorApi = {
+  latest: () => get('/factors'),
 }

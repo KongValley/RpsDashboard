@@ -10,6 +10,9 @@
 4. 周期值为 NULL 的股票详情/曲线必须 200（旧实现把 NaN 丢给 Starlette 直接 500）
 5. 导出 CSV 必须可被 `csv` 模块解析、行数 = total + 1、代码列保持 6 位
 6. 非法周期必须回落到默认周期而不是报错
+7. QMT 交易端点在**没有交易数据**时也必须返回结构化空结果（不是 500），
+   且任何接口里都不出现未脱敏的资金账号
+8. 自建模拟盘端点 `/api/trade/paper` 在没跑过时返回空结构而不是 500
 
 用法（服务默认 http://127.0.0.1:8000）：
     backend/.venv/Scripts/python.exe -m rpsboard.cli serve     # 另开一个终端
@@ -140,6 +143,55 @@ def main() -> int:
         check(isinstance(pat.get("rows"), list), "三升底筛选返回 200")
     except Exception as exc:  # noqa: BLE001
         check(False, "三升底筛选返回 200", f"{type(exc).__name__}: {exc}")
+
+    # ── QMT 交易端点（只读库；空库也要返回结构而不是 500）────────
+    for ep in ("/api/trade/summary", "/api/trade/positions", "/api/trade/orders",
+               "/api/trade/fills", "/api/trade/plans"):
+        try:
+            body = get_json(base, ep)
+            check(isinstance(body, dict), f"{ep} 返回 200")
+        except Exception as exc:  # noqa: BLE001
+            check(False, f"{ep} 返回 200", f"{type(exc).__name__}: {exc}")
+    try:
+        s = get_json(base, "/api/trade/summary")
+        check(isinstance(s.get("mode"), str) and isinstance(s.get("halt"), bool),
+              "/api/trade/summary 含 mode / halt", f"mode={s.get('mode')}")
+        check(isinstance(s.get("positions"), list) and isinstance(s.get("reconcile"), list),
+              "/api/trade/summary 含 positions / reconcile")
+        # 账号只允许脱敏形态出现在任何接口里
+        acct = s.get("account_masked") or ""
+        check(acct == "" or acct.startswith("****"), "账号已脱敏", acct)
+    except Exception as exc:  # noqa: BLE001
+        check(False, "/api/trade/summary 契约", f"{type(exc).__name__}: {exc}")
+
+    # ── 自建模拟盘（不连券商）──────────────────────────────────────
+    try:
+        pp = get_json(base, "/api/trade/paper")
+        check(isinstance(pp.get("days"), int) and isinstance(pp.get("curve"), list),
+              "/api/trade/paper 返回 200")
+        if pp.get("days"):
+            check(isinstance(pp.get("positions"), list),
+                  "模拟盘持仓非空", f"{len(pp['positions'])} 只")
+        else:
+            check(True, "模拟盘为空（尚未跑过 trade run）")
+    except Exception as exc:  # noqa: BLE001
+        check(False, "/api/trade/paper 返回 200", f"{type(exc).__name__}: {exc}")
+
+    # ── 因子评估（只读库；没跑过时要返回空结构而不是 500）──────────
+    try:
+        fc = get_json(base, "/api/factors")
+        check(isinstance(fc.get("factors"), list) and isinstance(fc.get("corr"), dict),
+              "/api/factors 返回 200")
+        names = (fc.get("corr") or {}).get("names") or []
+        matrix = (fc.get("corr") or {}).get("matrix") or []
+        if fc.get("factors"):
+            check(len(matrix) == len(names) and all(len(row) == len(names) for row in matrix),
+                  "因子相关矩阵为 N×N",
+                  f"run_at={fc.get('run_at')} 因子 {len(fc['factors'])} 个")
+        else:
+            check(True, "尚无因子评估（尚未跑 cli factors）")
+    except Exception as exc:  # noqa: BLE001
+        check(False, "/api/factors 返回 200", f"{type(exc).__name__}: {exc}")
 
     print(f"[smoke] 完成：{len(FAILS)} 项失败")
     for f in FAILS:

@@ -329,3 +329,122 @@ def test_resonance_mask_covers_every_other_period():
     assert bool(by_15.loc[dates[0], "000002"]) is True
     assert bool(by_15.loc[dates[0], "000001"]) is False, "250 日不达标必须排除"
     assert bool(by_15.loc[dates[0], "000003"]) is False, "所选周期恰为最短周期时一并要求"
+
+
+# ── Top-N 选股 ──────────────────────────────────────────────────────
+def _one_day(symbols, mask_values, score_values):
+    dates = pd.bdate_range("2024-01-01", periods=1)
+    mask = pd.DataFrame([mask_values], index=dates, columns=symbols)
+    score = pd.DataFrame([score_values], index=dates, columns=symbols, dtype="float64")
+    return dates[0], mask, score
+
+
+def test_select_top_takes_best_n():
+    syms = [f"{i:06d}" for i in range(10)]
+    t, mask, score = _one_day(syms, [True] * 10, list(range(10)))
+    assert list(bt._select_names(mask, score, t, 3)) == ["000009", "000008", "000007"]
+
+
+def test_select_top_tie_break_is_symbol_order():
+    """并列时按 symbol 升序：否则同一份数据两次回测会抽出不同的票，结论不可复现。"""
+    syms = [f"{i:06d}" for i in range(10)]
+    t, mask, score = _one_day(syms, [True] * 10, [5.0] * 10)
+    assert list(bt._select_names(mask, score, t, 3)) == syms[:3]
+    # 列顺序被打乱时仍是 symbol 升序（不是「按列顺序取前 N」）
+    order = [9, 0, 4, 2, 7, 1, 8, 3, 6, 5]
+    shuffled = [syms[i] for i in order]
+    assert list(bt._select_names(mask[shuffled], score[shuffled], t, 3)) == syms[:3]
+
+
+def test_select_top_excludes_nan_score():
+    """打分为 NaN 的票排不出名次，不占名额（会被次高者顶替）。"""
+    syms = [f"{i:06d}" for i in range(4)]
+    t, mask, score = _one_day(syms, [True] * 4, [1.0, float("nan"), 3.0, 2.0])
+    assert list(bt._select_names(mask, score, t, 2)) == ["000002", "000003"]
+
+
+def test_select_top_none_keeps_all_masked():
+    syms = [f"{i:06d}" for i in range(6)]
+    t, mask, score = _one_day(syms, [True, False, True, True, False, True], list(range(6)))
+    assert list(bt._select_names(mask, score, t, None)) == [
+        "000000", "000002", "000003", "000005"]
+    # 掩码内不足 N 只时不截断：与不传 select_top 的结果逐只相同
+    assert list(bt._select_names(mask, score, t, 99)) == list(
+        bt._select_names(mask, score, t, None))
+
+
+def test_signal_composite_runs_and_records_params(tmp_path, monkeypatch):
+    """合成分跑通并把口径记进 params（方向取自滚动训练窗，不是全样本拟合）。"""
+    from rpsboard.analytics import factors as fac
+
+    monkeypatch.setattr(fac, "MIN_CROSS_IC", 3)   # 合成库只有 40 只票
+    conn = _seed_db(tmp_path, "composite.db", n_symbols=40, n_days=320, seed=75)
+    res = bt.run_backtest(conn, period=20, threshold=0.0, hold=20,
+                          signal="composite", select_top=5)
+    conn.close()
+    assert res.params["signal"] == "composite"
+    assert res.params["select_top"] == 5
+    assert res.params["train_days"] == fac.DEFAULT_TRAIN_DAYS
+    assert res.equity_curve, "合成分应有净值点（不是整段平线）"
+    assert all(c.get("holdings", 0) <= 5 for c in res.equity_curve), "Top-N 不得超出 N"
+    assert sum(b["samples"] for b in res.buckets) > 0
+    assert "合成分" in res.buckets_note
+
+
+def test_entry_mask_hard_constraints_still_apply_with_score(tmp_path):
+    """给了 score 之后，ST / 涨停 / 停牌三种硬约束仍然剔除对应格子。"""
+    conn = _seed_db(tmp_path, "hard.db", n_symbols=40, n_days=200, seed=87)
+    dates = [r["date"] for r in conn.execute(
+        "SELECT DISTINCT date FROM daily_bar ORDER BY date")]
+    syms = [r["symbol"] for r in conn.execute(
+        "SELECT DISTINCT symbol FROM daily_bar ORDER BY symbol")]
+    last, prev = dates[-1], dates[-2]
+    st_sym, up_sym, halt_sym, ok_sym = syms[0], syms[1], syms[2], syms[3]
+    prev_close = conn.execute(
+        "SELECT close FROM daily_bar WHERE symbol = ? AND date = ?",
+        (up_sym, prev)).fetchone()["close"]
+    conn.execute("UPDATE daily_bar SET is_st = 1 WHERE symbol = ? AND date = ?",
+                 (st_sym, last))
+    conn.execute("UPDATE daily_bar SET close = ? WHERE symbol = ? AND date = ?",
+                 (prev_close * 1.102, up_sym, last))      # +10.2% → 涨停
+    conn.execute("UPDATE daily_bar SET close = 0 WHERE symbol = ? AND date = ?",
+                 (halt_sym, last))                        # 无有效收盘 → 不可交易
+    conn.executemany(
+        "INSERT OR REPLACE INTO price_limit_daily(date, symbol, limit_ratio, rule, status)"
+        " VALUES (?,?,10.0,'main','normal')", [(last, s) for s in syms])
+    conn.commit()
+    bt.clear_context_cache()
+
+    ctx = bt.load_context(conn, None)
+    everything = pd.DataFrame(100.0, index=ctx["close"].index, columns=ctx["close"].columns)
+    entry = bt.entry_mask(ctx, conn, 20, 0.0, score=everything)
+    conn.close()
+
+    assert not bool(entry.mask.loc[last, st_sym]), "ST 仍然被剔除"
+    assert not bool(entry.mask.loc[last, up_sym]), "涨停仍然被剔除"
+    assert not bool(entry.mask.loc[last, halt_sym]), "停牌/无价仍然被剔除"
+    assert bool(entry.mask.loc[last, ok_sym]), "普通格子必须还在，否则上面的断言等于没测"
+
+
+def test_ctx_key_distinguishes_ohlcv(tmp_path):
+    """OHLCV 必须进 ctx 缓存键，否则两次调用会互相拿到对方那份矩阵。"""
+    conn = _seed_db(tmp_path, "ctx.db", n_symbols=20, n_days=120, seed=79)
+    bt.clear_context_cache()
+    with_ohlcv = bt.load_context(conn, None, with_ohlcv=True)
+    without = bt.load_context(conn, None)
+    again = bt.load_context(conn, None, with_ohlcv=True)
+    conn.close()
+    assert "high" in with_ohlcv and "amount" in with_ohlcv
+    assert "high" not in without and "amount" not in without
+    assert "high" in again, "反向顺序（先无后有）也不得串味"
+
+
+def test_select_top_does_not_change_equity_without_limit(tmp_path):
+    """`select_top=None`（默认）必须与改造前的口径逐值相同：净值曲线不动。"""
+    conn = _seed_db(tmp_path, "same.db", n_symbols=40, n_days=320, seed=91)
+    a = bt.run_backtest(conn, period=20, threshold=80, hold=20)
+    b = bt.run_backtest(conn, period=20, threshold=80, hold=20, select_top=None)
+    conn.close()
+    assert a.params["select_top"] is None and b.params["select_top"] is None
+    assert a.metrics["total_return"] == b.metrics["total_return"]
+    assert a.equity_curve == b.equity_curve

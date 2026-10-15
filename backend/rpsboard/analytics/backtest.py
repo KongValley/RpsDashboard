@@ -33,6 +33,9 @@ BUCKET_LABELS = ["90-100", "80-90", "70-80", "50-70", "<50"]
 #: 大盘择时模式。欧奈尔的原方法是**只在强势市场做多**，而纯价格 RPS 回测
 #: 完全没有择时，这正是它测出「反向」结论的重要原因之一。
 MARKET_FILTERS = ("none", "ma200", "above_ma50", "trend_up")
+#: 信号源：单因子 RPS / 多因子等权合成（方向取自滚动训练窗的 IC 符号）。
+#: **单一真源**：回测、交易计划、模拟盘三处都引用它，避免各自抄一份字符串元组。
+SIGNALS = ("rps", "composite")
 MARKET_FILTER_LABELS = {
     "none": "不择时（全年满仓）",
     "ma200": "沪深300 > 200 日均线",
@@ -157,7 +160,7 @@ _CTX_TTL = 300.0
 _ctx_cache: dict = {"key": None, "at": 0.0, "data": None}
 
 
-def _ctx_key(conn: sqlite3.Connection, lookback_days: int | None):
+def _ctx_key(conn: sqlite3.Connection, lookback_days: int | None, with_ohlcv: bool = False):
     try:
         path = conn.execute("PRAGMA database_list").fetchone()[2] or ""
     except sqlite3.Error:
@@ -172,28 +175,46 @@ def _ctx_key(conn: sqlite3.Connection, lookback_days: int | None):
         latest = conn.execute("SELECT MAX(date) AS d FROM rps_daily").fetchone()["d"]
     except sqlite3.Error:
         latest = None
-    return (path, mtime, latest, lookback_days)
+    # with_ohlcv **必须进 key**：不然先用不带 OHLCV 的 ctx 建过缓存、再用
+    # with_ohlcv=True 取，会拿回没有 high/low/amount 的那份，合成因子随即 KeyError
+    return (path, mtime, latest, lookback_days, bool(with_ohlcv))
 
 
 def load_context(
-    conn: sqlite3.Connection, lookback_days: int | None = None
+    conn: sqlite3.Connection, lookback_days: int | None = None, *,
+    with_ohlcv: bool = False,
 ) -> dict:
-    """取回测需要的全部矩阵（带进程内缓存）。"""
-    key = _ctx_key(conn, lookback_days)
+    """取回测需要的全部矩阵（带进程内缓存）。
+
+    `with_ohlcv=True` 时额外带上 `high/low/volume/amount`（因子库用）：
+    多读四列会让 660 万行的读取慢一截，只有真需要时才要。
+    """
+    key = _ctx_key(conn, lookback_days, with_ohlcv)
     now = time.monotonic()
     if _ctx_cache["key"] == key and now - _ctx_cache["at"] < _CTX_TTL:
         return _ctx_cache["data"]
 
     start = _lookback_start(conn, lookback_days)
-    long = matrix.load_long(conn, start)
+    long = matrix.load_long(
+        conn, start, extra_columns=("high", "low", "volume", "amount") if with_ohlcv else (),
+    )
+    close = matrix.build_close_matrix(long, matrix.negative_offsets(conn))
     data = {
         "start": start,
         # 负偏移股票（5 只）必须还原后再算比值，否则它们的区间收益整段失真
-        "close": matrix.build_close_matrix(long, matrix.negative_offsets(conn)),
+        "close": close,
         "tradable": matrix.build_tradable_matrix(long),
         "st_flags": matrix.build_st_flags(long),
         "pct": matrix.build_pctchg_matrix(long),
     }
+    if with_ohlcv:
+        # 一律 reindex 到 close 的 shape：pivot_table 会丢掉整列为空的那一列，
+        # 与 close 的列对不齐时后续的 (high - low) / close 会静默错位
+        for name, kw in (("high", {"ffill": True}), ("low", {"ffill": True}),
+                         ("volume", {"fill": 0.0}), ("amount", {"fill": 0.0})):
+            data[name] = matrix.build_value_matrix(long, name, **kw).reindex(
+                index=close.index, columns=close.columns
+            )
     _ctx_cache.update(key=key, at=now, data=data)
     return data
 
@@ -249,72 +270,56 @@ def resonance_mask(
     return mask
 
 
-def run_backtest(
+@dataclass(frozen=True)
+class EntryMask:
+    """买入候选掩码及其附属信息（回测与交易计划共用）。"""
+
+    #: date × symbol 的布尔矩阵，True = 当日该股入选买入候选
+    mask: pd.DataFrame
+    #: 涨跌停覆盖率等**面向用户**的提示（回测直接并入 warnings）
+    warnings: list[str]
+    #: 产出过 RPS 的交易日；调仓日的口径来源（空集表示未取）
+    sig_dates: set[str]
+    #: 买入日涨停被剔除的格数；None = 本次没有应用该过滤
+    limit_up_filtered: int | None
+    #: 跌停掩码，卖出受阻判定用（None = 没有涨跌停数据）
+    lim_dn: pd.DataFrame | None
+
+
+def entry_mask(
+    ctx: dict,
     conn: sqlite3.Connection,
+    period: int,
+    threshold: float,
     *,
-    period: int = config.DEFAULT_PERIOD,
-    threshold: float = 80.0,
-    hold: int = 20,
-    rebalance: int | None = None,
-    resonance: bool = False,
     exclude_st: bool = True,
-    exclude_limit_up: bool = True,
-    benchmark_symbol: str = "000300",
-    market_filter: str = "none",
+    resonance: bool = False,
     use_price_limits: bool = True,
-    cost_model: CostModel | None = None,
-    lookback_days: int | None = None,
-) -> BacktestResult:
-    """执行回测。返回结构化结果（含幸存者偏差警示）。
+    exclude_limit_up: bool = True,
+    score: pd.DataFrame | None = None,
+) -> EntryMask:
+    """买入候选掩码：RPS 阈值 → ST 过滤 → 涨停过滤 → 可交易性。
 
-    lookback_days 默认 None（**全部历史**）：这是本项目对外公布回测结论时的口径，
-    改成「近 3 年」会让净值曲线多出一段 2023-10~2024-01 的下跌期，
-    把总收益从 +43% 压到 +0.9%，属于静默改结论，因此不作为默认。
-    矩阵通过 load_context() 做进程内缓存，重复调参不再重复读库。
+    回测与交易计划（broker/plan.py）**共用本函数**，保证「回测能买的」与
+    「计划允许买的」是同一口径 —— 两边各写一套时，最先出问题的就是
+    「回测显示买得进、计划却空手」这类无法排查的偏差。
+
+    `score` 给出时用它取代 `rps{period}` 作阈值判据（多因子合成分的百分位版本），
+    其后 ST / 涨停 / 可交易性三段硬约束**一字不变** —— 换的只是「谁算高分」，
+    不换「什么不能买」。
     """
-
-    # 入口兜底：传进来的 period 不在周期真源里会让 frames[f"rps{period}"] KeyError，
-    # hold 为 0/负数会让 fwd = close.shift(-hold) 变成「未来负数天」的假收益。
-    if period not in config.PERIODS:
-        period = config.DEFAULT_PERIOD
-    hold = max(1, min(int(hold), 250))
-    if market_filter not in MARKET_FILTERS:
-        market_filter = "none"
-    if cost_model is None:
-        cost_model = default_cost_model(enabled=True)
-
-    result = BacktestResult(
-        params={
-            "period": period, "threshold": threshold, "hold": hold,
-            "rebalance": rebalance or hold, "resonance": resonance,
-            "exclude_st": exclude_st, "benchmark": benchmark_symbol,
-            "market_filter": market_filter,
-            "market_filter_label": MARKET_FILTER_LABELS[market_filter],
-            "cost": cost_model.describe(),
-            "use_price_limits": use_price_limits,
-            "lookback_days": lookback_days,
-        }
-    )
-    result.warnings.append(
-        "本回测使用当前证券池回溯历史，中途退市的股票缺失，存在幸存者偏差，"
-        "结果偏乐观，不可直接用于实盘决策。"
-    )
-
-    if not db.table_has_rows(conn, "rps_daily"):
-        result.warnings.append("rps_daily 为空，请先执行 compute-rps")
-        return result
-
-    ctx = load_context(conn, lookback_days)
     close_wide = ctx["close"]
     tradable = ctx["tradable"]
     st_flags = ctx["st_flags"]
+    warnings: list[str] = []
 
     frames = get_frames(ctx, exclude_st)
-    rps_main = frames[f"rps{period}"]
-    if resonance:
+    if score is not None:
+        mask = score.reindex_like(frames[f"rps{period}"]) >= threshold
+    elif resonance:
         mask = resonance_mask(frames, period, threshold)
     else:
-        mask = rps_main >= threshold
+        mask = frames[f"rps{period}"] >= threshold
 
     # 落库的 RPS 是用默认参数（剔除 ST）算的，但 ST 仍可能有分位值并越过阈值，
     # 因此这里显式再滤一次，与实时计算路径保持同一语义。
@@ -329,6 +334,7 @@ def run_backtest(
     # 真实 limit_ratio，并用「收益率比」判定（后复权价与不复权涨停价
     # 不在同一基准，直接比会算出 4303 家假涨停）。
     lim_up = lim_dn = None
+    limit_up_filtered: int | None = None
     #: 产出过 RPS 的交易日（信号日）：覆盖率分母与调仓日都用它，
     #: 口径必须一致（见下方 coverage 与 dates 两处使用）
     sig_dates: set[str] = set()
@@ -362,7 +368,7 @@ def run_backtest(
                 ratios, statuses = merge_ratio_frames(
                     measured, derive_ratio_frames(conn, dates, cols)
                 )
-                result.warnings.append(
+                warnings.append(
                     f"涨跌停：实测覆盖 {covered}/{total} 个交易日，其余 {total - covered} 天"
                     f"按板块规则推算（与已采集的 {MODEL_VALIDATION_DAYS} 个交易日 / "
                     f"{MODEL_VALIDATION_ROWS:,} 行逐行一致率 100%；新股前 5 日按"
@@ -371,7 +377,7 @@ def run_backtest(
         else:
             # 一行实测都没有：整段用规则推算，并明确说出来（可校验性差一档）
             ratios, statuses = derive_ratio_frames(conn, dates, cols)
-            result.warnings.append(
+            warnings.append(
                 "price_limit_daily 为空：涨跌停按板块规则推算（无实测数据可校验），"
                 "请执行 cli price-limits 采集实测值"
             )
@@ -380,18 +386,147 @@ def run_backtest(
             if exclude_limit_up:
                 mask &= ~lim_up.reindex(index=mask.index, columns=mask.columns) \
                     .fillna(False).astype(bool)
-                result.params["limit_up_filtered"] = int(
-                    lim_up.to_numpy().sum()
-                )
+                limit_up_filtered = int(lim_up.to_numpy().sum())
         else:
-            result.warnings.append(
+            warnings.append(
                 "涨跌停比例为空（推算也失败），未应用「剔除涨停」过滤"
             )
 
     if tradable is not None and not tradable.empty:
         mask &= tradable.reindex_like(mask).fillna(False).astype(bool)
 
+    return EntryMask(
+        mask=mask, warnings=warnings, sig_dates=sig_dates,
+        limit_up_filtered=limit_up_filtered, lim_dn=lim_dn,
+    )
+
+
+def _select_names(
+    mask: pd.DataFrame, score: pd.DataFrame, t, select_top: int | None
+) -> pd.Index:
+    """当日入池的股票。`select_top=None` 时是「掩码内全选」，否则按 score 取前 N。
+
+    并列时按 symbol 升序（`sort_values(kind="mergesort")` 是稳定排序，输入按
+    symbol 排好即可）：否则同一份数据两次回测会抽出不同的票，结论不可复现。
+
+    `score` 为 NaN 的票在 Top-N 模式下被**排除**（排不出名次就不该占名额），
+    非 Top-N 模式下保持原样入选。
+    """
+    sel = mask.loc[t].fillna(False).astype(bool)
+    names = pd.Index(sorted(sel.index[sel]))
+    if select_top is None or len(names) <= select_top:
+        return names
+    s = score.loc[t].reindex(names).dropna()
+    if s.empty:
+        return names[:0]
+    return s.sort_values(ascending=False, kind="mergesort").index[:select_top]
+
+
+def run_backtest(
+    conn: sqlite3.Connection,
+    *,
+    period: int = config.DEFAULT_PERIOD,
+    threshold: float = 80.0,
+    hold: int = 20,
+    rebalance: int | None = None,
+    resonance: bool = False,
+    exclude_st: bool = True,
+    exclude_limit_up: bool = True,
+    benchmark_symbol: str = "000300",
+    market_filter: str = "none",
+    use_price_limits: bool = True,
+    cost_model: CostModel | None = None,
+    lookback_days: int | None = None,
+    signal: str = "rps",
+    select_top: int | None = None,
+) -> BacktestResult:
+    """执行回测。返回结构化结果（含幸存者偏差警示）。
+
+    lookback_days 默认 None（**全部历史**）：这是本项目对外公布回测结论时的口径，
+    改成「近 3 年」会让净值曲线多出一段 2023-10~2024-01 的下跌期，
+    把总收益从 +43% 压到 +0.9%，属于静默改结论，因此不作为默认。
+    矩阵通过 load_context() 做进程内缓存，重复调参不再重复读库。
+
+    `signal="composite"` 换用多因子合成分作信号（方向取自滚动训练窗 IC 符号）；
+    `select_top=N` 只保留打分最高的 N 只（None = 掩码内全选，旧行为）。
+    """
+    # 入口兜底：传进来的 period 不在周期真源里会让 frames[f"rps{period}"] KeyError，
+    # hold 为 0/负数会让 fwd = close.shift(-hold) 变成「未来负数天」的假收益。
+    if period not in config.PERIODS:
+        period = config.DEFAULT_PERIOD
+    hold = max(1, min(int(hold), 250))
+    if market_filter not in MARKET_FILTERS:
+        market_filter = "none"
+    # 与 market_filter 同款兜底：API 层已白名单过滤，这里不抛异常
+    if signal not in SIGNALS:
+        signal = "rps"
+    if select_top is not None:
+        select_top = max(1, min(int(select_top), 500))
+    if cost_model is None:
+        cost_model = default_cost_model(enabled=True)
+
+    result = BacktestResult(
+        params={
+            "period": period, "threshold": threshold, "hold": hold,
+            "rebalance": rebalance or hold, "resonance": resonance,
+            "exclude_st": exclude_st, "benchmark": benchmark_symbol,
+            "market_filter": market_filter,
+            "market_filter_label": MARKET_FILTER_LABELS[market_filter],
+            "cost": cost_model.describe(),
+            "use_price_limits": use_price_limits,
+            "lookback_days": lookback_days,
+            "signal": signal, "select_top": select_top,
+        }
+    )
+    result.warnings.append(
+        "本回测使用当前证券池回溯历史，中途退市的股票缺失，存在幸存者偏差，"
+        "结果偏乐观，不可直接用于实盘决策。"
+    )
+
+    if not db.table_has_rows(conn, "rps_daily"):
+        result.warnings.append("rps_daily 为空，请先执行 compute-rps")
+        return result
+
+    ctx = load_context(conn, lookback_days, with_ohlcv=(signal == "composite"))
+    close_wide = ctx["close"]
+    # 下面净值循环与分档表还要用到这两样；get_frames 缓存在 ctx 上，重取不花钱
+    tradable = ctx["tradable"]
+    rps_main = get_frames(ctx, exclude_st)[f"rps{period}"]
+
+    # 前瞻收益先算：合成因子的滚动 IC 就建立在它上面（方向 = 训练窗里的 IC 符号）
     fwd = _forward_return(close_wide, hold)
+
+    score_pct = None
+    if signal == "composite":
+        from . import factors as fac
+
+        score_pct = fac.composite_score(
+            ctx, conn, period=period, hold=hold, exclude_st=exclude_st
+        )
+        if int(score_pct.notna().to_numpy().sum()) == 0:
+            result.warnings.append(
+                f"合成分全部为 NaN：滚动训练窗（{fac.DEFAULT_TRAIN_DAYS} 个交易日）"
+                "不足，请增大 lookback_days 或减小 factors.DEFAULT_TRAIN_DAYS"
+            )
+        result.params["train_days"] = fac.DEFAULT_TRAIN_DAYS
+
+    # RPS 模式下的排序键是 rps{period} 本身（不是 ret{period}），
+    # 这样 --select-top 20 单独用也能表达「RPS Top-20」
+    score_for_rank = score_pct if score_pct is not None else rps_main
+
+    entry = entry_mask(
+        ctx, conn, period, threshold,
+        exclude_st=exclude_st, resonance=resonance,
+        use_price_limits=use_price_limits, exclude_limit_up=exclude_limit_up,
+        score=score_pct,
+    )
+    result.warnings.extend(entry.warnings)
+    if entry.limit_up_filtered is not None:
+        result.params["limit_up_filtered"] = entry.limit_up_filtered
+    mask = entry.mask
+    lim_dn = entry.lim_dn
+    sig_dates = entry.sig_dates
+
     fwd = fwd.reindex(index=mask.index, columns=mask.columns)
 
     dates = list(mask.index)
@@ -471,10 +606,9 @@ def run_backtest(
                           "equity": round(equity, 6),
                           "holdings": 0})
             continue
-        sel = mask.loc[t].fillna(False)
-        if not sel.any():
+        names = _select_names(mask, score_for_rank, t, select_top)
+        if len(names) == 0:
             continue
-        names = sel[sel].index
 
         # 卖出受阻的那部分：收益不可实现，顺延到下一个调仓点。
         # 保守做法是**剔除**它们（等价于这段收益记 0），而不是照单全收。
@@ -565,11 +699,14 @@ def run_backtest(
         dates=[c["date"] for c in result.equity_curve],
     )
 
-    # ── RPS 分档前瞻收益（核心验证图）───────────────────────────
-    # 刻意**不扣成本**：这张图衡量的是「RPS 信号本身有没有预测力」，
+    # ── 分档前瞻收益（核心验证图）───────────────────────────────
+    # 刻意**不扣成本**：这张图衡量的是「信号本身有没有预测力」，
     # 混进执行摩擦会把信号质量与交易成本两件事搅在一起。
-    result.buckets = compute_buckets(rps_main, fwd)
+    result.buckets = compute_buckets(score_for_rank, fwd)
     result.buckets_note = (
+        "分档前瞻收益为**零成本**口径，分档依据是**合成分的横截面百分位**；"
+        "上方净值曲线为**含成本**口径。"
+        if signal == "composite" else
         "分档前瞻收益为**零成本**口径，衡量信号本身的预测力；"
         "上方净值曲线为**含成本**口径，衡量策略的可执行性。"
     )
