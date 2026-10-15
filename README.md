@@ -732,7 +732,7 @@ cd frontend; npm run lint; npm run build             # 前端 lint + 构建
 全部测试离线运行，使用合成数据，不触网。
 
 - **覆盖率**：`pytest` 默认带 `--cov=rpsboard --cov-report=term-missing`；**门槛
-  `--cov-fail-under=50` 只写在 CI 命令里**（全套 **304 项测试、实测 TOTAL 67%**，门槛按实测值
+  `--cov-fail-under=50` 只写在 CI 命令里**（全套 **306 项测试、实测 TOTAL 67%**，门槛按实测值
   向下取整）——放进 `addopts` 会让「只跑一个测试文件」也因总覆盖率不足而失败。`cli.py` 与
   `sources/*` 目前覆盖较少（本轮补了 tradestatus / price-limits / backfill 退出码的用例），
   门槛按实测值设，不虚设高线。
@@ -742,6 +742,14 @@ cd frontend; npm run lint; npm run build             # 前端 lint + 构建
 - **CI**：`.github/workflows/ci.yml`，push 与 PR 各跑一遍 backend（ruff + pytest，
   用 `uv sync --frozen` 按 `uv.lock` 装）与 frontend（`npm ci` + lint + build）两个 job。
 - **依赖锁定**：`uv.lock` 入库，CI 用 `--frozen` 保证可复现。
+- **测试不得依赖墙钟**：CI runner 是 UTC、开发机是 UTC+8，凡是拿 `datetime.now()`
+  去和注入的固定时间比较，两个环境会给出相反结果（2026-10-15 的 CI 阻断即此）。
+  时间一律由参数注入。
+- **测试不发真推送**：`.env.local` 的专属地址会在 `config` 导入时进内存，所以
+  `conftest._no_real_push` 这个 autouse fixture 会把 `config.SHOWDOC_PUSH_URL` 与
+  `os.environ` 同时置空（同进程与 CLI 子进程都挡）。没有它，断线用例会经
+  `_notify_disconnect()` **真的**把测试消息推到开发者微信上（2026-10-15 实测）。
+  要测真实 HTTP 路径的 `test_notify_http.py` 用自己的 fixture 覆盖成临时本地服务。
 
 ### 开发脚本
 
@@ -898,7 +906,7 @@ curl -s http://127.0.0.1:8000/api/meta/perf      # 前后端耗时快照
 | 环境变量 | 默认 | 作用 |
 |---|---|---|
 | `RPSBOARD_PERF_SLOW_MS` | 300 | 超过该毫秒数记为慢请求 |
-| `RPSBOARD_PERF_LOG` | `logs/perf.jsonl` | 逐请求日志路径（不轮转） |
+| `RPSBOARD_PERF_LOG` | `logs/perf.jsonl` | 逐请求日志路径（超 5 MB 滚动为 `.1`，只留一份历史） |
 | `RPSBOARD_PERF_RING_SERVER` / `_CLIENT` | 1000 / 500 | 内存窗口条数 |
 
 ## 工程事故与修复（2026-10-14）

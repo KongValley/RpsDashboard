@@ -90,8 +90,8 @@ def period_columns(prefix: str = "rps") -> list[str]:
 #: 性能日志目录（logs/perf.jsonl，见 api/perf.py）。要留 uvicorn 的 stdout/stderr
 #: 也可以重定向到这里（启动脚本没有代做这件事）。
 LOG_DIR = Path(os.environ.get("RPSBOARD_LOG_DIR", ROOT_DIR / "logs"))
-#: 每个请求追加一行 JSON。logs/ 已在 .gitignore，刻意不做轮转：
-#: 一行约 0.2 KB，个人盯盘的使用强度下一天也就几百 KB。
+#: 每个请求追加一行 JSON。logs/ 已在 .gitignore；写入侧按 5 MB 滚动为 `.1`
+#: 并只留一份历史（见 api/perf.py 的 PERF_LOG_MAX_BYTES）。
 PERF_LOG = Path(os.environ.get("RPSBOARD_PERF_LOG", LOG_DIR / "perf.jsonl"))
 #: 超过该毫秒数记为慢请求（ASGI 全程耗时，含响应体发送）
 PERF_SLOW_MS = float(os.environ.get("RPSBOARD_PERF_SLOW_MS", "300"))
