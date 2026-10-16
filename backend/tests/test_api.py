@@ -24,6 +24,7 @@ from rpsboard.analytics.matrix import (
 from .fixtures import make_industry_map_zh, make_long
 
 PERIODS = config.PERIODS
+PERIODS_DEFAULT = config.DEFAULT_PERIOD
 
 
 @pytest.fixture()
@@ -283,6 +284,51 @@ def test_review_day_on_empty_db(monkeypatch):
     body = TestClient(create_app()).get("/api/review/day").json()
     assert body["date"] is None and body["breadth"] is None
     assert body["limit_up"] == [] and body["message"]
+
+
+# ── 已保存的筛选条件（排行榜看板）──────────────────────────────────
+def test_saved_screens_roundtrip_and_validation(seeded):
+    """保存/同名覆盖/删除，以及**白名单 + 夹取**（存进去的东西会直接拼进查询）。"""
+    client, *_ = seeded
+    assert client.get("/api/screens").json()["rows"] == []
+
+    created = client.post("/api/screens", json={
+        "name": "强势涨幅榜",
+        "params": {"period": 60, "rps_min": 90, "sort": "pct_chg", "direction": "ASC",
+                   "industries": "银行,,软件", "exclude_st": True},
+    }).json()
+    assert created["ok"] is True and created["id"] >= 1
+
+    row = client.get("/api/screens").json()["rows"][0]
+    p = row["params"]
+    assert p["rps_min"] == 90.0 and p["direction"] == "asc", "方向归一化成小写"
+    assert p["industries"] == "银行,软件", "行业名要去掉空项"
+
+    # 同名再存 = 覆盖（不攒同名条目）
+    again = client.post("/api/screens", json={
+        "name": "强势涨幅榜", "params": {"period": 20}}).json()
+    assert again["id"] == created["id"]
+    rows = client.get("/api/screens").json()["rows"]
+    assert len(rows) == 1 and rows[0]["params"] == {"period": 20}
+
+    # 未知键拒绝（422），非法值回落
+    assert client.post("/api/screens", json={
+        "name": "坏", "params": {"nope": 1}}).status_code == 422
+    assert client.post("/api/screens", json={
+        "name": "  ", "params": {}}).status_code == 422
+
+    fallback = client.post("/api/screens", json={
+        "name": "回落", "params": {"period": 999, "sort": "nope", "sanxingdi": 7,
+                                   "rps_min": -5, "direction": "sideways"}}).json()
+    got = {r["id"]: r["params"] for r in client.get("/api/screens").json()["rows"]}
+    fp = got[fallback["id"]]
+    assert fp["period"] == PERIODS_DEFAULT and fp["sort"] == "rps"
+    assert fp["sanxingdi"] == 0 and fp["rps_min"] == 0.0 and fp["direction"] == "desc"
+    # 分页参数刻意不保存：看板存的是筛选口径，不是"第几页"
+    assert "page" not in fp and "limit" not in fp
+
+    assert client.delete(f"/api/screens/{fallback['id']}").json()["ok"] is True
+    assert client.delete("/api/screens/999").json()["ok"] is False
 
 
 def test_backtest_save_and_reload(seeded):

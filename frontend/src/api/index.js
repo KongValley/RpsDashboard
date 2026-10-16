@@ -173,6 +173,13 @@ export const stockApi = {
     get(`/stock/${symbol}/patterns`, date ? { days, date } : { days }),
 }
 
+/** 已保存的筛选条件（排行榜看板）；参数白名单见 backend/rpsboard/api/screens.py */
+export const screenApi = {
+  list: () => get('/screens'),
+  save: (name, params) => post('/screens', { name, params }),
+  remove: (id) => request(`/screens/${id}`, undefined, { method: 'DELETE' }),
+}
+
 export const backtestApi = {
   // 回测是同步算的（大库上可达数十秒），单独放宽超时；
   // 合成分还要多走一遍全市场因子矩阵，调用方可再放宽（见 Backtest.vue 的 signal）

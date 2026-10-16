@@ -345,6 +345,16 @@ CREATE TABLE IF NOT EXISTS paper_archive (
   created_at   TEXT NOT NULL
 );
 
+-- 已保存的横截面筛选条件（排行榜的"我的看板"）。**纯新增表**。
+-- params 是排行榜请求参数的子集（白名单，见 api/screens.py）；
+-- name 唯一：同名保存视为覆盖，避免攒出一堆同名条目。
+CREATE TABLE IF NOT EXISTS saved_screen (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  name       TEXT NOT NULL UNIQUE,
+  params     TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
 -- 已保存的回测（跨会话对比用）。**纯新增表**：既有库由
 -- `CREATE TABLE IF NOT EXISTS` 直接获得，不动任何老表。
 -- payload 是完整结果 JSON（逐日曲线约 890 点 + 分档 + 警告，约 50 KB），

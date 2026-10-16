@@ -1,7 +1,8 @@
 """自选股池与条件预警的读写接口。
 
-这是**全 API 唯一的写入口**（`db.py` 里 watchlist / alert_rule / alert_hit 三张表）；
-其余 handler 保持只读 SQLite 的既有约束。写操作都在本文件内 commit + close，
+本文件负责 watchlist / alert_rule / alert_hit 三张表的写入口。
+（「全 API 唯一的写入口」这句早就不成立了：`trade.py` 的 halt / snapshot / 归档、
+`backtest.py` 的存档、`screens.py` 的筛选条件都会写库 —— 它们各自的模块头写明了这一点。）写操作都在本文件内 commit + close，
 不做任何外部采集（与 README 的「只落库 + CLI 输出、不引入消息推送」边界一致）。
 """
 

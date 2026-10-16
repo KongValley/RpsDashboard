@@ -93,6 +93,16 @@
             <input type="checkbox" v-model="excludeSt" /> 剔除ST
           </label>
         </div>
+
+        <div class="group">
+          <label title="把当前筛选条件存成具名看板，下次下拉即用">看板</label>
+          <select v-model.number="screenId" style="min-width:150px" @change="applyScreen">
+            <option :value="0">（未选择）</option>
+            <option v-for="s in screens" :key="s.id" :value="s.id">{{ s.name }}</option>
+          </select>
+          <button class="btn" @click="saveScreen">保存当前</button>
+          <button class="btn" :disabled="!screenId" @click="removeScreen">删除</button>
+        </div>
       </div>
 
       <div class="row meta">
@@ -122,7 +132,7 @@
 <script setup>
 import { ref, watch, onMounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
-import { rpsApi, metaApi, watchApi } from '../api'
+import { rpsApi, metaApi, watchApi, screenApi } from '../api'
 import { DEFAULT_PERIOD, usePeriods } from '../composables/usePeriods'
 import { useLatestRequest } from '../composables/useLatestRequest'
 import RpsTable from '../components/RpsTable.vue'
@@ -165,18 +175,25 @@ async function toggleWatch(symbol) {
 }
 
 const { periods, error: periodsError } = usePeriods()
-const period = ref(DEFAULT_PERIOD)
-const rpsMin = ref(80)
+/** URL 上的筛选参数在**初始化时**就读进来（不是 mount 后再写回控件）：
+ *  mount 后写回会连带触发 watcher 再发一次请求，而且 `period` 没有 watcher，
+ *  于是 `/?period=250` 只会点亮按钮、表格里仍是默认周期的数据。 */
+const q0 = route.query
+const qNum = (key, fallback) => (q0[key] != null && q0[key] !== '' ? Number(q0[key]) : fallback)
+const qStr = (key, fallback) => (q0[key] != null && q0[key] !== '' ? String(q0[key]) : fallback)
+
+const period = ref(qNum('period', DEFAULT_PERIOD))
+const rpsMin = ref(qNum('rps_min', 80))
 /** 排序键与方向：后端 sort 支持 rps/ret/pct_chg/amount/close，direction 支持 asc/desc。 */
-const sort = ref('rps')
-const direction = ref('desc')
-const industry = ref('')
+const sort = ref(qStr('sort', 'rps'))
+const direction = ref(qStr('direction', 'desc'))
+const industry = ref((qStr('industries', '').split(',').filter(Boolean)[0]) || '')
 const minAmount = ref(0)
 const excludeSt = ref(true)
 const pageSize = 100
 const page = ref(1)
 /** 空 = 用最新交易日；非空 = 回看指定历史日 */
-const date = ref('')
+const date = ref(qStr('date', ''))
 const availableDates = ref([])
 /** 0 = 不对比名次；>0 = 与 N 个交易日前的名次比较 */
 const deltaDays = ref(0)
@@ -185,6 +202,9 @@ const sanxingdi = ref(0)
 
 const industries = ref([])
 const rows = ref([])
+/** 已保存的看板（筛选条件） */
+const screens = ref([])
+const screenId = ref(0)
 const total = ref(0)
 const dataDate = ref(null)
 const loading = ref(false)
@@ -283,6 +303,74 @@ watch(date, () => { page.value = 1; load() })
 watch(deltaDays, () => { page.value = 1; load() })
 watch(sanxingdi, () => { page.value = 1; load() })
 
+/** 当前筛选条件（保存看板与导出都用这一份，避免两处漂移） */
+function currentFilters() {
+  return {
+    period: period.value,
+    rps_min: rpsMin.value,
+    industries: industry.value || '',
+    exclude_st: excludeSt.value,
+    min_amount: minAmount.value || 0,
+    sort: sort.value,
+    direction: direction.value,
+    delta_days: deltaDays.value || 0,
+    sanxingdi: sanxingdi.value || 0,
+  }
+}
+
+function applyFilters(p) {
+  if (!p) return
+  if (p.period != null) period.value = Number(p.period)
+  if (p.rps_min != null) rpsMin.value = Number(p.rps_min)
+  if (p.industries != null) industry.value = String(p.industries).split(',').filter(Boolean)[0] || ''
+  if (p.exclude_st != null) excludeSt.value = !!p.exclude_st
+  if (p.min_amount != null) minAmount.value = Number(p.min_amount)
+  if (p.sort != null) sort.value = String(p.sort)
+  if (p.direction != null) direction.value = String(p.direction)
+  if (p.delta_days != null) deltaDays.value = Number(p.delta_days)
+  if (p.sanxingdi != null) sanxingdi.value = Number(p.sanxingdi)
+}
+
+async function loadScreens() {
+  try {
+    screens.value = (await screenApi.list()).rows || []
+  } catch (e) {
+    console.warn('看板列表加载失败（不影响排行）', e)
+  }
+}
+
+function applyScreen() {
+  const s = screens.value.find((x) => x.id === screenId.value)
+  if (!s) return
+  applyFilters(s.params)
+  page.value = 1
+  load()
+}
+
+async function saveScreen() {
+  const name = window.prompt('看板名称（同名会覆盖）', '')
+  if (name === null) return
+  if (!name.trim()) return
+  try {
+    await screenApi.save(name.trim(), currentFilters())
+    await loadScreens()
+  } catch (e) {
+    errMsg.value = `保存看板失败：${e?.message || e}`
+  }
+}
+
+async function removeScreen() {
+  const s = screens.value.find((x) => x.id === screenId.value)
+  if (!s || !window.confirm(`删除看板「${s.name}」？`)) return
+  try {
+    await screenApi.remove(s.id)
+    screenId.value = 0
+    await loadScreens()
+  } catch (e) {
+    errMsg.value = `删除看板失败：${e?.message || e}`
+  }
+}
+
 // 主数据与元数据**并行独立**加载：筛选项没就绪不该阻塞排行榜。
 // （早期写成 `await Promise.all([periods, industries])` 再 load()，
 //   一旦元数据请求挂起，整个排行榜就永远停在「加载中」。）
@@ -290,6 +378,7 @@ watch(sanxingdi, () => { page.value = 1; load() })
 onMounted(() => {
   load()
   loadWatchlist()
+  loadScreens()
   // 不传 limit：后端默认 2000，覆盖全部 rps 历史（此前写死 400 会把日期下拉截断）
   Promise.all([metaApi.industries(), metaApi.dates()])
     .then(([inds, dates]) => {
@@ -297,16 +386,6 @@ onMounted(() => {
       availableDates.value = dates || []
     })
     .catch((e) => console.error('元数据加载失败（不影响排行）', e))
-  // 从板块页点格子跳过来时带着 ?industries=xxx，这里消费它。
-  // 早期这里只 useRouter 从不 useRoute，导致「点击格子查看该行业榜单」点了没反应。
-  const q = route.query
-  if (q.industries) industry.value = String(q.industries).split(',').filter(Boolean)[0] || ''
-  if (q.date) date.value = String(q.date)
-  if (q.period) period.value = Number(q.period)
-  if (q.rps_min) rpsMin.value = Number(q.rps_min)
-  // 排序也可以带过来（分享/收藏一个「成交额榜」链接）
-  if (q.sort) sort.value = String(q.sort)
-  if (q.direction) direction.value = String(q.direction)
 })
 </script>
 

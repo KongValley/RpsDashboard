@@ -205,13 +205,14 @@ def create_app() -> FastAPI:
     app.add_middleware(perf.PerfMiddleware)
 
     from . import backtest as bt_api
-    from . import factors, meta, review, rps, stock, trade, watchlist
+    from . import factors, meta, review, rps, screens, stock, trade, watchlist
 
     app.include_router(perf.router)
     app.include_router(watchlist.router)
     app.include_router(meta.router)
     app.include_router(rps.router)
     app.include_router(review.router)
+    app.include_router(screens.router)
     app.include_router(stock.router)
     app.include_router(bt_api.router)
     app.include_router(trade.router)
