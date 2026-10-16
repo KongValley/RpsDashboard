@@ -212,6 +212,11 @@ export const tradeApi = {
   snapshotStatus: () => get('/trade/snapshot/status'),
   // 自建模拟盘：净值曲线 + 复盘指标 + 持仓（只读库）；date 可回看历史某日
   paper: (params) => get('/trade/paper', params),
+  // 曲线归档（策略对照）：跑新策略前先存下旧曲线
+  archives: (params) => get('/trade/paper/archives', params),
+  archive: (label) => post('/trade/paper/archive', { label }),
+  removeArchive: (id) =>
+    request(`/trade/paper/archives/${id}`, undefined, { method: 'DELETE' }),
 }
 
 /** 当日复盘：市场宽度 + 涨跌停清单 + 行业当日涨跌 + 信号名单（只读库） */

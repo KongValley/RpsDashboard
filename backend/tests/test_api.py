@@ -976,7 +976,34 @@ def test_trade_paper_endpoint_returns_nav_and_positions(seeded, tmp_path, monkey
     assert len(body["curve"]) == 2
 
 
-# ── 因子评估 ────────────────────────────────────────────────────────
+# ── 自建模拟盘的归档（策略对照）─────────────────────────────────
+def test_paper_archive_endpoints(trade_client):
+    """归档三个入口：空账户明确报错、归档成功、列表、删除。"""
+    client = trade_client
+    empty = client.post("/api/trade/paper/archive", json={"label": "x"}).json()
+    assert empty["ok"] is False and "无可归档" in empty["error"]
+
+    with dbmod.connect() as conn:
+        conn.execute(
+            "INSERT INTO paper_account(id, cash, created_at, updated_at)"
+            " VALUES (1, 900000, '2026-01-01', '2026-01-02')")
+        conn.executemany(
+            "INSERT INTO paper_nav(trade_date, cash, market_value, total, nav, n_positions)"
+            " VALUES (?,?,?,?,?,?)",
+            [("2026-01-01", 900000, 100000, 1000000, 1.0, 1),
+             ("2026-01-02", 920000, 80000, 1000000, 1.0, 1)])
+        conn.commit()
+
+    created = client.post("/api/trade/paper/archive", json={"label": "RPS60"}).json()
+    assert created["ok"] is True and created["label"] == "RPS60"
+    rows = client.get("/api/trade/paper/archives").json()["rows"]
+    assert [r["label"] for r in rows] == ["RPS60"]
+    assert rows[0]["days"] == 2 and len(rows[0]["curve"]) == 2
+
+    assert client.delete(f"/api/trade/paper/archives/{created['id']}").json()["ok"] is True
+    assert client.get("/api/trade/paper/archives").json()["rows"] == []
+
+
 def test_trade_paper_endpoint_supports_date_and_review(seeded):
     """`/api/trade/paper?date=` 回看历史某日（就近回退），并带复盘字段。"""
     client, *_ = seeded
@@ -1012,6 +1039,7 @@ def test_trade_paper_endpoint_supports_date_and_review(seeded):
     assert [p["symbol"] for p in latest["positions"]] == ["000002"]
 
 
+# ── 因子评估 ────────────────────────────────────────────────────────
 def test_factors_empty_returns_full_structure(seeded):
     """还没跑过 `cli factors` 时返回**同构**的空结构，不是 404/500。"""
     client, *_ = seeded

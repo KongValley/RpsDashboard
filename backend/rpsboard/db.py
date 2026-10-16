@@ -324,6 +324,27 @@ CREATE TABLE IF NOT EXISTS paper_meta (
   value TEXT NOT NULL
 );
 
+-- 模拟盘曲线归档：模拟盘只有**一个**活动账户（paper_account.id CHECK (id=1)），
+-- 跑第二种策略必须先 --reset 清掉第一种；归档就是把清掉之前的证据留下来，
+-- 供「策略对照」页叠加比较（原先这份对照只能手写进 README）。
+-- 纯新增表，不动任何既有表结构。
+CREATE TABLE IF NOT EXISTS paper_archive (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  label        TEXT NOT NULL,      -- 展示名（缺省按信号源 + 时间生成）
+  params       TEXT NOT NULL,      -- JSON：创建曲线时的 paper_meta.params
+  initial_cash REAL NOT NULL,
+  from_date    TEXT,
+  to_date      TEXT,
+  total        REAL NOT NULL,      -- 期末总权益
+  nav          REAL NOT NULL,
+  total_return REAL NOT NULL,
+  max_drawdown REAL NOT NULL,
+  days         INTEGER NOT NULL,
+  metrics      TEXT NOT NULL,      -- JSON：review().summary + 基准对照
+  curve        TEXT NOT NULL,      -- JSON：paper_nav 各行（点数受 nav_curve 上限约束）
+  created_at   TEXT NOT NULL
+);
+
 -- 因子评估结果：每次 `cli factors` 一行，payload 是完整 JSON（约 30 KB）。
 -- 页面只读最新一行；保留历史是为了能对比「改过因子之后 IC 变了多少」。
 -- 因子矩阵本身**不落库**（13 × 1285 × 5574 × 8B ≈ 750 MB），落库的只有这份结果。

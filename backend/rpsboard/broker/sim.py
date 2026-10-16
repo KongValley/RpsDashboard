@@ -26,6 +26,7 @@ import json
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import date as _date
+from datetime import datetime
 
 from .. import config, db
 from ..analytics import costs as costs_mod
@@ -432,6 +433,60 @@ def summary(conn: sqlite3.Connection) -> dict:
         "positions": positions_at(conn),
         "curve": curve,
     }
+
+
+# ── 曲线归档（策略对照）─────────────────────────────────────────────
+def archive(conn: sqlite3.Connection, label: str | None = None) -> dict:
+    """把**当前**模拟盘曲线归档一份。返回归档行的摘要。
+
+    模拟盘只有一个活动账户（`paper_account.id CHECK (id=1)`），跑第二种策略
+    必须先 `--reset` 清掉第一种。归档就是把清掉之前的证据留下来 ——
+    此前这份「RPS vs 合成分」的对照只能手写进 README。
+    """
+    s = summary(conn)
+    if not s["days"]:
+        raise SimError("模拟盘还没有曲线，无可归档")
+    rev = review(conn)
+    params = meta_get(conn, "params") or {}
+    name = (label or "").strip() or (
+        f"{params.get('signal', 'rps')}-{datetime.now():%Y%m%d-%H%M%S}")
+    metrics = {**(rev.get("summary") or {}), "benchmark": rev.get("benchmark")}
+    cur = conn.execute(
+        "INSERT INTO paper_archive(label, params, initial_cash, from_date, to_date,"
+        " total, nav, total_return, max_drawdown, days, metrics, curve, created_at)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (name, json.dumps(params, ensure_ascii=False), float(s["initial_cash"]),
+         s["from"], s["to"], float(s["total"]), float(s["nav"]),
+         float(s["return"]), float(s["max_drawdown"]), int(s["days"]),
+         json.dumps(metrics, ensure_ascii=False),
+         json.dumps(s["curve"], ensure_ascii=False), db.now()))
+    conn.commit()
+    return {"id": int(cur.lastrowid), "label": name, "days": s["days"],
+            "total": s["total"], "return": s["return"]}
+
+
+def list_archives(conn: sqlite3.Connection, limit: int = 10) -> list[dict]:
+    """最近的归档（新的在前）。**含曲线**，供对照页叠加画图。"""
+    rows = conn.execute(
+        "SELECT * FROM paper_archive ORDER BY id DESC LIMIT ?",
+        (max(1, int(limit)),)).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        for key in ("params", "metrics", "curve"):
+            try:
+                d[key] = json.loads(d[key])
+            except (TypeError, ValueError):
+                d[key] = {} if key != "curve" else []
+        out.append(d)
+    return out
+
+
+def delete_archive(conn: sqlite3.Connection, arch_id: int) -> bool:
+    """删掉一份归档；返回是否真的删到了。"""
+    cur = conn.execute("DELETE FROM paper_archive WHERE id = ?", (int(arch_id),))
+    conn.commit()
+    return bool(cur.rowcount)
 
 
 def _trading_calendar(conn: sqlite3.Connection) -> dict[str, int]:

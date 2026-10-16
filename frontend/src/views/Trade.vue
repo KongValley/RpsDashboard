@@ -226,6 +226,64 @@
       </template>
     </div>
 
+    <!-- 策略对照：模拟盘只有一个活动账户，换策略前先归档 -->
+    <div class="panel" style="margin-top:12px">
+      <div class="flex items-center gap-3" style="margin-bottom:12px">
+        <h3 style="margin:0">策略对照</h3>
+        <span class="muted">
+          模拟盘只有一个活动账户（换策略要 <code>--reset</code>）—— 跑新策略前先归档，
+          旧曲线才不会丢。对照此前只能手写进 README。
+        </span>
+        <div class="spacer" />
+        <button class="btn" :disabled="!paper?.days" @click="archiveCurrent">
+          归档当前曲线
+        </button>
+      </div>
+
+      <p v-if="!archives.length" class="muted">
+        还没有归档。当前曲线跑到想留下的时候点上面的按钮；归档后会在这里叠加比较。
+      </p>
+      <template v-else>
+        <table class="w-table">
+          <thead>
+            <tr>
+              <th style="width:36px">对比</th><th>名称</th><th>参数</th>
+              <th class="num">收益</th><th class="num">回撤</th><th class="num">天</th>
+              <th>区间</th><th>归档时间</th><th></th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="a in archives" :key="a.id">
+              <td>
+                <input type="checkbox" :value="a.id" v-model="picked" />
+              </td>
+              <td>{{ a.label }}</td>
+              <td class="muted" style="font-size:11px">{{ paramText(a.params) }}</td>
+              <td class="num" :class="a.total_return >= 0 ? 'up' : 'down'">
+                {{ pct(a.total_return) }}
+              </td>
+              <td class="num down">{{ pct(-a.max_drawdown) }}</td>
+              <td class="num muted">{{ a.days }}</td>
+              <td class="muted" style="font-size:11px">
+                {{ a.from_date }} ~ {{ a.to_date }}
+              </td>
+              <td class="muted" style="font-size:11px">{{ (a.created_at || '').replace('T', ' ') }}</td>
+              <td>
+                <button class="btn" @click="removeArchive(a)">删除</button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <VChart v-if="picked.length || paper?.days" class="chart"
+                :option="compareOption" autoresize />
+        <p class="muted note">
+          纵轴是净值倍数（1.0 = 本金），与上面的模拟盘曲线同口径；
+          「当前」是活动账户的曲线。归档保存的是归档那一刻的净值、持仓与复盘指标，
+          归档之后重跑不会改动它。
+        </p>
+      </template>
+    </div>
+
     <!-- 对账 -->
     <div class="panel" style="margin-top:12px">
       <div class="flex items-center gap-3" style="margin-bottom:12px">
@@ -389,6 +447,98 @@ const paperDays = computed(() => (paper.value?.curve || [])
 const review = computed(() => paper.value?.review || {
   summary: {}, round_trips: [], industry: [], notes: [], benchmark: null,
 })
+
+/** 曲线归档列表（策略对照） */
+const archives = ref([])
+/** 参与对照的归档 id */
+const picked = ref([])
+
+const COMPARE_COLORS = ['#f6465d', '#4c9aff', '#f0a020', '#2ebd85', '#b06cf0', '#38bdf8']
+
+/** 归档的参数摘要（对照表里要一眼看出两条曲线差在哪儿） */
+function paramText(p) {
+  if (!p || !Object.keys(p).length) return '—'
+  const parts = [
+    p.signal === 'composite' ? '合成分' : `RPS${p.period ?? ''}`,
+    p.threshold != null ? `≥${p.threshold}` : null,
+    p.hold != null ? `持有${p.hold}` : null,
+    p.max_positions != null ? `最多${p.max_positions}只` : null,
+  ]
+  return parts.filter(Boolean).join(' · ')
+}
+
+/** 当前曲线 + 勾选的归档叠加（按交易日并集对齐；不同曲线区间可以不同） */
+const compareOption = computed(() => {
+  const cur = paper.value?.curve || []
+  const chosen = archives.value.filter((a) => picked.value.includes(a.id))
+  const toMap = (rows) => new Map((rows || []).map((r) => [r.trade_date, r.nav]))
+  const entries = []
+  if (cur.length) entries.push({ name: '当前', map: toMap(cur) })
+  for (const a of chosen) entries.push({ name: a.label, map: toMap(a.curve) })
+
+  const dateSet = new Set()
+  for (const e of entries) for (const d of e.map.keys()) dateSet.add(d)
+  const dates = [...dateSet].sort()
+  const series = entries.map((e, i) => ({
+    name: e.name,
+    type: 'line',
+    showSymbol: false,
+    connectNulls: true,
+    data: dates.map((d) => e.map.get(d) ?? null),
+    lineStyle: { color: COMPARE_COLORS[i % COMPARE_COLORS.length], width: i === 0 ? 2 : 1.5 },
+  }))
+  return {
+    tooltip: { trigger: 'axis' },
+    legend: { data: series.map((s) => s.name), textStyle: { color: '#8b98a9' }, top: 0 },
+    grid: { left: 60, right: 30, top: 34, bottom: 40 },
+    xAxis: {
+      type: 'category', data: dates,
+      axisLabel: { color: '#8b98a9', fontSize: 10 },
+      axisLine: { lineStyle: { color: '#2a323d' } },
+    },
+    yAxis: {
+      type: 'value', scale: true, axisLabel: { color: '#8b98a9' },
+      splitLine: { lineStyle: { color: 'rgba(42,50,61,.6)' } },
+    },
+    series,
+  }
+})
+
+async function loadArchives() {
+  try {
+    const d = await tradeApi.archives()
+    archives.value = d.rows || []
+    // 默认全选（对照页打开就想看到全部；取消勾选即可隐藏）
+    picked.value = archives.value.map((a) => a.id)
+  } catch (e) {
+    console.warn('归档列表加载失败', e)
+  }
+}
+
+async function archiveCurrent() {
+  const label = window.prompt('归档名（留空按信号源 + 时间生成）', '')
+  if (label === null) return
+  try {
+    const r = await tradeApi.archive(label || null)
+    if (!r.ok) {
+      errMsg.value = r.error || '归档失败'
+      return
+    }
+    await loadArchives()
+  } catch (e) {
+    errMsg.value = `归档失败：${e?.message || e}`
+  }
+}
+
+async function removeArchive(a) {
+  if (!window.confirm(`删除归档「${a.label}」？删掉之后这条曲线就找不回来了。`)) return
+  try {
+    await tradeApi.removeArchive(a.id)
+    await loadArchives()
+  } catch (e) {
+    errMsg.value = `删除归档失败：${e?.message || e}`
+  }
+}
 const pct = (v) => (v == null || Number.isNaN(Number(v))
   ? '—'
   : `${(Number(v) * 100).toFixed(2)}%`)
@@ -489,6 +639,7 @@ async function takeSnapshot() {
 
 onMounted(async () => {
   await reload()
+  await loadArchives()
   timer = setInterval(reload, POLL_MS)
 })
 

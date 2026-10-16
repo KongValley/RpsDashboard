@@ -279,6 +279,49 @@ def paper(date: str | None = Query(
                 "round_trips": [], "review": {}}
 
 
+@router.get("/paper/archives")
+def paper_archives(limit: int = Query(default=10, ge=1, le=50)) -> dict:
+    """模拟盘曲线归档列表（**含曲线**，供策略对照页叠加画图）。只读库。"""
+    from ..broker import sim
+
+    conn = get_conn()
+    try:
+        return {"rows": sim.list_archives(conn, limit=int(limit))}
+    except sim.SimError as exc:
+        return {"rows": [], "error": str(exc)}
+
+
+class ArchiveBody(BaseModel):
+    label: str | None = None
+
+
+@router.post("/paper/archive")
+def paper_archive(body: ArchiveBody | None = None) -> dict:
+    """把**当前**曲线归档一份。写库（与 halt / snapshot 同类）。
+
+    模拟盘只有一个活动账户：跑第二种策略前先归档，否则 `--reset` 之后
+    这条曲线就再也拿不回来了。
+    """
+    from ..broker import sim
+
+    with db.session() as conn:
+        try:
+            res = sim.archive(conn, (body.label if body else None) or None)
+        except sim.SimError as exc:
+            return {"ok": False, "error": str(exc)}
+    _summary_cache.pop("v", None)
+    return {"ok": True, **res}
+
+
+@router.delete("/paper/archives/{arch_id}")
+def paper_archive_delete(arch_id: int) -> dict:
+    from ..broker import sim
+
+    with db.session() as conn:
+        removed = sim.delete_archive(conn, int(arch_id))
+    return {"ok": removed, "id": int(arch_id)}
+
+
 @router.get("/snapshot/status")
 def snapshot_status() -> dict:
     return dict(_snapshot_state)

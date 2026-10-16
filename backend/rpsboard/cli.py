@@ -924,6 +924,40 @@ def cmd_trade_paper(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_trade_archive(args: argparse.Namespace) -> int:
+    """模拟盘曲线归档：`--save` 存一份、`--rm` 删一份、都不给则列出。**不连 QMT。**"""
+    from .broker import sim
+
+    db.init_db()
+    with db.session() as conn:
+        if args.rm is not None:
+            ok = sim.delete_archive(conn, int(args.rm))
+            print(f"[paper] 归档 #{args.rm} " + ("已删除" if ok else "不存在"))
+            return 0 if ok else 2
+        if getattr(args, "save", False):
+            try:
+                res = sim.archive(conn, args.label)
+            except sim.SimError as exc:
+                print(f"[paper] {exc}", file=sys.stderr)
+                return 2
+            print(f"[paper] 已归档 #{res['id']}「{res['label']}」"
+                  f"{res['days']} 个交易日，收益 {res['return']:+.2%}")
+            return 0
+        rows = sim.list_archives(conn)
+
+    if not rows:
+        print("[paper] 还没有归档：cli trade archive --save --label RPS60")
+        return 0
+    print(f"{'ID':>4}  {'名称':<20}{'区间':<25}{'收益':>9}{'回撤':>9}{'天':>6}")
+    for r in rows:
+        mdd = float((r.get("metrics") or {}).get("max_drawdown") or 0.0)
+        span = f"{r.get('from_date') or '—'}~{r.get('to_date') or '—'}"
+        print(f"{r['id']:>4}  {str(r['label'])[:18]:<20}{span:<25}"
+              f"{float(r['total_return']):>+8.2%}{-mdd:>9.2%}{int(r['days']):>6}")
+    print("\n页面上可以在「交易 → 策略对照」里叠加比较；跑新策略前记得先 --save。")
+    return 0
+
+
 # ── trade（QMT：只读 / 影子 / 券商模拟盘；**没有实盘**）────────────
 # 退出码：0 正常；2 配置或连接失败；3 有差异/有跳过项；4 部分委托失败。
 # **没有实盘分支**：`execute` 只在 plan.mode=sim 且带 --i-know-this-is-sim 时放行。
@@ -940,9 +974,10 @@ def cmd_trade(args: argparse.Namespace) -> int:
         "halt": cmd_trade_halt,
         "run": cmd_trade_paper_run,
         "paper": cmd_trade_paper,
+        "archive": cmd_trade_archive,
     }.get(action)
     if fn is None:
-        print("[trade] 用法：cli trade run|paper|status|snapshot|plan|shadow|"
+        print("[trade] 用法：cli trade run|paper|archive|status|snapshot|plan|shadow|"
               "calibrate|execute|reconcile|halt", file=sys.stderr)
         return 2
     return fn(args)
@@ -1562,6 +1597,12 @@ def build_parser() -> argparse.ArgumentParser:
     t_run.add_argument("--reset", action="store_true", help="先清空模拟盘再跑（不可恢复）")
     t_run.add_argument("--yes-reset", action="store_true", help="确认 --reset")
     tsub.add_parser("paper", help="打印模拟盘净值与持仓")
+
+    # 曲线归档：跑第二种策略前先把第一种存下来（模拟盘只有一个活动账户）
+    t_arch = tsub.add_parser("archive", help="模拟盘曲线归档：--save 存一份 / --rm 删一份 / 缺省列出")
+    t_arch.add_argument("--save", action="store_true", help="把当前曲线归档一份")
+    t_arch.add_argument("--label", default=None, help="归档名（配合 --save，缺省按信号源+时间生成）")
+    t_arch.add_argument("--rm", type=int, default=None, help="删除指定 id 的归档")
 
     tsub.add_parser("status", help="拉账户与持仓并写 position_snapshot")
     tsub.add_parser("snapshot", help="只刷新持仓快照（不查资金、不下单）")
