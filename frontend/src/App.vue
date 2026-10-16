@@ -109,6 +109,7 @@ const PHASES = {
   patterns: '识别三升底',
   alerts: '评估预警规则',
   quality: '复权异常扫描（约 20 秒）',
+  paper: '推进模拟盘',
   done: '完成',
   failed: '失败',
 }

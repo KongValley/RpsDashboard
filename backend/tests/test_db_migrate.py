@@ -95,6 +95,65 @@ def test_ensure_period_columns_is_noop_on_new_db(tmp_path):
         conn.close()
 
 
+OLD_FILL_DDL = """
+CREATE TABLE IF NOT EXISTS trade_fill (
+  trade_date      TEXT NOT NULL,
+  broker_order_id INTEGER NOT NULL,
+  broker_trade_id INTEGER NOT NULL,
+  symbol          TEXT NOT NULL,
+  side            TEXT NOT NULL,
+  volume          INTEGER NOT NULL,
+  price           REAL NOT NULL,
+  traded_at       TEXT NOT NULL,
+  PRIMARY KEY (broker_order_id, broker_trade_id)
+);
+"""
+
+
+def test_ensure_fill_columns_backfills_old_db(tmp_path):
+    """老库的 `trade_fill` 没有 fee/realized_pnl/avg_cost：必须幂等补列且不动数据。"""
+    conn = sqlite3.connect(str(tmp_path / "old_fill.db"))
+    conn.executescript(OLD_FILL_DDL)
+    conn.execute(
+        "INSERT INTO trade_fill(trade_date, broker_order_id, broker_trade_id, symbol,"
+        " side, volume, price, traded_at) VALUES ('2026-01-05', 900000001, 1,"
+        " '000001', 'buy', 1000, 10.05, '2026-01-05T15:00:00')")
+    conn.commit()
+
+    added = dbmod.ensure_fill_columns(conn)
+    assert set(added) == {"trade_fill.fee", "trade_fill.realized_pnl",
+                          "trade_fill.avg_cost"}
+
+    row = conn.execute("SELECT * FROM trade_fill").fetchone()
+    cols = [d[0] for d in conn.execute("SELECT * FROM trade_fill").description]
+    got = dict(zip(cols, row))
+    assert got["volume"] == 1000 and got["price"] == 10.05
+    assert got["fee"] == 0, "老成交没有费用记录，宁可显示 0/未知也不猜"
+    assert got["realized_pnl"] is None
+    assert got["avg_cost"] is None
+
+    # 幂等：列都在时完全无副作用
+    assert dbmod.ensure_fill_columns(conn) == []
+    conn.close()
+
+
+def test_init_db_adds_fill_columns_to_existing_db(tmp_path):
+    """`cli init` 必须把老库升级到位（迁移的唯一入口）。"""
+    path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(str(path))
+    conn.executescript(OLD_FILL_DDL)
+    conn.commit()
+    conn.close()
+
+    dbmod.init_db(path)
+    conn = sqlite3.connect(str(path))
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(trade_fill)")}
+        assert {"fee", "realized_pnl", "avg_cost"} <= cols
+    finally:
+        conn.close()
+
+
 def test_full_materialize_drops_and_rebuilds_period_index(tmp_path):
     """全量重算先删覆盖索引、写完重建：跑完之后索引必须回来，且没有冗余索引。
 

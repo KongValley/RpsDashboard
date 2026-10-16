@@ -145,6 +145,141 @@ def test_limit_down_day_blocks_sell(simdb):
         assert acc.positions["000001"] == 1000
 
 
+def test_suspended_deferred_order_is_retried_next_day(simdb):
+    """停牌顺延的委托必须在恢复交易日被撮合，而不是永久卡 pending。
+
+    原先 `settle_day` 只捞 `trade_date = 当天` 的挂单，而顺延**不改日期** ——
+    第二天按新日期查询就再也看不到它：既不成交也不撤销（模块 docstring 与
+    README 承诺的"顺延到下一个交易日"从未生效）。
+    """
+    with dbmod.session(simdb) as conn:
+        sim.init_account(conn, CASH)
+        _bars(conn, [("000001", 10.0, 10.1, 9.9, 10.0, 1)], "2026-01-02")
+        _bars(conn, [("000001", 10.0, 10.0, 10.0, 10.0, 0)], "2026-01-05")  # 停牌
+        _bars(conn, [("000001", 10.0, 10.6, 9.8, 10.4, 1)], "2026-01-06")   # 恢复
+        _order(conn, 1, "2026-01-05", "000001", "buy", 1000, 10.05)
+
+        acc = sim.load_account(conn)
+        d1 = sim.settle_day(conn, acc, "2026-01-05", "2026-01-02")
+        assert d1["deferred"] == 1 and _status(conn, "000001") == "pending"
+
+        d2 = sim.settle_day(conn, acc, "2026-01-06", "2026-01-05")
+        assert d2["filled"] == 1, "顺延的委托在恢复交易后必须被撮合"
+        assert acc.positions["000001"] == 1000
+        assert _status(conn, "000001") == "filled"
+
+        d3 = sim.settle_day(conn, acc, "2026-01-07", "2026-01-06")
+        assert d3["filled"] == 0, "已成交的委托不该被再撮合一次"
+        assert conn.execute("SELECT COUNT(*) c FROM trade_fill").fetchone()["c"] == 1
+
+
+def test_limit_blocked_buy_keeps_retrying_until_tradable(simdb):
+    """涨停日买不进只是顺延：后续交易日继续尝试，直到能成交。"""
+    with dbmod.session(simdb) as conn:
+        sim.init_account(conn, CASH)
+        _bars(conn, [("000001", 10.0, 10.1, 9.9, 10.0, 1)], "2026-01-02")
+        _limits(conn, [("000001", 10.0, "normal")], "2026-01-02")
+        # D1、D2 都是开盘即涨停（相对前收 +10%），委托价挂不进去
+        _bars(conn, [("000001", 11.0, 11.0, 11.0, 11.0, 1)], "2026-01-05")
+        _limits(conn, [("000001", 10.0, "normal")], "2026-01-05")
+        _bars(conn, [("000001", 12.1, 12.1, 12.1, 12.1, 1)], "2026-01-06")
+        _limits(conn, [("000001", 10.0, "normal")], "2026-01-06")
+        # D3 回落，限价 10.05 能成交
+        _bars(conn, [("000001", 10.4, 10.6, 9.9, 10.5, 1)], "2026-01-07")
+        _limits(conn, [("000001", 10.0, "normal")], "2026-01-07")
+        _order(conn, 1, "2026-01-05", "000001", "buy", 1000, 10.05)
+
+        acc = sim.load_account(conn)
+        r1 = sim.settle_day(conn, acc, "2026-01-05", "2026-01-02")
+        r2 = sim.settle_day(conn, acc, "2026-01-06", "2026-01-05")
+        assert r1["deferred"] == 1 and r2["deferred"] == 1, \
+            "涨停日应顺延而不是撤单"
+        assert _status(conn, "000001") == "pending"
+        assert "000001" not in acc.positions
+
+        r3 = sim.settle_day(conn, acc, "2026-01-07", "2026-01-06")
+        assert r3["filled"] == 1
+        assert acc.positions["000001"] == 1000
+        assert conn.execute("SELECT COUNT(*) c FROM trade_fill").fetchone()["c"] == 1
+
+
+def test_fill_persists_fee_and_realized_pnl(simdb):
+    """成交必须落库费用与已实现盈亏 —— 复盘靠它们，而不靠重放曲线。"""
+    from datetime import date as _date
+
+    from rpsboard.analytics import costs as costs_mod
+
+    model = costs_mod.default_cost_model(enabled=True)
+    with dbmod.session(simdb) as conn:
+        sim.init_account(conn, CASH)
+        _bars(conn, [("000001", 10.0, 10.1, 9.9, 10.0, 1)], "2026-01-02")
+        _bars(conn, [("000001", 10.05, 10.6, 9.95, 10.5, 1)], "2026-01-05")
+        _bars(conn, [("000001", 10.5, 11.5, 10.4, 11.2, 1)], "2026-01-06")
+        _order(conn, 1, "2026-01-05", "000001", "buy", 1000, 10.05)
+        _order(conn, 1, "2026-01-06", "000001", "sell", 1000, 11.0)
+
+        acc = sim.load_account(conn)
+        sim.settle_day(conn, acc, "2026-01-05", "2026-01-02")
+        sim.settle_day(conn, acc, "2026-01-06", "2026-01-05")
+        sim.mark_to_market(conn, acc, "2026-01-06")   # 现金由盯市写回 paper_account
+
+        fills = {r["side"]: dict(r) for r in conn.execute(
+            "SELECT * FROM trade_fill")}
+        cash_end = float(conn.execute(
+            "SELECT cash FROM paper_account WHERE id=1").fetchone()["cash"])
+
+    buy, sell = fills["buy"], fills["sell"]
+    fee_buy = model.buy_cost(10.05 * 1000)
+    fee_sell = model.sell_cost(11.0 * 1000, _date(2026, 1, 6))
+    assert buy["fee"] == pytest.approx(fee_buy)
+    assert buy["realized_pnl"] is None, "买入没有已实现盈亏"
+    assert buy["avg_cost"] == pytest.approx((10.05 * 1000 + fee_buy) / 1000)
+
+    basis = 10.05 * 1000 + fee_buy
+    assert sell["fee"] == pytest.approx(fee_sell)
+    assert sell["realized_pnl"] == pytest.approx(11.0 * 1000 - fee_sell - basis)
+    assert sell["avg_cost"] == pytest.approx(basis / 1000)
+
+    # 平仓后：现金变动 == 已实现盈亏（没有任何持仓成本残留）
+    assert cash_end - CASH == pytest.approx(sell["realized_pnl"])
+
+
+def test_partial_sell_reduces_held_position(simdb):
+    """部分卖出必须把持仓股数减掉。
+
+    原先只更新了 `avg_cost`、**没有改 `acc.positions`**：账户还以为自己握着
+    卖掉的股数，下一次调仓就照着这个虚高的数量再卖一遍（实测 7800 卖掉 100
+    之后又卖掉 7800，凭空多出 100 股的现金），期末现金与净值都会偏高。
+    """
+    with dbmod.session(simdb) as conn:
+        sim.init_account(conn, CASH)
+        _bars(conn, [("000001", 10.0, 10.1, 9.9, 10.0, 1)], "2026-01-02")
+        _bars(conn, [("000001", 10.0, 10.6, 9.9, 10.5, 1)], "2026-01-05")
+        _bars(conn, [("000001", 10.5, 10.8, 10.2, 10.6, 1)], "2026-01-06")
+
+        acc = sim.load_account(conn)
+        _order(conn, 1, "2026-01-05", "000001", "buy", 1000, 10.05)
+        sim.settle_day(conn, acc, "2026-01-05", "2026-01-02")
+        assert acc.positions["000001"] == 1000
+        unit_cost = acc.avg_cost["000001"]
+
+        _order(conn, 1, "2026-01-06", "000001", "sell", 400, 10.4)
+        sim.settle_day(conn, acc, "2026-01-06", "2026-01-05")
+        assert acc.positions["000001"] == 600, "部分卖出必须把持仓减到 600"
+        assert acc.avg_cost["000001"] == pytest.approx(unit_cost), \
+            "部分卖出不改变每股成本"
+
+        # 再想卖 1000（超过现持）只能成交 600，且必须正好清仓、不留负持仓
+        _bars(conn, [("000001", 10.6, 10.9, 10.3, 10.7, 1)], "2026-01-07")
+        _order(conn, 1, "2026-01-07", "000001", "sell", 1000, 10.5)
+        sim.settle_day(conn, acc, "2026-01-07", "2026-01-06")
+        assert "000001" not in acc.positions, "持股不足时按整手缩减后正好清仓"
+        last_vol = conn.execute(
+            "SELECT volume FROM trade_fill WHERE side='sell'"
+            " ORDER BY trade_date DESC LIMIT 1").fetchone()["volume"]
+        assert last_vol == 600
+
+
 def test_no_price_limit_status_is_not_blocked(simdb):
     """新股前 5 日无涨跌幅限制：不能因为缺 ratio 就拦掉。"""
     with dbmod.session(simdb) as conn:

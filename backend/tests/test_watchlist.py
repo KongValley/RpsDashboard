@@ -292,6 +292,57 @@ def test_update_pipeline_runs_industry_and_alerts(tmp_path, monkeypatch):
     assert "industry" not in phases2, "已有行业数据时必须跳过，不能悄悄换口径"
 
 
+def test_update_pipeline_paper_phase_is_opt_in(tmp_path, monkeypatch):
+    """`paper=True` 才推进模拟盘；且续跑参数取库里记录的那一份。
+
+    验证的是**接线**：默认关闭（它会加载全市场矩阵，耗时以分钟计）、
+    打开时用已有曲线的参数调用 `sim.run`，而不是另写一套默认值 ——
+    那样会与曲线创建时的参数不一致，被续跑校验直接拒绝。
+    """
+    from rpsboard import cli
+    from rpsboard import config as cfg
+    from rpsboard import db as dbmod
+    from rpsboard.broker import sim
+
+    path = tmp_path / "paper_pipe.db"
+    dbmod.init_db(path)
+    monkeypatch.setattr(cfg, "DB_PATH", path)
+    monkeypatch.setattr(cfg, "ensure_dirs", lambda: None)
+    monkeypatch.setattr(cli, "cmd_backfill", lambda _ns: 0)
+    monkeypatch.setattr(cli, "cmd_compute_rps", lambda _ns: 0)
+    monkeypatch.setattr(cli, "cmd_patterns", lambda _ns: 0)
+    monkeypatch.setattr(cli, "cmd_industry_map", lambda _ns: 0)
+    from rpsboard.sources import limit_src
+
+    monkeypatch.setattr(limit_src, "sync_price_limits", lambda *_a, **_k: 0)
+    calls: list[dict] = []
+    monkeypatch.setattr(sim, "run", lambda conn, **kw: (
+        calls.append(kw), {"days": 3, "final_total": 1.0, "return": 0.0})[1])
+
+    phases: list[str] = []
+    res = cli.run_update_pipeline(progress=phases.append)
+    assert res["paper"] is None and not calls, "默认不该推进模拟盘"
+    assert "paper" not in phases
+
+    with dbmod.session(path) as conn:
+        conn.execute(
+            "INSERT INTO paper_nav(trade_date, cash, market_value, total, nav,"
+            " n_positions) VALUES ('2026-01-05', 1000000, 0, 1000000, 1.0, 0)")
+        # 老格式：缺 signal 键
+        conn.execute("INSERT INTO paper_meta(key, value) VALUES ('params', ?)",
+                     ('{"period":60,"threshold":80.0,"hold":20,"max_positions":20,'
+                      '"exclude_st":true,"resonance":false}',))
+        conn.commit()
+
+    phases2: list[str] = []
+    res2 = cli.run_update_pipeline(progress=phases2.append, paper=True)
+    assert "paper" in phases2 and phases2[-1] == "done"
+    assert res2["paper"] == {"days": 3, "total": 1.0, "return": 0.0}
+    assert calls, "paper=True 必须真的调用 sim.run"
+    assert calls[-1]["signal"] == "rps" and calls[-1]["hold"] == 20, \
+        "续跑参数必须取库里记录的那一份（老格式缺 signal 时按默认值补齐）"
+
+
 def test_cli_alert_rm_removes_hits(tmp_path, monkeypatch):
     """CLI 删规则要连带删命中记录（与 API 的 DELETE 行为一致）。
 

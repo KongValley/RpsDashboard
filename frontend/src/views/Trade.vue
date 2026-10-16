@@ -59,14 +59,25 @@
           本项目自己撮合：T 日收盘按 close×(1±0.5%) 挂限价单，T+1 日内按区间判定成交。
           <b>不需要任何券商账号</b>，也不连 QMT。
         </span>
+        <div class="spacer" />
+        <label v-if="paper?.days" class="muted">回看
+          <select v-model="paperDate" @change="reloadPaper" style="margin-left:6px">
+            <option value="">最新</option>
+            <option v-for="d in paperDays" :key="d" :value="d">{{ d }}</option>
+          </select>
+        </label>
       </div>
 
       <p v-if="!paper?.days" class="muted">
         还没跑过。在命令行执行
         <code>python -m rpsboard.cli trade run --from 2026-01-01 --cash 1000000</code>
-        即可生成净值曲线。
+        即可生成净值曲线；之后再跑同一条命令（可省 <code>--from</code>）就是<strong>增量推进</strong>，
+        历史净值不会被重算。
       </p>
       <template v-else>
+        <div v-if="paper.date && paper.date !== paper.to" class="warnbar soft inset">
+          正在回看 {{ paper.date }}（曲线最新一天是 {{ paper.to }}）；下方「持仓」是那天的快照。
+        </div>
         <div class="stats" style="margin-bottom:14px">
           <div class="stat">
             <span class="muted">初始资金</span>
@@ -96,7 +107,105 @@
           </div>
         </div>
         <VChart class="chart" :option="navOption" autoresize />
-        <h4 style="margin:16px 0 8px">当前持仓</h4>
+
+        <!-- 复盘：逐笔回合 + 绩效（数字直接来自成交落库的费用/已实现盈亏）-->
+        <template v-if="review.summary && review.summary.round_trips">
+          <h4 style="margin:16px 0 8px">绩效复盘</h4>
+          <div class="stats" style="margin-bottom:10px">
+            <div class="stat">
+              <span class="muted">回合数</span>
+              <strong>{{ review.summary.round_trips }}</strong>
+            </div>
+            <div class="stat">
+              <span class="muted">胜率</span>
+              <strong>{{ pct(review.summary.win_rate) }}</strong>
+              <span class="sub muted">{{ review.summary.wins }} 盈 / {{ review.summary.losses }} 亏</span>
+            </div>
+            <div class="stat">
+              <span class="muted">盈亏比</span>
+              <strong>{{ num2(review.summary.profit_factor) }}</strong>
+              <span class="sub muted">总盈 {{ money(review.summary.gross_win) }}</span>
+            </div>
+            <div class="stat">
+              <span class="muted">平均持有</span>
+              <strong>{{ review.summary.avg_holding_days ?? '—' }} 日</strong>
+            </div>
+            <div class="stat">
+              <span class="muted">已实现</span>
+              <strong :class="review.summary.realized_total >= 0 ? 'up' : 'down'">
+                {{ money(review.summary.realized_total) }}
+              </strong>
+            </div>
+            <div class="stat">
+              <span class="muted">浮动盈亏</span>
+              <strong :class="review.summary.unrealized_total >= 0 ? 'up' : 'down'">
+                {{ money(review.summary.unrealized_total) }}
+              </strong>
+            </div>
+            <div class="stat">
+              <span class="muted">累计费用</span>
+              <strong>{{ money(review.summary.fees_total) }}</strong>
+            </div>
+            <div class="stat" v-if="review.benchmark">
+              <span class="muted">超额（vs 沪深300）</span>
+              <strong :class="review.benchmark.excess >= 0 ? 'up' : 'down'">
+                {{ pct(review.benchmark.excess) }}
+              </strong>
+              <span class="sub muted">基准 {{ pct(review.benchmark.return) }}</span>
+            </div>
+          </div>
+          <div class="note muted" v-for="(n, i) in review.notes" :key="i">· {{ n }}</div>
+
+          <h4 style="margin:16px 0 8px">逐笔回合（{{ review.round_trips.length }} 笔）</h4>
+          <table class="w-table">
+            <thead>
+              <tr>
+                <th>代码</th><th>买入日</th><th>卖出日</th>
+                <th class="num">股数</th><th class="num">买入价</th><th class="num">卖出价</th>
+                <th class="num">持有</th><th class="num">费用</th><th class="num">已实现盈亏</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="(t, i) in review.round_trips" :key="i">
+                <td class="mono">{{ t.symbol }}</td>
+                <td class="mono muted">{{ t.buy_date || '—' }}</td>
+                <td class="mono">{{ t.sell_date }}</td>
+                <td class="num">{{ num(t.volume) }}</td>
+                <td class="num">{{ fmt2(t.buy_price) }}</td>
+                <td class="num">{{ fmt2(t.sell_price) }}</td>
+                <td class="num muted">{{ t.holding_days ?? '—' }}</td>
+                <td class="num muted">{{ money(t.fee) }}</td>
+                <td class="num" :class="t.realized_pnl >= 0 ? 'up' : 'down'">
+                  {{ money(t.realized_pnl) }}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+
+          <template v-if="review.industry.length">
+            <h4 style="margin:16px 0 8px">当前持仓行业分布</h4>
+            <table class="w-table">
+              <thead>
+                <tr><th>行业</th><th class="num">只数</th><th class="num">市值</th><th class="num">占比</th></tr>
+              </thead>
+              <tbody>
+                <tr v-for="g in review.industry" :key="g.industry">
+                  <td>{{ g.industry }}</td>
+                  <td class="num">{{ g.n }}</td>
+                  <td class="num">{{ money(g.market_value) }}</td>
+                  <td class="num">{{ pct(g.weight) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </template>
+        </template>
+
+        <h4 style="margin:16px 0 8px">
+          持仓
+          <span class="muted" style="font-weight:400;font-size:12px">
+            {{ paper.date && paper.date !== paper.to ? `${paper.date} 当日快照` : '最新一天' }}
+          </span>
+        </h4>
         <table class="w-table">
           <thead>
             <tr><th>代码</th><th class="num">股数</th><th class="num">成本</th><th class="num">现价</th><th class="num">市值</th><th class="num">浮动盈亏</th></tr>
@@ -268,6 +377,18 @@ const modeLabel = computed(() => ({
 }[s.value?.mode] ?? s.value?.mode ?? '—'))
 
 const num = (v) => (v == null ? '—' : Number(v).toLocaleString('zh-CN'))
+/** 需要固定小数位的数字（盈亏比之类） */
+const num2 = (v) => (v == null || Number.isNaN(Number(v)) ? '—' : Number(v).toFixed(2))
+const fmt2 = (v) => (v == null ? '—' : Number(v).toFixed(2))
+/** 自建模拟盘回看日期（空 = 最新一天） */
+const paperDate = ref('')
+/** 可选回看日 = 曲线自身的交易日（倒序），不必再拉一份日期清单 */
+const paperDays = computed(() => (paper.value?.curve || [])
+  .map((c) => c.trade_date).reverse())
+/** 复盘指标（后端 review；旧接口无此字段时给空结构） */
+const review = computed(() => paper.value?.review || {
+  summary: {}, round_trips: [], industry: [], notes: [], benchmark: null,
+})
 const pct = (v) => (v == null || Number.isNaN(Number(v))
   ? '—'
   : `${(Number(v) * 100).toFixed(2)}%`)
@@ -291,7 +412,11 @@ const navOption = computed(() => {
       markLine: {
         silent: true, symbol: 'none',
         lineStyle: { color: '#8b98a9', type: 'dashed', width: 1 },
-        data: [{ yAxis: 1 }],
+        data: [
+          { yAxis: 1 },
+          // 回看某天时在曲线上标一条竖线，免得"看了哪一天"全靠记忆
+          ...(paperDate.value ? [{ xAxis: paperDate.value }] : []),
+        ],
       },
     }],
   }
@@ -311,8 +436,13 @@ async function reload() {
   } catch (e) {
     errMsg.value = `交易状态加载失败：${e?.message || e}`
   }
+  await reloadPaper()
+}
+
+async function reloadPaper() {
   try {
-    paper.value = await tradeApi.paper()
+    paper.value = await tradeApi.paper(
+      paperDate.value ? { date: paperDate.value } : undefined)
   } catch (e) {
     console.warn('模拟盘加载失败', e)
   }

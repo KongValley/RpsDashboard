@@ -885,6 +885,11 @@ def cmd_trade_paper_run(args: argparse.Namespace) -> int:
     print(f"\n[paper] 初始资金 {_money(summary['initial_cash'])} → "
           f"期末 {_money(summary['total'])}（{summary['return']:+.2%}，"
           f"{summary['days']} 个交易日 {summary['from']}~{summary['to']}）")
+    if res.get("resumed_from"):
+        print(f"[paper] 本次为续跑：已结算到 {res['resumed_from']}，"
+              f"新增结算 {res['days']} 个交易日（历史净值不重算）")
+    else:
+        print(f"[paper] 本次新建曲线，结算 {res['days']} 个交易日")
     print(f"[paper] 最大回撤 {summary['max_drawdown']:.2%}｜期末持仓 "
           f"{len(summary['positions'])} 只｜计划 {res['plans']} 次，"
           f"委托 {res['orders']} 笔，成交 {res['filled']} 笔，"
@@ -1320,7 +1325,8 @@ def _ns(cmd: str = "status", **over):
     return argparse.Namespace(**base)
 
 
-def run_update_pipeline(progress=None, workers: int | None = None) -> dict:
+def run_update_pipeline(progress=None, workers: int | None = None,
+                        paper: bool = False) -> dict:
     """完整更新流程：拉日K → 采涨跌停 → 重算 RPS。
 
     供 API 后台线程与 update.bat 共用。任一步失败即中止并把错误抛出，
@@ -1328,6 +1334,10 @@ def run_update_pipeline(progress=None, workers: int | None = None) -> dict:
 
     每一步都用**该子命令自己的** parser 生成参数（`_ns("<cmd>")`），
     这样新增/改名参数不会让这条流水线悄悄跑偏。
+
+    `paper=True` 时在末尾把自建模拟盘**增量推进**到今天（已有曲线时只结算
+    新交易日，历史净值不重算）。默认关闭：它会加载全市场矩阵，耗时以分钟计，
+    不该塞进每一次「更新数据」。
     """
     say = progress or (lambda _phase: None)
     say("bars")
@@ -1379,8 +1389,31 @@ def run_update_pipeline(progress=None, workers: int | None = None) -> dict:
     if rc != 0:
         print(f"[quality] 复权异常扫描失败（退出码 {rc}），本次更新继续")
 
+    # 自建模拟盘增量推进（可选）：只结算上次之后的新交易日，历史净值不重算。
+    # 失败不阻断更新的其余部分 —— 模拟盘是消费端，不该因为它把数据更新拖挂。
+    paper_info: dict | None = None
+    if paper:
+        say("paper")
+        from .broker import sim
+        try:
+            with db.session() as conn:
+                if sim.last_settled_date(conn) is None:
+                    print("[paper] 还没有模拟盘曲线，跳过"
+                          "（首次：cli trade run --from <日期>）")
+                else:
+                    p = sim.resume_params(conn)
+                    c = float(sim.meta_get(conn, "initial_cash") or 1_000_000.0)
+                    st = sim.run(conn, cash=c, **p)
+                    paper_info = {"days": st["days"], "total": st["final_total"],
+                                  "return": st["return"]}
+                    print(f"[paper] 推进 {st['days']} 个交易日，"
+                          f"净值 {st['final_total']:,.0f}（{st['return']:+.2%}）")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[paper] 推进失败：{type(exc).__name__}: {exc}（本次更新继续）")
+
     say("done")
-    return {"ok": True, "price_limit_rows": n_lim, "alert_hits": n_hits}
+    return {"ok": True, "price_limit_rows": n_lim, "alert_hits": n_hits,
+            "paper": paper_info}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1403,7 +1436,11 @@ def build_parser() -> argparse.ArgumentParser:
     # 以前 update 一个参数都没注册：`cli update --workers 4` 会直接 argparse 报错
     up.add_argument("--workers", type=int, default=config.TDX_WORKERS,
                     help="日K 采集并发线程数（默认 8）")
-    up.set_defaults(func=lambda ns: (run_update_pipeline(workers=ns.workers), 0)[1])
+    up.add_argument("--paper", action="store_true",
+                    help="更新后把自建模拟盘增量推进到今天（耗时以分钟计，默认关；"
+                         "首次仍需先手动 cli trade run --from <日期>）")
+    up.set_defaults(func=lambda ns: (run_update_pipeline(
+        workers=ns.workers, paper=ns.paper), 0)[1])
 
     sp = sub.add_parser("industry-map", help="写入 industry_map（eltdx 行业分类或自带 CSV）")
     sp.add_argument("--replace", action="store_true",
@@ -1507,8 +1544,10 @@ def build_parser() -> argparse.ArgumentParser:
     tsub = tsp.add_subparsers(dest="action", required=True)
 
     # 自建模拟盘：全程只读库里的日 K，不需要任何券商账号
-    t_run = tsub.add_parser("run", help="自建模拟盘逐日跑：出计划 → 次日撮合 → 盯市")
-    t_run.add_argument("--from", dest="from_date", required=True, help="起始信号日")
+    t_run = tsub.add_parser("run", help="自建模拟盘逐日推进：出计划 → 次日撮合 → 盯市")
+    t_run.add_argument("--from", dest="from_date", default=None,
+                       help="起始信号日（**只在首次建曲线时用**；已有曲线时被忽略，"
+                            "曲线起点固定，要改起点请配合 --reset）")
     t_run.add_argument("--to", dest="to_date", default=None, help="结束日（缺省至今）")
     t_run.add_argument("--cash", type=float, default=1_000_000.0, help="初始资金（元）")
     t_run.add_argument("--period", type=int, default=config.DEFAULT_PERIOD,

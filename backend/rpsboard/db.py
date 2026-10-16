@@ -262,6 +262,14 @@ CREATE TABLE IF NOT EXISTS trade_fill (
   volume          INTEGER NOT NULL,
   price           REAL NOT NULL,
   traded_at       TEXT NOT NULL,
+  -- 该笔成交产生的费用（佣金/印花税/过户费/滑点）。老库经
+  -- db.ensure_fill_columns 幂等补列，默认 0。
+  fee             REAL NOT NULL DEFAULT 0,
+  -- 仅卖出笔有意义：卖出净收入 − 卖出部分的账面成本（账面成本含累计费用）。
+  -- 买入笔为 NULL。没有它，事后复盘只能靠重放，而重放会污染曲线。
+  realized_pnl    REAL,
+  -- 对账用成本单价：买入 = (成交额 + 费用) / 股数；卖出 = 卖出部分的账面成本 / 股数
+  avg_cost        REAL,
   PRIMARY KEY (broker_order_id, broker_trade_id)
 );
 CREATE INDEX IF NOT EXISTS idx_trade_fill_date ON trade_fill(trade_date);
@@ -359,6 +367,9 @@ def init_db(path: Path | str | None = None) -> None:
         added = ensure_period_columns(conn)
         if added:
             print(f"[db] 新增周期列 {', '.join(added)}（需 cli compute-rps --full 填值）")
+        if ensure_fill_columns(conn):
+            print("[db] trade_fill 已补 fee/realized_pnl/avg_cost 列"
+                  "（历史行无费用记录，显示为 0/未知）")
         if ensure_indexes(conn):
             print("[db] 已重建 rps_daily 覆盖索引（并删除冗余的 idx_rps_date）")
 
@@ -384,6 +395,28 @@ def ensure_period_columns(conn: sqlite3.Connection) -> list[str]:
             if col not in have:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} REAL")
                 added.append(f"{table}.{col}")
+    conn.commit()
+    return added
+
+
+def ensure_fill_columns(conn: sqlite3.Connection) -> list[str]:
+    """给既有库的 `trade_fill` 补上费用/已实现盈亏列（幂等）。
+
+    新库由 SCHEMA 直接带上这些列；老库的 `CREATE TABLE IF NOT EXISTS`
+    不会补列，所以要走一次 ALTER TABLE ADD COLUMN（纯元数据操作，不动数据）。
+    补出来的历史行 `fee=0, realized_pnl=NULL` —— 那些成交确实**没有**记录过
+    费用，宁可让它们显示为"未知"也不要假装是 0 成本。
+    """
+    added: list[str] = []
+    if not table_exists(conn, "trade_fill"):
+        return added
+    have = {row[1] for row in conn.execute("PRAGMA table_info(trade_fill)")}
+    for col, ddl in (("fee", "REAL NOT NULL DEFAULT 0"),
+                     ("realized_pnl", "REAL"),
+                     ("avg_cost", "REAL")):
+        if col not in have:
+            conn.execute(f"ALTER TABLE trade_fill ADD COLUMN {col} {ddl}")
+            added.append(f"trade_fill.{col}")
     conn.commit()
     return added
 

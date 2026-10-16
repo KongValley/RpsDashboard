@@ -87,6 +87,24 @@ def test_missing_limit_row_is_skipped_not_guessed(trade_db):
     assert item["reason"] == "no_limit_row" and item["target_volume"] == 0
 
 
+def test_local_mode_does_not_require_limit_rows(trade_db):
+    """自建模拟盘不需要实测涨跌停行：缺行也必须出得来计划。
+
+    它全程只读库内日K，涨跌停由撮合引擎按收益率比处理（`check_limits=False`）。
+    原先 `no_limit_row` 没看 `check_limits`，缺行会把候选**整只跳过** ——
+    在缺数据的库上模拟盘会一笔都不成交，而它本来完全不需要这行数据。
+    """
+    path, plan_date, _ = trade_db
+    with dbmod.session(path) as conn:
+        top = _candidates(conn, plan_date)[0]
+        conn.execute("DELETE FROM price_limit_daily WHERE symbol=?", (top,))
+        conn.commit()
+        pid, _ = _build(conn, plan_date, mode="local")
+        item = {i["symbol"]: i for i in plan_mod.load_plan(conn, pid)[1]}[top]
+    assert item["reason"] == "ok", item["reason"]
+    assert item["side"] == "buy" and item["target_volume"] > 0
+
+
 def test_price_above_limit_up_is_skipped(trade_db):
     path, plan_date, last_close = trade_db
     with dbmod.session(path) as conn:

@@ -226,8 +226,12 @@ def build_plan(
         reason, ref, price, target, side = "ok", 0.0, None, 0, "hold"
         if statuses.get(sym) is None or not int(statuses.get(sym) or 0):
             reason = "suspended"
-        elif sym not in limits:
-            # 没有实测涨跌停行就不推算：宁可不出计划，也不拿猜出来的价位发单
+        elif check_limits and sym not in limits:
+            # 没有实测涨跌停行就不推算：宁可不出计划，也不拿猜出来的价位发单。
+            # **只对需要比价的模式成立**（QMT 发单要比 limit_up/down）；
+            # 自建模拟盘全程只读库内日K，涨跌停由撮合引擎按收益率比处理，
+            # 不该因为缺这一行就把候选整只跳过（那会让模拟盘在缺数据的日子
+            # 一笔都不成交，而它本来完全不需要这行数据）。
             reason = "no_limit_row"
         else:
             last = ticks.get(sym)
@@ -235,7 +239,9 @@ def build_plan(
                 reason = "no_tick"
             else:
                 ref = round(float(last), 4)
-                lim = limits[sym]
+                # 自建模拟盘（check_limits=False）不需要实测涨跌停行：缺失时
+                # 按「无约束」处理，绝不 KeyError。
+                lim = limits.get(sym) or {}
                 has_limit = (lim.get("status") or "normal") != "no_price_limit"
                 buy_px = round(ref * (1 + PRICE_OFFSET), 2)
                 sell_px = round(ref * (1 - PRICE_OFFSET), 2)

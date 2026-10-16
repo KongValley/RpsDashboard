@@ -207,8 +207,8 @@ export const tradeApi = {
   // 重取快照会起子进程连 QMT，单独放宽超时
   snapshot: () => post('/trade/snapshot', {}, 120_000),
   snapshotStatus: () => get('/trade/snapshot/status'),
-  // 自建模拟盘：净值曲线 + 持仓（只读库）
-  paper: () => get('/trade/paper'),
+  // 自建模拟盘：净值曲线 + 复盘指标 + 持仓（只读库）；date 可回看历史某日
+  paper: (params) => get('/trade/paper', params),
 }
 
 /** 因子研究：最近一次 `cli factors` 的评估结果（只读库，见 api/factors.py） */

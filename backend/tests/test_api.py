@@ -852,6 +852,41 @@ def test_trade_paper_endpoint_returns_nav_and_positions(seeded, tmp_path, monkey
 
 
 # ── 因子评估 ────────────────────────────────────────────────────────
+def test_trade_paper_endpoint_supports_date_and_review(seeded):
+    """`/api/trade/paper?date=` 回看历史某日（就近回退），并带复盘字段。"""
+    client, *_ = seeded
+    with dbmod.connect() as conn:
+        conn.execute(
+            "INSERT INTO paper_account(id, cash, created_at, updated_at)"
+            " VALUES (1, 900000, '2026-01-01', '2026-01-02')")
+        conn.executemany(
+            "INSERT INTO paper_nav(trade_date, cash, market_value, total, nav, n_positions)"
+            " VALUES (?,?,?,?,?,?)",
+            [("2026-01-01", 900000, 100000, 1000000, 1.0, 1),
+             ("2026-01-02", 920000, 80000, 1000000, 1.0, 1)])
+        conn.execute(
+            "INSERT INTO paper_position(trade_date, symbol, volume, avg_price, close,"
+            " market_value) VALUES ('2026-01-01','000001',1000,10.0,10.5,10500)")
+        conn.execute(
+            "INSERT INTO paper_position(trade_date, symbol, volume, avg_price, close,"
+            " market_value) VALUES ('2026-01-02','000002',500,20.0,21.0,10500)")
+        conn.commit()
+
+    d1 = client.get("/api/trade/paper", params={"date": "2026-01-01"}).json()
+    assert d1["date"] == "2026-01-01"
+    assert [p["symbol"] for p in d1["positions"]] == ["000001"], "回看日应给那天的持仓"
+    assert d1["nav_row"]["trade_date"] == "2026-01-01"
+    assert "review" in d1 and d1["review"]["summary"]["round_trips"] == 0
+
+    # 早于曲线第一天 → 就近落到第一天（不是静默换成最新一天）
+    early = client.get("/api/trade/paper", params={"date": "2025-12-28"}).json()
+    assert early["date"] == "2026-01-01"
+
+    latest = client.get("/api/trade/paper").json()
+    assert latest["date"] == "2026-01-02"
+    assert [p["symbol"] for p in latest["positions"]] == ["000002"]
+
+
 def test_factors_empty_returns_full_structure(seeded):
     """还没跑过 `cli factors` 时返回**同构**的空结构，不是 404/500。"""
     client, *_ = seeded

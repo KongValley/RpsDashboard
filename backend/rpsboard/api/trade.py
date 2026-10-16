@@ -225,16 +225,58 @@ def start_snapshot() -> dict:
         _snapshot_lock.release()
 
 
+def _paper_date(conn: sqlite3.Connection, raw: str | None) -> str | None:
+    """把请求日期解析为净值曲线上**实际存在**的一天。
+
+    与 `api/__init__.py::resolve_date` 同一条就近回退策略：优先不晚于该日的
+    最近一天（周末/长假落回），一个都没有才取更早的下一天。直接退回"最新一天"
+    是错的 —— 用户选 2026-05-05 会被无声换成 2026-10-14，看到的完全是另一天。
+    """
+    latest_row = conn.execute("SELECT MAX(trade_date) AS d FROM paper_nav").fetchone()
+    latest = latest_row["d"] if latest_row and latest_row["d"] else None
+    if not raw or not str(raw).strip():
+        return latest
+    raw = str(raw).strip()
+    hit = conn.execute("SELECT 1 FROM paper_nav WHERE trade_date = ?", (raw,)).fetchone()
+    if hit:
+        return raw
+    near = conn.execute(
+        "SELECT trade_date AS d FROM paper_nav WHERE trade_date <= ?"
+        " ORDER BY trade_date DESC LIMIT 1", (raw,)).fetchone()
+    if near and near["d"]:
+        return near["d"]
+    near = conn.execute(
+        "SELECT trade_date AS d FROM paper_nav WHERE trade_date > ?"
+        " ORDER BY trade_date ASC LIMIT 1", (raw,)).fetchone()
+    return near["d"] if near and near["d"] else latest
+
+
 @router.get("/paper")
-def paper() -> dict:
-    """自建模拟盘：净值曲线 + 权益摘要 + 当前持仓。**只读库，不连任何券商。**"""
+def paper(date: str | None = Query(
+        default=None, description="YYYY-MM-DD：回看历史某日；缺省=最新一天")) -> dict:
+    """自建模拟盘：净值曲线 + 权益摘要 + 复盘指标 + 当前/指定日持仓。
+
+    **只读库，不连任何券商。** `date` 落在非交易日时按就近回退，并在
+    `date` 字段回显实际生效的交易日。
+    """
     from ..broker import sim
 
     conn = get_conn()
     try:
-        return sim.summary(conn)
+        out = sim.summary(conn)
+        out["review"] = sim.review(conn)
+        effective = _paper_date(conn, date)
+        out["date"] = effective
+        if out.get("days") and effective and effective != out.get("to"):
+            out["positions"] = sim.positions_at(conn, effective)
+            row = conn.execute(
+                "SELECT trade_date, cash, market_value, total, nav, n_positions"
+                " FROM paper_nav WHERE trade_date = ?", (effective,)).fetchone()
+            out["nav_row"] = dict(row) if row else None
+        return out
     except sim.SimError as exc:
-        return {"error": str(exc), "days": 0, "curve": [], "positions": []}
+        return {"error": str(exc), "days": 0, "curve": [], "positions": [],
+                "round_trips": [], "review": {}}
 
 
 @router.get("/snapshot/status")
