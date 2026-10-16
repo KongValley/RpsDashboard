@@ -528,7 +528,13 @@ def portfolio_risk(conn: sqlite3.Connection, *, window: int = 60) -> dict:
     pos = positions_at(conn)
     if not pos:
         return {}
-    total = sum(float(p["market_value"]) for p in pos) or 1.0
+    # 分母必须是**总权益**（现金 + 持仓市值），与 `review()` 的 `positions[].weight`
+    # 以及本文档的口径一致：用"持仓市值合计"当分母会让仓位越轻的票显得越集中
+    # （半仓时所有票的权重都会翻倍），那种数字没法与阈值直接比。
+    row = conn.execute(
+        "SELECT total FROM paper_nav ORDER BY trade_date DESC LIMIT 1").fetchone()
+    equity = float(row["total"]) if row and row["total"] else 0.0
+    total = equity or (sum(float(p["market_value"]) for p in pos) or 1.0)
     weights = sorted(((p["symbol"], float(p["market_value"]) / total) for p in pos),
                      key=lambda x: -x[1])
 

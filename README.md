@@ -1232,6 +1232,31 @@ QMT 客户端自带的那 11 个「模拟」通道**全是期货**，股票的�
 老库（迁移前）的历史成交没有这三列，此时复盘按成交价重算、**不含费用**，并在
 `notes` 里明确标注 —— 迁移只补列、不编造历史费用。
 
+### 组合风险体检（阈值 + 可选推送）
+
+```powershell
+.venv\Scripts\python.exe -m rpsboard.cli trade risk              # 只打印
+.venv\Scripts\python.exe -m rpsboard.cli trade risk --dry-run    # 打印推送内容，不发送
+.venv\Scripts\python.exe -m rpsboard.cli trade risk --push       # 有告警时推到微信
+.venv\Scripts\python.exe -m rpsboard.cli trade risk --max-single 0.15 --max-drawdown 0.15
+```
+
+| 项 | 默认阈值 | 环境变量 |
+|---|---|---|
+| 单票权重（持仓市值 / **总权益**） | 25% | `RPSBOARD_RISK_MAX_SINGLE_WEIGHT` |
+| 单行业权重 | 50% | `RPSBOARD_RISK_MAX_INDUSTRY_WEIGHT` |
+| 持仓平均两两相关 | 0.70 | `RPSBOARD_RISK_MAX_AVG_CORR` |
+| **当前**回撤（距历史峰值） | 20% | `RPSBOARD_RISK_MAX_CURRENT_DRAWDOWN` |
+
+- 权重分母是**总权益**（现金 + 持仓市值），不是持仓市值合计 —— 半仓时后者会把每只票的
+  权重都放大一倍，与阈值没法直接比。
+- 「当前回撤」是**现在**距峰值的跌幅，不是历史最大回撤；两者在复盘卡里是两个数。
+- 退出码：无告警 `0`、有告警 `3`、推送/配置失败 `2`（与 `alert` 一套约定）。
+- **默认不推送**：要发微信必须显式 `--push`（与项目的「只手动推送」边界一致）；
+  地址没配时给明确错误，不静默跳过。
+- 页面上「交易 → 自建模拟盘」会把告警渲染成顶部提示条（**只显示，不推送**），
+  数据来自只读接口 `GET /api/trade/risk`。
+
 ### 策略对照：换策略前先归档
 
 模拟盘只有**一个活动账户**（`paper_account.id CHECK (id=1)`）：跑第二种策略必须先
@@ -1417,6 +1442,7 @@ $env:RPSBOARD_TRADE_MODE = "sim"
 | `POST /api/trade/snapshot` · `GET /api/trade/snapshot/status` | 页面「重取持仓快照」：后台线程连 QMT + 轮询 |
 | `GET/POST /api/trade/paper/archive[s]` · `DELETE /api/trade/paper/archives/{id}` | 曲线归档：列出 / 存一份（写库）/ 删除；供「策略对照」叠加比较 |
 | `GET /api/trade/paper/export.csv?kind=nav\|orders\|fills` | 模拟盘净值/委托/成交导出 CSV（BOM + 公式注入防护） |
+| `GET /api/trade/risk` | 组合风险体检（集中度/相关性/当前回撤，只读**不推送**；推送走 `cli trade risk --push`） |
 | `GET /api/trade/paper?date=` | 自建模拟盘：净值曲线 + **绩效复盘**（逐笔回合/胜率/盈亏比/持有天数/费用/基准超额）+ 当前或指定日持仓（**只读库，不连券商**）；`date` 就近回退并在 `date` 字段回显生效日 |
 
 ## 许可证

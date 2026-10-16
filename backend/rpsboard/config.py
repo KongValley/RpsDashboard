@@ -186,6 +186,19 @@ TRADE_MODES = ("paper", "local", "sim")
 TRADE_HALT_FILE = Path(os.environ.get(
     "RPSBOARD_TRADE_HALT_FILE", DATA_DIR / "trade.halt"))
 
+# ── 组合风险阈值（cli trade risk / GET /api/trade/risk）────────────────
+#: 单票权重上限（持仓市值 / 总权益）。等权 20 只时单票约 5%，
+#: 超过 25% 说明某只票的仓位已经明显偏离策略设定。
+RISK_MAX_SINGLE_WEIGHT = float(os.environ.get("RPSBOARD_RISK_MAX_SINGLE_WEIGHT", "0.25"))
+#: 单个行业权重上限。行业过度集中会让"分散持 20 只"退化成"押一个板块"。
+RISK_MAX_INDUSTRY_WEIGHT = float(os.environ.get(
+    "RPSBOARD_RISK_MAX_INDUSTRY_WEIGHT", "0.50"))
+#: 平均两两相关上限。超过 0.7 时，组合实际风险≈一只票（分散度是幻觉）。
+RISK_MAX_AVG_CORR = float(os.environ.get("RPSBOARD_RISK_MAX_AVG_CORR", "0.70"))
+#: 当前回撤上限（距历史峰值）。注意是**当前**回撤，不是历史最大回撤。
+RISK_MAX_CURRENT_DRAWDOWN = float(os.environ.get(
+    "RPSBOARD_RISK_MAX_CURRENT_DRAWDOWN", "0.20"))
+
 
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)

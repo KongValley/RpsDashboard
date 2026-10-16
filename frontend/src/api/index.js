@@ -227,6 +227,8 @@ export const tradeApi = {
     request(`/trade/paper/archives/${id}`, undefined, { method: 'DELETE' }),
   // 导出 CSV：净值 / 委托 / 成交（复盘留档用）
   exportPaper: (kind, name) => download('/trade/paper/export.csv', { kind }, name),
+  // 组合风险体检（只读，不推送；推送走 cli trade risk --push）
+  risk: (params) => get('/trade/risk', params),
 }
 
 /** 当日复盘：市场宽度 + 涨跌停清单 + 行业当日涨跌 + 信号名单（只读库） */

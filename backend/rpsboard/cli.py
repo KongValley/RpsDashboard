@@ -958,6 +958,48 @@ def cmd_trade_archive(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_trade_risk(args: argparse.Namespace) -> int:
+    """模拟盘组合风险体检（集中度/相关性/回撤）。**默认只打印**，`--push` 才推微信。"""
+    from .broker import risk_alerts, sim
+
+    db.init_db()
+    with db.session() as conn:
+        try:
+            over = {k: v for k, v in (
+                ("max_single", args.max_single), ("max_industry", args.max_industry),
+                ("max_avg_corr", args.max_avg_corr),
+                ("max_drawdown", args.max_drawdown)) if v is not None}
+            t = risk_alerts.thresholds(**over)
+            alerts = risk_alerts.evaluate(conn, **over)
+        except sim.SimError as exc:
+            print(f"[risk] {exc}", file=sys.stderr)
+            return 2
+
+    print(f"阈值：单票 ≤ {t['max_single_weight']:.0%}｜行业 ≤ {t['max_industry_weight']:.0%}"
+          f"｜平均相关 ≤ {t['max_avg_corr']:.2f}｜当前回撤 ≤ {t['max_drawdown']:.0%}")
+    if not alerts:
+        print("[risk] 没有触发任何告警。")
+        return 0
+    for a in alerts:
+        print(f"[risk] ⚠ {a['name']}：{a['detail']}")
+
+    title, content = risk_alerts.format_alerts(alerts, t)
+    if args.dry_run or not args.push:
+        print(f"\n{title}\n{content}")
+        if not args.push:
+            print("\n（只是打印；要推到手机加 --push）")
+        return 3
+    from . import notify
+
+    try:
+        notify.push(title, content)
+    except notify.NotifyError as exc:
+        print(f"[risk] {exc}", file=sys.stderr)
+        return 2
+    print(f"[risk] 已推送：{title}")
+    return 3
+
+
 # ── trade（QMT：只读 / 影子 / 券商模拟盘；**没有实盘**）────────────
 # 退出码：0 正常；2 配置或连接失败；3 有差异/有跳过项；4 部分委托失败。
 # **没有实盘分支**：`execute` 只在 plan.mode=sim 且带 --i-know-this-is-sim 时放行。
@@ -975,10 +1017,11 @@ def cmd_trade(args: argparse.Namespace) -> int:
         "run": cmd_trade_paper_run,
         "paper": cmd_trade_paper,
         "archive": cmd_trade_archive,
+        "risk": cmd_trade_risk,
     }.get(action)
     if fn is None:
-        print("[trade] 用法：cli trade run|paper|archive|status|snapshot|plan|shadow|"
-              "calibrate|execute|reconcile|halt", file=sys.stderr)
+        print("[trade] 用法：cli trade run|paper|archive|risk|status|snapshot|plan|"
+              "shadow|calibrate|execute|reconcile|halt", file=sys.stderr)
         return 2
     return fn(args)
 
@@ -1603,6 +1646,19 @@ def build_parser() -> argparse.ArgumentParser:
     t_arch.add_argument("--save", action="store_true", help="把当前曲线归档一份")
     t_arch.add_argument("--label", default=None, help="归档名（配合 --save，缺省按信号源+时间生成）")
     t_arch.add_argument("--rm", type=int, default=None, help="删除指定 id 的归档")
+
+    # 组合风险体检：默认只打印，--push 才推微信（与 alert push 同一套约定）
+    t_risk = tsub.add_parser("risk", help="模拟盘组合风险体检（集中度/相关性/回撤）")
+    t_risk.add_argument("--push", action="store_true", help="有告警时推到手机（默认只打印）")
+    t_risk.add_argument("--dry-run", action="store_true", help="只打印推送内容，不发送")
+    t_risk.add_argument("--max-single", type=float, default=None,
+                        help="单票权重上限（默认 0.25）")
+    t_risk.add_argument("--max-industry", type=float, default=None,
+                        help="单行业权重上限（默认 0.50）")
+    t_risk.add_argument("--max-avg-corr", type=float, default=None,
+                        help="平均两两相关上限（默认 0.70）")
+    t_risk.add_argument("--max-drawdown", type=float, default=None,
+                        help="当前回撤上限（默认 0.20）")
 
     tsub.add_parser("status", help="拉账户与持仓并写 position_snapshot")
     tsub.add_parser("snapshot", help="只刷新持仓快照（不查资金、不下单）")

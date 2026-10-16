@@ -68,6 +68,16 @@
         </label>
       </div>
 
+      <div v-if="riskAlerts.length" class="warnbar soft inset" style="margin-bottom:10px">
+        <div v-for="a in riskAlerts" :key="a.kind">
+          ⚠ {{ a.name }}：{{ a.detail }}
+        </div>
+        <div class="muted" style="font-size:11px;margin-top:4px">
+          阈值可用 <code>cli trade risk --max-single/--max-industry/--max-avg-corr/--max-drawdown</code>
+          改；推送要显式加 <code>--push</code>（本页不推送）。
+        </div>
+      </div>
+
       <p v-if="!paper?.days" class="muted">
         还没跑过。在命令行执行
         <code>python -m rpsboard.cli trade run --from 2026-01-01 --cash 1000000</code>
@@ -506,6 +516,9 @@ const review = computed(() => paper.value?.review || {
   summary: {}, round_trips: [], industry: [], notes: [], benchmark: null,
 })
 
+/** 组合风险告警（GET /api/trade/risk；只读，不推送） */
+const riskAlerts = ref([])
+
 /** 曲线归档列表（策略对照） */
 const archives = ref([])
 /** 参与对照的归档 id */
@@ -653,6 +666,11 @@ async function reloadPaper() {
       paperDate.value ? { date: paperDate.value } : undefined)
   } catch (e) {
     console.warn('模拟盘加载失败', e)
+  }
+  try {
+    riskAlerts.value = (await tradeApi.risk()).alerts || []
+  } catch (e) {
+    console.warn('风险体检加载失败', e)
   }
 }
 

@@ -372,6 +372,33 @@ def paper_export(
                         f"paper_{kind}_{stamp}.csv")
 
 
+@router.get("/risk")
+def risk(
+    max_single: float | None = Query(default=None, gt=0, le=1),
+    max_industry: float | None = Query(default=None, gt=0, le=1),
+    max_avg_corr: float | None = Query(default=None, gt=0, le=1),
+    max_drawdown: float | None = Query(default=None, gt=0, le=1),
+) -> dict:
+    """模拟盘组合风险体检（只读，**不推送**）。
+
+    与 `cli trade risk` 同一套判据（`broker/risk_alerts.py`）；
+    推送只走命令行，页面只负责显示。
+    """
+    from ..broker import risk_alerts
+
+    conn = get_conn()
+    try:
+        over = {k: v for k, v in (
+            ("max_single", max_single), ("max_industry", max_industry),
+            ("max_avg_corr", max_avg_corr), ("max_drawdown", max_drawdown),
+        ) if v is not None}
+        return {"thresholds": risk_alerts.thresholds(**over),
+                "alerts": risk_alerts.evaluate(conn, **over),
+                "current_drawdown": risk_alerts.current_drawdown(conn)}
+    except Exception as exc:  # noqa: BLE001 - 没有曲线时不该 500
+        return {"thresholds": {}, "alerts": [], "error": str(exc)}
+
+
 @router.get("/snapshot/status")
 def snapshot_status() -> dict:
     return dict(_snapshot_state)
