@@ -43,6 +43,10 @@ ORDER_ID_BASE = 900_000_000
 #: 单个交易日最多撮合几笔（防御性上限，正常远小于此）
 MAX_ORDERS_PER_DAY = 200
 
+#: `summary()`/`nav_curve()` 一次最多返回多少个净值点（约 8 年交易日）。
+#: 超过时 `summary()` 会带 `curve_truncated=True` —— 静默截断会让人误判区间收益与回撤。
+NAV_CURVE_LIMIT = 2000
+
 #: `paper_meta['params']` 的补全基准：老曲线落库时可能缺键（如 signal），
 #: 缺失项按这套默认值补齐后再与本次请求比较。
 DEFAULT_PARAMS = {
@@ -366,8 +370,13 @@ def _set_status(conn: sqlite3.Connection, order_id: int, status: str,
                  (status, err_msg, db.now(), order_id))
 
 
-def mark_to_market(conn: sqlite3.Connection, acc: Account, trade_date: str) -> dict:
-    """按当日收盘价盯市，写 paper_position / paper_nav。同一交易日重跑覆盖。"""
+def mark_to_market(conn: sqlite3.Connection, acc: Account, trade_date: str,
+                   filled_orders: int = 0) -> dict:
+    """按当日收盘价盯市，写 paper_position / paper_nav。同一交易日重跑覆盖。
+
+    `filled_orders` 是当日成交笔数，落进 `paper_nav.filled_orders`
+    （这列此前从来没有写入方，永远显示 0 —— 等于一个假的"当日无成交"）。
+    """
     bars = _day_bars(conn, trade_date)
     mv = 0.0
     conn.execute("DELETE FROM paper_position WHERE trade_date=?", (trade_date,))
@@ -385,9 +394,9 @@ def mark_to_market(conn: sqlite3.Connection, acc: Account, trade_date: str) -> d
     initial = _initial_cash(conn) or total
     conn.execute(
         "INSERT OR REPLACE INTO paper_nav(trade_date, cash, market_value, total, nav,"
-        " n_positions) VALUES (?,?,?,?,?,?)",
+        " n_positions, filled_orders) VALUES (?,?,?,?,?,?,?)",
         (trade_date, acc.cash, mv, total, total / initial if initial else 1.0,
-         len(acc.positions)))
+         len(acc.positions), int(filled_orders)))
     conn.execute("UPDATE paper_account SET cash=?, updated_at=? WHERE id=1",
                  (acc.cash, db.now()))
     conn.commit()
@@ -395,7 +404,7 @@ def mark_to_market(conn: sqlite3.Connection, acc: Account, trade_date: str) -> d
             "total": total, "n_positions": len(acc.positions)}
 
 
-def nav_curve(conn: sqlite3.Connection, limit: int = 2000) -> list[dict]:
+def nav_curve(conn: sqlite3.Connection, limit: int = NAV_CURVE_LIMIT) -> list[dict]:
     rows = conn.execute(
         "SELECT * FROM paper_nav ORDER BY trade_date LIMIT ?", (int(limit),)).fetchall()
     return [dict(r) for r in rows]
@@ -413,11 +422,13 @@ def positions_at(conn: sqlite3.Connection, trade_date: str | None = None) -> lis
 
 def summary(conn: sqlite3.Connection) -> dict:
     """一屏摘要：初始资金、当前净值、区间收益、最大回撤、持仓数。"""
-    curve = nav_curve(conn)
+    # 显式传模块常量（而不是靠默认参数）：测试可以 monkeypatch 它来验证截断提示
+    curve = nav_curve(conn, limit=NAV_CURVE_LIMIT)
     if not curve:
         return {"initial_cash": 0.0, "total": 0.0, "nav": 1.0, "return": 0.0,
                 "max_drawdown": 0.0, "days": 0, "from": None, "to": None,
-                "positions": [], "curve": []}
+                "positions": [], "curve": [], "curve_limit": NAV_CURVE_LIMIT,
+                "curve_truncated": False}
     first, last = curve[0], curve[-1]
     peak, mdd = 0.0, 0.0
     for r in curve:
@@ -434,6 +445,10 @@ def summary(conn: sqlite3.Connection) -> dict:
         "from": first["trade_date"], "to": last["trade_date"],
         "positions": positions_at(conn),
         "curve": curve,
+        # 曲线点数受 nav_curve 上限约束：截断时上面的 to/收益/回撤都只基于前 N 行，
+        # 必须让调用方看得见（原先静默截断）
+        "curve_limit": NAV_CURVE_LIMIT,
+        "curve_truncated": len(curve) >= NAV_CURVE_LIMIT,
     }
 
 
@@ -491,6 +506,90 @@ def delete_archive(conn: sqlite3.Connection, arch_id: int) -> bool:
     return bool(cur.rowcount)
 
 
+# ── 持仓体检（集中度 + 相关性）───────────────────────────────────────
+def _pearson(xs: list[float], ys: list[float]) -> float | None:
+    """皮尔逊相关（纯标准库，避免为一个数引入 pandas 依赖）。样本 <3 返回 None。"""
+    n = len(xs)
+    if n < 3 or n != len(ys):
+        return None
+    mx, my = sum(xs) / n, sum(ys) / n
+    num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    dx = math.sqrt(sum((x - mx) ** 2 for x in xs))
+    dy = math.sqrt(sum((y - my) ** 2 for y in ys))
+    return num / (dx * dy) if dx > 0 and dy > 0 else None
+
+
+def portfolio_risk(conn: sqlite3.Connection, *, window: int = 60) -> dict:
+    """当前持仓的体检：集中度 + 两两相关性（"是不是一堆同一个赌注"）。
+
+    相关性用**近 `window` 个交易日的日收益**算：截面分散度是策略风险的
+    主要来源之一，等权持 20 只但两两相关 0.9 时，实际风险≈一只票。
+    """
+    pos = positions_at(conn)
+    if not pos:
+        return {}
+    total = sum(float(p["market_value"]) for p in pos) or 1.0
+    weights = sorted(((p["symbol"], float(p["market_value"]) / total) for p in pos),
+                     key=lambda x: -x[1])
+
+    industry: dict[str, float] = {}
+    syms = [p["symbol"] for p in pos]
+    marks = ",".join("?" * len(syms))
+    for r in conn.execute(
+            f"SELECT symbol, industry FROM industry_map WHERE symbol IN ({marks})",
+            syms):
+        w = next((w for s, w in weights if s == r["symbol"]), 0.0)
+        industry[r["industry"] or "未分类"] = industry.get(r["industry"] or "未分类", 0.0) + w
+    top_industry = max(industry.items(), key=lambda kv: kv[1]) if industry else None
+
+    # 近 window 个交易日的收盘价（只查持仓这几只，代价很小）
+    days = [r["date"] for r in conn.execute(
+        "SELECT DISTINCT date FROM daily_bar ORDER BY date DESC LIMIT ?",
+        (max(3, int(window)) + 1,))]
+    lo = min(days) if days else None
+    rets: dict[str, list[float]] = {}
+    if lo:
+        series: dict[str, dict[str, float]] = {}
+        for r in conn.execute(
+                f"SELECT symbol, date, close FROM daily_bar WHERE symbol IN ({marks})"
+                f" AND date >= ? ORDER BY date", (*syms, lo)):
+            series.setdefault(r["symbol"], {})[r["date"]] = float(r["close"] or 0.0)
+        for sym, closes in series.items():
+            seq = [closes.get(d) for d in sorted(days)]
+            rets[sym] = [
+                seq[i] / seq[i - 1] - 1.0
+                for i in range(1, len(seq))
+                if seq[i] is not None and seq[i - 1]
+            ]
+
+    corrs: list[tuple[str, str, float]] = []
+    for i, a in enumerate(syms):
+        for b in syms[i + 1:]:
+            ra, rb = rets.get(a) or [], rets.get(b) or []
+            n = min(len(ra), len(rb))
+            if n < 3:
+                continue
+            c = _pearson(ra[-n:], rb[-n:])
+            if c is not None:
+                corrs.append((a, b, c))
+    best = max(corrs, key=lambda x: x[2]) if corrs else None
+
+    return {
+        "n_positions": len(pos),
+        "top_weight": {"symbol": weights[0][0], "weight": round(weights[0][1], 4)},
+        "top5_weight": round(sum(w for _, w in weights[:5]), 4),
+        "top_industry": ({"industry": top_industry[0], "weight": round(top_industry[1], 4)}
+                         if top_industry else None),
+        "corr_window": int(window),
+        "corr_pairs": len(corrs),
+        "corr_avg": round(sum(c for *_, c in corrs) / len(corrs), 4) if corrs else None,
+        "corr_max": ({"a": best[0], "b": best[1], "value": round(best[2], 4)}
+                     if best else None),
+        "notes": [f"相关性按近 {int(window)} 个交易日的日收益算；样本不足 3 天的不计入。",
+                  "权重按 **持仓市值 / 总权益** 算（含现金），加总不等于 1 的部分是现金。"],
+    }
+
+
 def _trading_calendar(conn: sqlite3.Connection) -> dict[str, int]:
     """交易日序号表（用 `rps_daily` 的日期，与全项目同一套交易日口径）。"""
     return {r["date"]: i for i, r in enumerate(conn.execute(
@@ -505,7 +604,8 @@ def review(conn: sqlite3.Connection, *, benchmark_symbol: str = "000300") -> dic
     老库的历史成交没有这些列（迁移后是 0/NULL），此时退化成"按价格重算、
     不含费用"，并在 `notes` 里说明 —— 假装有精确费用比不给更糟。
     """
-    curve = nav_curve(conn)
+    # 显式传模块常量（而不是靠默认参数）：测试可以 monkeypatch 它来验证截断提示
+    curve = nav_curve(conn, limit=NAV_CURVE_LIMIT)
     if not curve:
         return {"days": 0, "round_trips": [], "summary": {}, "positions": [],
                 "industry": [], "benchmark": None, "notes": []}
@@ -677,6 +777,7 @@ def review(conn: sqlite3.Connection, *, benchmark_symbol: str = "000300") -> dic
         },
         "positions": pos_rows,
         "industry": industry_rows,
+        "risk": portfolio_risk(conn),
         "benchmark": bench,
         "notes": notes,
     }
@@ -868,13 +969,15 @@ def run(
         if last is not None and day <= last:
             continue                      # 已结算，绝不重算
         prev = dates[k - 1] if k > 0 else None
+        today_filled = 0
         if prev is not None:
             st = settle_day(conn, acc, day, prev)
             totals["filled"] += st["filled"]
             totals["canceled"] += st["canceled"]
             totals["deferred"] += st["deferred"]
             totals["fee"] += st["fee"]
-        mark_to_market(conn, acc, day)
+            today_filled = st["filled"]
+        mark_to_market(conn, acc, day, filled_orders=today_filled)
         totals["days"] += 1
         _plan_and_submit(k)
         if progress:

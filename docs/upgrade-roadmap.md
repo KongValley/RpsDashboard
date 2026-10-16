@@ -386,7 +386,12 @@ ORDER BY trade_date, id
 - **风险工具**：持仓相关性矩阵、单票/行业集中度上限告警、回撤阈值推送（复用 `notify.py`）。
 - **年化 / 波动 / 夏普 / 卡玛**：直接复用回测已有的 `analytics/backtest.py::compute_metrics`（`716-761`），别另写一套。
 - **横截面筛选保存**：把筛选条件存一张小表 + 页面下拉。
-- **小清理**（都在 §2.5/§2.6）：`summary()` 的 `nav_curve(limit=2000)` 改为分页或显式声明"只显示最近 2000 天"（现在是**静默**截断，会让人误判区间收益与回撤）；`paper_nav.filled_orders` 要么真的写入要么删列（仍是死列）；删掉空的 `data/backtest_cache/`。（`MAX_ORDERS_PER_DAY` 已在 P0-2 真正启用。）
+- ✅ **小清理**（已完成）：`summary()` 现在给 `curve_limit` + `curve_truncated`，页面明确提示"只基于前 2000 天"（原先静默截断）；`paper_nav.filled_orders` 由 `mark_to_market` 真的写入当日成交笔数（原先永远是 0，等于假的"当日无成交"）；空的 `data/backtest_cache/` 已删除。（`MAX_ORDERS_PER_DAY` 已在 P0-2 启用。）
+- ✅ **导出中心（模拟盘侧）**：`GET /api/trade/paper/export.csv?kind=nav|orders|fills` + 页面三个按钮；转义逻辑抽成 `api/__init__.py` 的 `csv_cell/csv_bytes/csv_response`，排行榜导出改为复用同一份。
+- ✅ **自选按日**：`GET /api/watchlist?date=` + 页面日期下拉。
+- ✅ **模拟盘年化/波动/夏普/卡玛**：`review().summary` 新增（逐日净值口径）+ 页面绩效卡。
+- ✅ **风险工具（持仓体检）**：`sim.portfolio_risk()` —— 集中度（最大单票 / 前 5 合计 / 最大行业权重）与**两两相关性**（近 60 日收益，含最像的一对），已进 `/api/trade/paper` 的 `review.risk` 与页面「持仓体检」块；相关性用纯标准库实现（`_pearson`），失败/样本不足一律 `None`，不编造。
+- ⏳ **仍未做**：回测结果导出（CSV/JSON）、相关性**告警**与回撤推送（现在是展示，不是主动提醒）、横截面筛选保存、撮合的成交量约束。
 - **成交量/流动性约束**：给撮合加"参与率上限"（如不超过当日成交额的 X%），否则对流动性差的票会高估可成交量。这是**保守性原则**的延伸，不是新功能。
 - **接更多数据源**：`sources/base.py` 已是适配器模式，但基本面数据（财务/股本）需要新源；且 README 已记录多个源被评估后删除（`config.py:113-119`），引入前要先确认可达性。
 

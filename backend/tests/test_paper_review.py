@@ -148,3 +148,29 @@ def test_review_without_fee_columns_is_marked_in_notes(market_db):
     assert rev["summary"]["fees_total"] == 0.0
     assert all(r["buy_price"] is not None for r in rev["round_trips"]), \
         "没有落库成本时也要按买入成交价配出买入均价"
+
+
+def test_nav_rows_carry_daily_fill_count(market_db):
+    """`paper_nav.filled_orders` 必须真的写入（这列此前永远 0）。"""
+    with dbmod.session(market_db) as conn:
+        _run(conn)
+        rows = [dict(r) for r in conn.execute(
+            "SELECT trade_date, filled_orders FROM paper_nav ORDER BY trade_date")]
+        fills = conn.execute("SELECT COUNT(*) c FROM trade_fill").fetchone()["c"]
+
+    assert fills > 0, "合成行情下应有成交"
+    assert sum(r["filled_orders"] for r in rows) == fills, \
+        "逐日成交笔数之和必须等于成交总数"
+
+
+def test_truncated_curve_is_flagged(market_db, monkeypatch):
+    """曲线点数被上限截断时必须显式标记（原先静默截断，区间收益/回撤会被误读）。"""
+    with dbmod.session(market_db) as conn:
+        _run(conn)
+        full = sim.summary(conn)
+        monkeypatch.setattr(sim, "NAV_CURVE_LIMIT", 3)
+        cut = sim.summary(conn)
+
+    assert full["curve_truncated"] is False and len(full["curve"]) > 3
+    assert cut["curve_truncated"] is True
+    assert len(cut["curve"]) == 3 and cut["curve_limit"] == 3

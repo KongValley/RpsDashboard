@@ -78,6 +78,10 @@
         <div v-if="paper.date && paper.date !== paper.to" class="warnbar soft inset">
           正在回看 {{ paper.date }}（曲线最新一天是 {{ paper.to }}）；下方「持仓」是那天的快照。
         </div>
+        <div v-if="paper.curve_truncated" class="warnbar soft inset">
+          净值曲线已超过 {{ paper.curve_limit }} 个交易日：图上的区间收益与最大回撤
+          只基于前 {{ paper.curve_limit }} 天，不是全区间。
+        </div>
         <div class="stats" style="margin-bottom:14px">
           <div class="stat">
             <span class="muted">初始资金</span>
@@ -209,6 +213,41 @@
                 </tr>
               </tbody>
             </table>
+          </template>
+
+          <template v-if="review.risk && review.risk.n_positions">
+            <h4 style="margin:16px 0 8px">持仓体检</h4>
+            <div class="stats" style="margin-bottom:8px">
+              <div class="stat">
+                <span class="muted">最大单票</span>
+                <strong>{{ review.risk.top_weight.symbol }}</strong>
+                <span class="sub muted">{{ pct(review.risk.top_weight.weight) }}</span>
+              </div>
+              <div class="stat">
+                <span class="muted">前 5 合计</span>
+                <strong>{{ pct(review.risk.top5_weight) }}</strong>
+              </div>
+              <div class="stat" v-if="review.risk.top_industry">
+                <span class="muted">最大行业</span>
+                <strong>{{ review.risk.top_industry.industry }}</strong>
+                <span class="sub muted">{{ pct(review.risk.top_industry.weight) }}</span>
+              </div>
+              <div class="stat" v-if="review.risk.corr_avg != null">
+                <span class="muted">平均相关</span>
+                <strong>{{ num2(review.risk.corr_avg) }}</strong>
+                <span class="sub muted">
+                  近 {{ review.risk.corr_window }} 日 / {{ review.risk.corr_pairs }} 对
+                </span>
+              </div>
+              <div class="stat" v-if="review.risk.corr_max">
+                <span class="muted">最像的一对</span>
+                <strong class="mono">
+                  {{ review.risk.corr_max.a }} · {{ review.risk.corr_max.b }}
+                </strong>
+                <span class="sub muted">{{ num2(review.risk.corr_max.value) }}</span>
+              </div>
+            </div>
+            <div class="note muted" v-for="(n, i) in review.risk.notes" :key="i">· {{ n }}</div>
           </template>
         </template>
 

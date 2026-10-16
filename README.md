@@ -507,6 +507,7 @@ README 里的历史数字仍按调仓点口径记，**没有**被静默替换。
 
 - **调仓记录**：每个调仓日的净值、持仓只数、顺延笔数、以及**买入名单**（接口最多给前 50 只 ——
   等权全市场模式下真实持仓有几千只，全量会撑爆响应）。
+- **逐日成交笔数**：`paper_nav.filled_orders` 现在真的写入（此前永远是 0，等于一个假的"当日无成交"）。
 - **参数对比**：换参数再跑一次，结果会留在内存里并排比较（最多 6 次），可**导出/导入 JSON**。
   它是纯前端的内存表，不落库；要跨会话留存请导出。
 
@@ -1193,8 +1194,13 @@ QMT 客户端自带的那 11 个「模拟」通道**全是期货**，股票的�
 ```
 
 页面上「交易 → 自建模拟盘」有净值曲线、绩效复盘、逐笔回合、持仓与行业分布，
-并可用**回看**下拉看历史某一天（`/api/trade/paper?date=`）。**不需要任何券商账号，
-也不连 QMT**（参考价直接用库里的收盘价）。
+并可用**回看**下拉看历史某一天（`/api/trade/paper?date=`）；净值/委托/成交都能
+**导出 CSV**（页面按钮或 `GET /api/trade/paper/export.csv?kind=nav|orders|fills`）。
+**不需要任何券商账号，也不连 QMT**（参考价直接用库里的收盘价）。
+
+> 曲线点数上限 `NAV_CURVE_LIMIT = 2000`（约 8 年交易日）。真的超了时响应里
+> `curve_truncated=true`，页面会明确提示"区间收益/回撤只基于前 2000 天" ——
+> 静默截断会让人把部分区间当全区间读。
 
 > **续跑语义（重要）**：`trade run` 是**幂等推进**，不是"重算区间"。
 > 已结算的交易日一律跳过。早先的实现每次都从 `--from` 重走，而账户是从**当前**
@@ -1213,7 +1219,10 @@ QMT 客户端自带的那 11 个「模拟」通道**全是期货**，股票的�
 | 胜率 / 盈亏比 | 胜率 = 盈利回合 / 总回合；盈亏比 = 总盈利 / 总亏损 |
 | 已实现盈亏 | 卖出净收入 − 卖出部分的账面成本（账面成本含累计费用） |
 | 累计费用 | **全部**成交的 `fee` 之和（买 + 卖），与 `trade run` 打印的那个数同口径 |
+| 年化 / 波动 / 夏普 | 按**逐日**净值算（曲线本身就是每个结算交易日一行）；样本不足 2 天时夏普给 `None`，不编造 0 |
+| 最大回撤 | **正数幅度**（`0.432` = 跌了 43.2%）。注意回测侧的 `max_drawdown` 是**负数**口径，两边各自渲染，别互相套用 |
 | 超额 | 同期策略收益 − `benchmark_bar.000300` 的收益 |
+| 持仓体检 | 集中度（最大单票 / 前 5 合计 / 最大行业权重）+ **两两相关性**（近 60 个交易日日收益，含最像的一对）；等权持 20 只但两两相关 0.9 时，实际风险≈一只票 |
 
 老库（迁移前）的历史成交没有这三列，此时复盘按成交价重算、**不含费用**，并在
 `notes` 里明确标注 —— 迁移只补列、不编造历史费用。
@@ -1394,13 +1403,14 @@ $env:RPSBOARD_TRADE_MODE = "sim"
 | `GET /api/stock/{symbol}/curve?days=&date=` · `/patterns?days=&date=` | 多周期曲线 + 后复权价 / 三升底历史；`date` 为**右端**，形态的「此后最低价」也只算到那天 |
 | `GET /api/backtest/run` | 回测：`period`、`threshold`、`hold`、`resonance`、`market_filter`、涨跌停与成本开关；返回调仓点净值 + **逐日净值** + 每期持仓名单（前 50）+ 指标（含逐日回撤） |
 | `POST /api/admin/update` · `GET /api/admin/update/status` | 页面「更新数据」：后台线程 + 轮询阶段 |
-| `GET/POST/DELETE /api/watchlist[/{symbol}]` | 自选股（写库） |
+| `GET/POST/DELETE /api/watchlist[/{symbol}]` | 自选股（写库）；`GET` 支持 `?date=` 按日回看 |
 | `GET/POST/DELETE /api/alerts/rules[/{id}]`、`GET /api/alerts/hits`、`/kinds` | 预警规则与命中（写库） |
 | `GET /api/trade/summary` | 交易页一屏数据：模式 / halt / 上次连接状态 / 脱敏账号 / 资金 / 持仓 / 计划 / 委托 / 成交 / 对账。**只读库，不连客户端** |
 | `GET /api/trade/positions` · `/orders?date=` · `/fills?date=` · `/plans?limit=` | 持仓快照 / 当日委托 / 成交 / 计划列表（只读） |
 | `POST /api/trade/halt` | 发单总开关（只增删 `data/trade.halt` 哨兵文件，不连客户端） |
 | `POST /api/trade/snapshot` · `GET /api/trade/snapshot/status` | 页面「重取持仓快照」：后台线程连 QMT + 轮询 |
 | `GET/POST /api/trade/paper/archive[s]` · `DELETE /api/trade/paper/archives/{id}` | 曲线归档：列出 / 存一份（写库）/ 删除；供「策略对照」叠加比较 |
+| `GET /api/trade/paper/export.csv?kind=nav\|orders\|fills` | 模拟盘净值/委托/成交导出 CSV（BOM + 公式注入防护） |
 | `GET /api/trade/paper?date=` | 自建模拟盘：净值曲线 + **绩效复盘**（逐笔回合/胜率/盈亏比/持有天数/费用/基准超额）+ 当前或指定日持仓（**只读库，不连券商**）；`date` 就近回退并在 `date` 字段回显生效日 |
 
 ## 许可证
