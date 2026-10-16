@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import csv
+import io
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -15,6 +17,7 @@ from typing import Any
 import pandas as pd
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 
 from .. import __version__, db
 from . import perf
@@ -141,6 +144,47 @@ def jsonable(df: pd.DataFrame) -> list[dict]:
     if df.empty:
         return []
     return df.replace({float("nan"): None}).to_dict("records")
+
+
+# ── CSV 导出（报表与下载共用同一套转义，避免第二处口径）─────────────
+def csv_cell(v) -> str:
+    """单元格 → CSV 文本。
+
+    Excel 打开 UTF-8 CSV 时若没有 BOM，中文会显示成乱码（在 `csv_bytes` 里加）；
+    而以 `= + - @` 开头的文本会被 Excel/WPS 当**公式执行**
+    （`=cmd|'/c calc'!A1` 这类 CSV 公式注入），一律加 `'` 前缀。
+    """
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ""
+    if isinstance(v, float):
+        return f"{v:.4f}"
+    s = str(v)
+    return "'" + s if s[:1] in ("=", "+", "-", "@", "\t", "\r") else s
+
+
+def csv_bytes(headers: list[str], rows: list[list]) -> bytes:
+    """带 BOM 的 CSV（列数由 headers 决定，行内用 `csv.writer` 保证转义正确）。"""
+    buf = io.StringIO()
+    writer = csv.writer(buf, quoting=csv.QUOTE_MINIMAL, lineterminator="\r\n")
+    writer.writerow(headers)
+    for row in rows:
+        writer.writerow([csv_cell(v) for v in row])
+    return buf.getvalue().encode("utf-8-sig")
+
+
+def csv_response(headers: list[str], rows: list[list], filename: str) -> StreamingResponse:
+    """下载用响应：BOM + 附件名。文件名含中文时用 RFC 5987 的 `filename*`。"""
+    from urllib.parse import quote
+
+    return StreamingResponse(
+        iter([csv_bytes(headers, rows)]),
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition":
+                f"attachment; filename=\"{filename}\";"
+                f" filename*=UTF-8''{quote(filename)}",
+        },
+    )
 
 
 def create_app() -> FastAPI:

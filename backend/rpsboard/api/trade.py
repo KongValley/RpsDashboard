@@ -19,10 +19,11 @@ import time
 from typing import Any
 
 from fastapi import APIRouter, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from .. import config, db
-from . import get_conn
+from . import csv_response, get_conn
 
 router = APIRouter(prefix="/api/trade", tags=["trade"])
 
@@ -320,6 +321,55 @@ def paper_archive_delete(arch_id: int) -> dict:
     with db.session() as conn:
         removed = sim.delete_archive(conn, int(arch_id))
     return {"ok": removed, "id": int(arch_id)}
+
+
+_EXPORTS = {
+    # kind: (表头, 取值函数)
+    "nav": (["日期", "现金", "持仓市值", "总权益", "净值", "持仓数"],
+            lambda r: [r["trade_date"], r["cash"], r["market_value"], r["total"],
+                       r["nav"], r["n_positions"]]),
+    "orders": (["日期", "代码", "方向", "数量", "价格", "状态", "券商委托号", "错误"],
+               lambda r: [r["trade_date"], r["symbol"], r["side"], r["volume"],
+                          r["price"], r["status"], r["broker_order_id"],
+                          r["err_msg"]]),
+    "fills": (["日期", "代码", "方向", "数量", "价格", "费用", "已实现盈亏"],
+              lambda r: [r["trade_date"], r["symbol"], r["side"], r["volume"],
+                         r["price"], r["fee"], r["realized_pnl"]]),
+}
+
+
+@router.get("/paper/export.csv")
+def paper_export(
+    kind: str = Query(default="nav", pattern="^(nav|orders|fills)$"),
+    limit: int = Query(default=5000, ge=1, le=100_000),
+) -> StreamingResponse:
+    """把模拟盘的净值 / 委托 / 成交导出为 CSV（复盘与留档用）。
+
+    只导出**模拟盘自建的**记录（`paper_nav` + 本地号段委托/成交），
+    券商回报那部分在 `/api/trade/*` 里看，不混进这份文件。
+    """
+    from ..broker import sim
+
+    conn = get_conn()
+    try:
+        if kind == "nav":
+            rows = sim.nav_curve(conn, limit=limit)
+        elif kind == "orders":
+            rows = [dict(r) for r in conn.execute(
+                "SELECT * FROM trade_order WHERE broker_order_id >= ?"
+                " ORDER BY trade_date, id LIMIT ?", (sim.ORDER_ID_BASE, limit))]
+        else:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT * FROM trade_fill WHERE broker_order_id >= ?"
+                " ORDER BY trade_date, broker_order_id, broker_trade_id LIMIT ?",
+                (sim.ORDER_ID_BASE, limit))]
+    except sqlite3.OperationalError:
+        rows = []          # 老库缺列/缺表时不 500，导出一份带表头的空文件
+    headers, pick = _EXPORTS[kind]
+    dates = [r["trade_date"] for r in rows if r.get("trade_date")]
+    stamp = max(dates) if dates else "empty"
+    return csv_response(headers, [pick(r) for r in rows],
+                        f"paper_{kind}_{stamp}.csv")
 
 
 @router.get("/snapshot/status")

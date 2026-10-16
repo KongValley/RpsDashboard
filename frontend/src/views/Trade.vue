@@ -146,6 +146,18 @@
               <span class="muted">累计费用</span>
               <strong>{{ money(review.summary.fees_total) }}</strong>
             </div>
+            <div class="stat" v-if="review.summary.annualized != null">
+              <span class="muted">年化</span>
+              <strong :class="review.summary.annualized >= 0 ? 'up' : 'down'">
+                {{ pct(review.summary.annualized) }}
+              </strong>
+              <span class="sub muted">
+                波动 {{ pct(review.summary.volatility) }}
+                <template v-if="review.summary.sharpe != null">
+                  · 夏普 {{ num2(review.summary.sharpe) }}
+                </template>
+              </span>
+            </div>
             <div class="stat" v-if="review.benchmark">
               <span class="muted">超额（vs 沪深300）</span>
               <strong :class="review.benchmark.excess >= 0 ? 'up' : 'down'">
@@ -235,6 +247,12 @@
           旧曲线才不会丢。对照此前只能手写进 README。
         </span>
         <div class="spacer" />
+        <button class="btn" :disabled="!paper?.days"
+                @click="tradeApi.exportPaper('nav', 'paper_nav.csv')">导出净值</button>
+        <button class="btn" :disabled="!paper?.days"
+                @click="tradeApi.exportPaper('orders', 'paper_orders.csv')">导出委托</button>
+        <button class="btn" :disabled="!paper?.days"
+                @click="tradeApi.exportPaper('fills', 'paper_fills.csv')">导出成交</button>
         <button class="btn" :disabled="!paper?.days" @click="archiveCurrent">
           归档当前曲线
         </button>
@@ -412,6 +430,7 @@
 
 <script setup>
 import { computed, onMounted, onUnmounted, ref } from 'vue'
+// tradeApi 也直接用在模板里（导出按钮）
 import { tradeApi } from '../api'
 
 const s = ref(null)

@@ -186,7 +186,7 @@ export const adminApi = {
 
 /** 自选股池（全 API 唯一的写入面，见 backend/rpsboard/api/watchlist.py） */
 export const watchApi = {
-  list: () => get('/watchlist'),
+  list: (params) => get('/watchlist', params),
   add: (symbol, note) => post('/watchlist', { symbol, note }),
   remove: (symbol) => request(`/watchlist/${symbol}`, undefined, { method: 'DELETE' }),
 }
@@ -217,6 +217,8 @@ export const tradeApi = {
   archive: (label) => post('/trade/paper/archive', { label }),
   removeArchive: (id) =>
     request(`/trade/paper/archives/${id}`, undefined, { method: 'DELETE' }),
+  // 导出 CSV：净值 / 委托 / 成交（复盘留档用）
+  exportPaper: (kind, name) => download('/trade/paper/export.csv', { kind }, name),
 }
 
 /** 当日复盘：市场宽度 + 涨跌停清单 + 行业当日涨跌 + 信号名单（只读库） */

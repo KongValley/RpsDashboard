@@ -95,6 +95,28 @@ def test_watchlist_rejects_bad_symbol(client):
     assert c.delete("/api/watchlist/abc").status_code == 422
 
 
+def test_watchlist_supports_date(client):
+    """自选可以按日回看（原先硬编码最新交易日）。"""
+    c, path = client
+    c.post("/api/watchlist", json={"symbol": "000001"})
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    conn.execute("INSERT INTO rps_daily(date, symbol, rps60) VALUES"
+                 " ('2026-01-06', '000001', 42.0)")
+    conn.commit()
+    conn.close()
+
+    latest = c.get("/api/watchlist").json()
+    assert latest[0]["data_date"] == "2026-01-06" and latest[0]["rps60"] == 42.0
+
+    past = c.get("/api/watchlist", params={"date": "2026-01-05"}).json()
+    assert past[0]["data_date"] == "2026-01-05" and past[0]["rps60"] == 95.0
+
+    # 非交易日就近回退（不是静默换成最新一天之前，而是落到不晚于该日的最近一天）
+    fb = c.get("/api/watchlist", params={"date": "2030-01-01"}).json()
+    assert fb[0]["data_date"] == "2026-01-06"
+
+
 # ── 规则 ────────────────────────────────────────────────────────────
 def test_rule_kind_whitelist(client):
     c, _ = client

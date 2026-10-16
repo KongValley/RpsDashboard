@@ -23,10 +23,12 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import date as _date
 from datetime import datetime
+from statistics import stdev
 
 from .. import config, db
 from ..analytics import costs as costs_mod
@@ -626,6 +628,19 @@ def review(conn: sqlite3.Connection, *, benchmark_symbol: str = "000300") -> dic
         if peak > 0:
             mdd = max(mdd, 1 - float(r["total"]) / peak)
 
+    # 年化 / 波动 / 夏普：净值曲线本身就是**逐日**的（每个结算交易日一行），
+    # 所以直接用日收益。年化与 `return` 同源（都由 nav 推出），不会互相打架。
+    rets = []
+    for i in range(1, len(curve)):
+        prev = float(curve[i - 1]["total"])
+        if prev:
+            rets.append(float(curve[i]["total"]) / prev - 1.0)
+    span = (_as_date(curve[-1]["trade_date"]) - _as_date(curve[0]["trade_date"])).days
+    years = max(1e-9, span / 365.25)
+    ret_total = float(last["nav"]) - 1.0
+    ann = (1.0 + ret_total) ** (1.0 / years) - 1.0 if ret_total > -1 else -1.0
+    vol = stdev(rets) * math.sqrt(252) if len(rets) > 1 else 0.0
+
     notes = ["逐笔盈亏与费用取自成交记录（trade_fill.fee / realized_pnl）。",
              "持有天数按交易日计（口径同全项目的 rps_daily 交易日）。"]
     if not has_costs:
@@ -651,7 +666,14 @@ def review(conn: sqlite3.Connection, *, benchmark_symbol: str = "000300") -> dic
             "best": max((r["realized_pnl"] for r in round_trips), default=None),
             "worst": min((r["realized_pnl"] for r in round_trips), default=None),
             "max_drawdown": round(mdd, 4),
-            "return": round(float(last["nav"]) - 1, 4),
+            "return": round(ret_total, 4),
+            # 年化/波动/夏普按**逐日**净值算（曲线本身就是逐日留档的）；
+            # 样本不足 2 天时夏普为 None，不编造一个 0
+            "annualized": round(ann, 4),
+            "volatility": round(vol, 4),
+            "years": round(years, 2),
+            "sharpe": round(ann / vol, 2) if vol > 0 else None,
+            "calmar": round(ann / abs(mdd), 2) if mdd else None,
         },
         "positions": pos_rows,
         "industry": industry_rows,

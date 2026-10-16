@@ -55,6 +55,41 @@ def test_review_matches_stored_fills(market_db):
         "正常成交不该出现配不上买入成本的卖出"
 
 
+def test_review_reports_annualized_metrics(market_db):
+    """年化/波动/夏普：口径必须与区间收益同源，且不许编造。"""
+    with dbmod.session(market_db) as conn:
+        _run(conn)
+        rev = sim.review(conn)
+
+    s = rev["summary"]
+    assert s["years"] > 0, "合成库跨了几个月，年化年限不该是 0"
+    assert s["volatility"] >= 0
+    assert (s["annualized"] > 0) == (s["return"] > 0), \
+        "年化方向必须与区间收益一致（都由 nav 推出，不该打架）"
+    if s["volatility"] > 0:
+        assert s["sharpe"] == pytest.approx(s["annualized"] / s["volatility"], abs=0.01)
+    # 口径注意：模拟盘侧的 max_drawdown 是**正数幅度**（与 sim.summary 一致），
+    # 而回测侧（compute_metrics）给的是负数 —— 两边各自渲染，别互相套用
+    assert s["max_drawdown"] > 0, "模拟盘的口径是正数幅度"
+    assert s["calmar"] == pytest.approx(s["annualized"] / s["max_drawdown"], abs=0.05)
+
+
+def test_review_metrics_are_not_fabricated_on_tiny_curve(market_db):
+    """只有 1 个净值点时不该给出夏普（样本不足就返回 None）。"""
+    with dbmod.session(market_db) as conn:
+        conn.execute(
+            "INSERT INTO paper_account(id, cash, created_at, updated_at)"
+            " VALUES (1, 1000000, '2026-01-05', '2026-01-05')")
+        conn.execute(
+            "INSERT INTO paper_nav(trade_date, cash, market_value, total, nav, n_positions)"
+            " VALUES ('2026-01-05', 1000000, 0, 1000000, 1.0, 0)")
+        conn.commit()
+        rev = sim.review(conn)
+    s = rev["summary"]
+    assert s["round_trips"] == 0
+    assert s["sharpe"] is None and s["calmar"] is None
+
+
 def test_review_positions_and_industry_exposure(market_db):
     """当前持仓的浮动盈亏、权重、行业分布必须与 paper_position 对得上。"""
     with dbmod.session(market_db) as conn:

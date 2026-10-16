@@ -9,6 +9,13 @@
           在排行榜点行首星标加入；本页只做加/删与展示（预警命中在下方）
         </span>
         <div class="spacer" />
+        <label class="muted">日期
+          <select v-model="date" style="margin-left:6px;min-width:130px" @change="reload">
+            <option value="">最新</option>
+            <option v-for="d in availableDates" :key="d" :value="d">{{ d }}</option>
+          </select>
+        </label>
+        <span v-if="date && items.length" class="muted">RPS 为 {{ items[0].data_date }}</span>
         <button class="btn" @click="reload">刷新</button>
       </div>
 
@@ -98,7 +105,7 @@
 <script setup>
 import { ref, onMounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { watchApi, alertApi } from '../api'
+import { watchApi, alertApi, metaApi } from '../api'
 import { usePeriods } from '../composables/usePeriods'
 
 const router = useRouter()
@@ -111,13 +118,16 @@ const kinds = ref([])
 const errMsg = ref('')
 watch(periodsError, (v) => { if (v) errMsg.value = v }, { immediate: true })
 const newRule = ref({ name: '', kind: 'rps_threshold', params: '{"period":60,"min":90,"max":100}' })
+/** 回看日期（空 = 最新）；选项来自 /api/meta/dates，与排行榜/个股页同一套 */
+const date = ref('')
+const availableDates = ref([])
 
 const num = (v) => (v == null ? '—' : Number(v).toFixed(0))
 
 async function reload() {
   errMsg.value = ''
   try {
-    items.value = await watchApi.list()
+    items.value = await watchApi.list(date.value ? { date: date.value } : undefined)
   } catch (e) {
     errMsg.value = `自选列表加载失败：${e?.message || e}`
   }
@@ -181,6 +191,10 @@ onMounted(async () => {
     console.error('预警类型加载失败', e)
   }
   await reload()
+  // 不传 limit：后端默认 2000，覆盖全部 rps 历史
+  metaApi.dates()
+    .then((ds) => { availableDates.value = ds || [] })
+    .catch((e) => console.error('日期清单加载失败（不影响最新视图）', e))
 })
 </script>
 

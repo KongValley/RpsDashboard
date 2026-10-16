@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .. import config, db
 from ..analytics.alerts import ALERT_KINDS, SANXINGDI_WINDOWS
+from . import resolve_date
 
 router = APIRouter(prefix="/api", tags=["watchlist"])
 
@@ -94,10 +95,16 @@ class AlertRuleIn(BaseModel):
 
 
 @router.get("/watchlist")
-def list_watchlist() -> list[dict]:
-    """自选列表，附带最新交易日的各周期 RPS。"""
+def list_watchlist(date: str | None = None) -> list[dict]:
+    """自选列表，附带**指定日**（缺省最新）的各周期 RPS。
+
+    原先硬编码 `MAX(date)`：复盘时看不到自选在历史某天的状态。
+    `date` 走全项目统一的 `resolve_date`（非交易日就近回退），
+    响应里每条都带 `data_date`（实际生效日）。
+    """
     conn = db.connect()
     try:
+        d = resolve_date(conn, date) or "9999-12-31"
         rows = conn.execute(
             "SELECT w.symbol, w.note, w.added_at, s.name, s.is_st, i.industry, "
             "       r.date AS data_date, "
@@ -106,8 +113,9 @@ def list_watchlist() -> list[dict]:
             "LEFT JOIN security_master s ON s.symbol = w.symbol "
             "LEFT JOIN industry_map i ON i.symbol = w.symbol "
             "LEFT JOIN rps_daily r ON r.symbol = w.symbol "
-            "  AND r.date = (SELECT MAX(date) FROM rps_daily) "
-            "ORDER BY w.added_at DESC"
+            "  AND r.date = (SELECT MAX(date) FROM rps_daily WHERE date <= ?) "
+            "ORDER BY w.added_at DESC",
+            (d,),
         ).fetchall()
         return [dict(r) for r in rows]
     finally:

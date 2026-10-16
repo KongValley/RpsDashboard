@@ -10,7 +10,7 @@ from fastapi import APIRouter, Query
 from fastapi.responses import StreamingResponse
 
 from .. import config, db
-from . import jsonable, nth_previous_date, read_sql, resolve_date
+from . import csv_cell, jsonable, nth_previous_date, read_sql, resolve_date
 
 router = APIRouter(prefix="/api/rps", tags=["rps"])
 
@@ -531,13 +531,9 @@ def _csv_bytes(df: pd.DataFrame, headers: list[str] | None) -> bytes:
     if headers is None:
         return b"\xef\xbb\xbf"
 
-    def cell(v) -> str:
-        if v is None or (isinstance(v, float) and pd.isna(v)):
-            return ""
-        if isinstance(v, float):
-            return f"{v:.4f}"
-        s = str(v)
-        return "'" + s if s[:1] in ("=", "+", "-", "@", "\t", "\r") else s
+    # 转义规则集中在本模块顶部的 csv_cell（与 /api/trade/paper/export.csv 共用），
+    # 这里只负责排行榜特有的列（代码包公式、收益率转百分数）
+    cell = csv_cell
 
     buf = io.StringIO()
     writer = csv.writer(buf, quoting=csv.QUOTE_MINIMAL, lineterminator="\r\n")

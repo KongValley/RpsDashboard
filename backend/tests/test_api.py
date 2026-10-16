@@ -1004,6 +1004,51 @@ def test_paper_archive_endpoints(trade_client):
     assert client.get("/api/trade/paper/archives").json()["rows"] == []
 
 
+def test_paper_export_csv(trade_client):
+    """模拟盘导出：空库给带表头的空文件；有数据时转义正确、公式注入被前缀。"""
+    import io
+
+    client = trade_client
+    empty = client.get("/api/trade/paper/export.csv")
+    assert empty.status_code == 200
+    assert empty.content.decode("utf-8-sig").splitlines()[0].startswith("日期")
+
+    with dbmod.connect() as conn:
+        conn.execute(
+            "INSERT INTO paper_account(id, cash, created_at, updated_at)"
+            " VALUES (1, 900000, '2026-01-05', '2026-01-05')")
+        conn.executemany(
+            "INSERT INTO paper_nav(trade_date, cash, market_value, total, nav, n_positions)"
+            " VALUES (?,?,?,?,?,?)",
+            [("2026-01-05", 900000, 100000, 1000000, 1.0, 1),
+             ("2026-01-06", 920000, 80000, 1000000, 1.0, 1)])
+        conn.execute(
+            "INSERT INTO trade_order(plan_id, trade_date, symbol, side, volume, price,"
+            " status, broker_order_id, err_msg, created_at, updated_at)"
+            " VALUES (1,'2026-01-05','000001','buy',1000,12.1,'pending',900000001,"
+            " '=1+1',?,?)", (dbmod.now(), dbmod.now()))
+        conn.execute(
+            "INSERT INTO trade_fill(trade_date, broker_order_id, broker_trade_id, symbol,"
+            " side, volume, price, traded_at, fee, realized_pnl)"
+            " VALUES ('2026-01-06',900000001,1,'000001','sell',1000,12.5,?,3.2,380.0)",
+            (dbmod.now(),))
+        conn.commit()
+
+    nav = client.get("/api/trade/paper/export.csv", params={"kind": "nav"})
+    rows = list(csv.reader(io.StringIO(nav.content.decode("utf-8-sig"))))
+    assert rows[0][:2] == ["日期", "现金"]
+    assert len(rows) == 3, "两行净值 + 表头"
+    assert "paper_nav_2026-01-06.csv" in nav.headers["content-disposition"]
+
+    orders = client.get("/api/trade/paper/export.csv",
+                        params={"kind": "orders"}).content.decode("utf-8-sig")
+    assert "'=1+1" in orders, "以 = 开头的文本必须加前缀（CSV 公式注入）"
+
+    fills = client.get("/api/trade/paper/export.csv",
+                       params={"kind": "fills"}).content.decode("utf-8-sig")
+    assert "3.2000" in fills and "380.0000" in fills, "费用与已实现盈亏要导出"
+
+
 def test_trade_paper_endpoint_supports_date_and_review(seeded):
     """`/api/trade/paper?date=` 回看历史某日（就近回退），并带复盘字段。"""
     client, *_ = seeded
