@@ -150,6 +150,7 @@ def run(
         )
         payload = {
             "equity_curve": res.equity_curve,
+            "daily_curve": res.daily_curve,
             "benchmark_curve": res.benchmark_curve,
             "market_curve": res.market_curve,
             "metrics": res.metrics,

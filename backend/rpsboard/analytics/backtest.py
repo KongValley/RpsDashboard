@@ -33,6 +33,10 @@ BUCKET_LABELS = ["90-100", "80-90", "70-80", "50-70", "<50"]
 #: 大盘择时模式。欧奈尔的原方法是**只在强势市场做多**，而纯价格 RPS 回测
 #: 完全没有择时，这正是它测出「反向」结论的重要原因之一。
 MARKET_FILTERS = ("none", "ma200", "above_ma50", "trend_up")
+#: 每个调仓点随响应返回的持仓名单上限。等权全市场模式下名单有几千只，
+#: 全量塞进响应会把 payload 撑到几百 KB，而复盘想看的是「分数最高的那批」。
+HOLDINGS_TOP = 50
+
 #: 信号源：单因子 RPS / 多因子等权合成（方向取自滚动训练窗的 IC 符号）。
 #: **单一真源**：回测、交易计划、模拟盘三处都引用它，避免各自抄一份字符串元组。
 SIGNALS = ("rps", "composite")
@@ -95,6 +99,9 @@ def _rps_dates(conn: sqlite3.Connection, lo, hi) -> set[str]:
 @dataclass
 class BacktestResult:
     equity_curve: list[dict] = field(default_factory=list)
+    #: 逐日盯市净值（调仓点之间的中间交易日也有一条），用于看**真实回撤路径**。
+    #: 调仓点净值只在每期结束时取值，期内的下跌看不见，回撤因此被低估。
+    daily_curve: list[dict] = field(default_factory=list)
     benchmark_curve: list[dict] = field(default_factory=list)
     metrics: dict = field(default_factory=dict)
     buckets: list[dict] = field(default_factory=list)
@@ -594,20 +601,66 @@ def run_backtest(
     # 于是出现「单期 +667%」「年化 61875%」这种数学上不可能的数字。
     equity = 1.0
     curve: list[dict] = []
+    daily: list[dict] = []
+    # 矩阵的完整交易日历：逐日盯市要按它走（`dates` 已被滤成信号日）
+    all_dates = list(mask.index)
+    _all_pos = {d: i for i, d in enumerate(all_dates)}
     total_deferred = 0
     holdings_used: list[int] = []      # 供成本口径说明算真实持仓中位数
+
+    def _flat_daily(window: list, include_start: bool) -> None:
+        """空仓/无持仓的窗口：逐日净值按现金计（平线）。
+
+        必须补点，否则「这段时间在空仓」在逐日曲线上会变成一段缺失。
+        窗口首日**只有第一个窗口才发** —— 它是上一个窗口的末日，重复发
+        会让同一天出现两条互相矛盾的净值。
+        """
+        for d in (window if include_start else window[1:]):
+            daily.append({"date": d.strftime("%Y-%m-%d"), "equity": round(equity, 6)})
+
+    def _mark_daily(window: list, t, names: list, eq_end: float, entry_px,
+                    include_start: bool) -> None:
+        """把这一段持仓按**逐日**收盘价盯市，并整段**锚定**在该期期末净值上。
+
+        `eq_end` 是该期公布在 `equity_curve` 上的净值。不能简单地在建仓值上乘
+        `(1-cost)`：公布值走的是 `1 + 收益 - 成本`（加性），乘性写法会差一个
+        `成本 × 收益` 的交叉项（实测 0.015%），两条线就会互相矛盾。
+        这里反过来由期末值推出建仓值，两端都与公布口径严格相等。
+        """
+        ratios: dict = {}
+        for d in window:
+            if d == t:
+                ratios[d] = None
+                continue
+            r = close_wide.loc[d, names] / entry_px
+            ratios[d] = float(r.mean()) if r.notna().any() else 1.0
+        end_ratio = next((v for v in reversed(list(ratios.values())) if v), 1.0)
+        base = eq_end / end_ratio if end_ratio else eq_end
+        for d in (window if include_start else window[1:]):
+            v = ratios[d]
+            daily.append({"date": d.strftime("%Y-%m-%d"),
+                          "equity": round(base if v is None else base * v, 6)})
+
     for idx, t in enumerate(dates):
         if idx % step:
             continue
+        # 窗口必须按**矩阵的交易日历**取（不是上面那份滤过信号日的 `dates`）：
+        # 两者在有缺失信号日的区间里会错位，导致期末净值与 `fwd` 的
+        # t+hold 对不上（实测差 0.015%）。首日只在第一个窗口发：它是上一段的末日。
+        include_start = idx == 0
+        p0 = _all_pos.get(t, 0)
+        window = all_dates[p0:min(p0 + step, len(all_dates) - 1) + 1]
         if not bool(mkt_ok.get(t, True)):
             # 空仓：净值按现金计（不变），但**必须保留这个点**，
             # 否则曲线上看不出「这段时间在空仓」，也无法画开/空仓区间。
             curve.append({"date": t.strftime("%Y-%m-%d"),
                           "equity": round(equity, 6),
                           "holdings": 0})
+            _flat_daily(window, include_start)
             continue
         names = _select_names(mask, score_for_rank, t, select_top)
         if len(names) == 0:
+            _flat_daily(window, include_start)
             continue
 
         # 卖出受阻的那部分：收益不可实现，顺延到下一个调仓点。
@@ -625,23 +678,32 @@ def run_backtest(
             curve.append({"date": t.strftime("%Y-%m-%d"),
                           "equity": round(equity, 6),
                           "holdings": 0, "deferred": deferred})
+            _flat_daily(window, include_start)
             continue
 
         period_ret = fwd.loc[t, names].mean()      # 单个持有期收益
         if pd.isna(period_ret):
+            _flat_daily(window, include_start)
             continue
         # 成本按「组合名义金额」计，与实际持仓只数有关：等权分散持有上千只时，
         # 券商的 5 元最低佣金才是真正生效的那一项。
-        period_ret = period_ret - cost_model.round_trip_cost(
-            t, n_positions=len(names)
-        )
+        cost = cost_model.round_trip_cost(t, n_positions=len(names))
+        period_ret = period_ret - cost
         equity *= float(1.0 + period_ret)
         holdings_used.append(int(len(names)))
+        # 逐日盯市：整段锚定在该期期末净值上（建仓值由期末值反推）
+        _mark_daily(window, t, names, equity,
+                    close_wide.loc[t, names], include_start)
         curve.append({"date": t.strftime("%Y-%m-%d"),
                       "equity": round(equity, 6),
                       "holdings": int(len(names)),
+                      # 每期买入名单（前 50 只，已按排序键降序）：复盘要能回答
+                      # 「那天到底买了哪几只」，全量名单在等权全市场模式下有几千只，
+                      # 塞进响应会把 payload 撑到几百 KB。
+                      "holdings_top": list(names[:HOLDINGS_TOP]),
                       "deferred": deferred})
     result.equity_curve = curve
+    result.daily_curve = daily
     if holdings_used:
         # 5 元最低佣金是按「组合名义金额」生效的：持仓越多，均摊到每只票的
         # 固定费用越低。params["cost"] 是前端用来解释扣费口径的说明，
@@ -698,6 +760,13 @@ def run_backtest(
         n_days_per_point=step,
         dates=[c["date"] for c in result.equity_curve],
     )
+    if len(result.daily_curve) > 2:
+        # 逐日口径的回撤：调仓点口径看不见期内的下跌，会**低估**回撤
+        # （实测同一段行情两个数字能差几个百分点）。两个都留着并标注口径，
+        # 不偷偷替换 —— README 里已公布的数字是按调仓点口径记的。
+        eq_d = pd.Series([c["equity"] for c in result.daily_curve], dtype="float64")
+        result.metrics["max_drawdown_daily"] = round(
+            float((eq_d / eq_d.cummax() - 1.0).min()), 4)
 
     # ── 分档前瞻收益（核心验证图）───────────────────────────────
     # 刻意**不扣成本**：这张图衡量的是「信号本身有没有预测力」，

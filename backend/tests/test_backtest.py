@@ -243,6 +243,72 @@ def test_run_backtest_end_to_end(tmp_path):
     assert "total_return" in res.metrics
 
 
+def test_daily_curve_connects_rebalance_points(tmp_path):
+    """逐日净值必须与调仓点净值对得上，且**回撤不小于**点式口径。
+
+    口径注意：`equity_curve` 的点记在**建仓日**上，值是**该期期末**（t+hold）
+    的净值。所以「某点的值」应当等于逐日曲线在**下一个调仓日**（即该期期末）
+    的值 —— 这条断言把这个约定钉住，免得后人以为两条线互相矛盾。
+
+    调仓点口径只在每期结束时取一次值，期内的下跌完全看不见，回撤因此被低估；
+    逐日口径是把同一段持仓按收盘价逐日盯市。
+    """
+    conn = _seed_db(tmp_path, "bt_daily.db", n_symbols=60, n_days=320, seed=73)
+    res = bt.run_backtest(conn, period=20, threshold=80, hold=20)
+    conn.close()
+
+    assert res.daily_curve, "逐日曲线不应为空"
+    assert len(res.daily_curve) >= len(res.equity_curve), \
+        "逐日点数不该少于调仓点数"
+    dates = [p["date"] for p in res.daily_curve]
+    assert dates == sorted(dates) and len(set(dates)) == len(dates), "日期必须递增且不重复"
+
+    daily_eq = {p["date"]: p["equity"] for p in res.daily_curve}
+    pts = res.equity_curve
+    for pt in pts:
+        assert pt["date"] in daily_eq, f"建仓日 {pt['date']} 在逐日曲线上缺失"
+    for i, pt in enumerate(pts[:-1]):
+        end = pts[i + 1]["date"]           # 该期期末 = 下一个调仓日
+        assert daily_eq[end] == pytest.approx(pt["equity"], rel=1e-6), \
+            f"{pt['date']} 建仓那期的期末净值与逐日曲线不一致"
+    tail = pts[-1]
+    if tail["date"] != dates[-1]:
+        assert daily_eq[dates[-1]] == pytest.approx(tail["equity"], rel=1e-6), \
+            "最后一个调仓点到窗口末的净值与逐日曲线不一致"
+
+    mdd_pt = abs(res.metrics["max_drawdown"])
+    mdd_daily = abs(res.metrics["max_drawdown_daily"])
+    assert mdd_daily >= mdd_pt - 1e-9, \
+        f"逐日回撤 {mdd_daily} 不该小于点式回撤 {mdd_pt}"
+
+
+def test_curve_carries_holdings_list(tmp_path):
+    """每个调仓点要带上买入名单（复盘要能回答"那天买了哪几只"）。"""
+    conn = _seed_db(tmp_path, "bt_hold.db", n_symbols=60, n_days=320, seed=74)
+    res = bt.run_backtest(conn, period=20, threshold=0.0, hold=20, select_top=5)
+    conn.close()
+
+    pts = [p for p in res.equity_curve if p.get("holdings")]
+    assert pts, "应至少有一个实际持仓的调仓点"
+    for pt in pts:
+        assert pt["holdings"] == 5
+        top = pt["holdings_top"]
+        assert len(top) == min(5, bt.HOLDINGS_TOP) == 5
+        assert len(set(top)) == len(top), "名单不该有重复"
+
+
+def test_holdings_list_is_capped(tmp_path):
+    """名单上限：等权全市场模式下真实持仓有几千只，全量塞进响应会撑爆 payload。"""
+    conn = _seed_db(tmp_path, "bt_cap.db", n_symbols=60, n_days=320, seed=75)
+    res = bt.run_backtest(conn, period=20, threshold=0.0, hold=20)
+    conn.close()
+
+    for pt in res.equity_curve:
+        if pt.get("holdings_top"):
+            assert len(pt["holdings_top"]) <= bt.HOLDINGS_TOP
+            assert pt["holdings"] >= len(pt["holdings_top"])
+
+
 def test_equity_curve_does_not_double_count(tmp_path):
     """回归测试：净值曲线不得重复计算持有期收益。
 

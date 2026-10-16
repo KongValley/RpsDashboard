@@ -81,6 +81,10 @@
         <div class="panel m">
           <div class="muted">最大回撤</div>
           <div class="mv down">{{ pct(result.metrics.max_drawdown) }}</div>
+          <div v-if="result.metrics.max_drawdown_daily != null" class="muted"
+               style="font-size:11px" title="调仓点口径看不见期内的下跌，会低估回撤；逐日口径按持仓的每日收盘价盯市">
+            逐日 {{ pct(result.metrics.max_drawdown_daily) }}
+          </div>
         </div>
         <div class="panel m">
           <div class="muted">夏普比率</div>
@@ -116,6 +120,75 @@
           </span>
           <span v-else><br /><b>未计入交易成本</b>，净值偏乐观。</span>
         </div>
+      </div>
+
+      <div class="panel" style="margin-top:12px">
+        <div class="flex items-center gap-3" style="margin-bottom:8px">
+          <h3 style="margin:0">调仓记录</h3>
+          <span class="muted">
+            每次调仓的持仓只数与前 12 只买入名单（接口名单上限 50 只；等权全市场模式下真实持仓有几千只）
+          </span>
+          <div class="spacer" />
+          <span class="muted">每期期末净值按建仓日归档</span>
+        </div>
+        <table class="w-table">
+          <thead>
+            <tr><th>建仓日</th><th class="num">净值</th><th class="num">持仓</th>
+              <th class="num">顺延</th><th>买入名单（前 12 只）</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="c in rebalanceRows" :key="c.date">
+              <td class="mono">{{ c.date }}</td>
+              <td class="num">{{ c.equity?.toFixed(4) }}</td>
+              <td class="num">{{ c.holdings || 0 }}</td>
+              <td class="num muted">{{ c.deferred || 0 }}</td>
+              <td class="mono muted" style="font-size:11px">
+                {{ (c.holdings_top || []).slice(0, 12).join(' ') || '—' }}
+                <span v-if="(c.holdings_top || []).length > 12">
+                  …共 {{ c.holdings_top.length }} 只
+                </span>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div v-if="history.length" class="panel" style="margin-top:12px">
+        <div class="flex items-center gap-3" style="margin-bottom:8px">
+          <h3 style="margin:0">参数对比</h3>
+          <span class="muted">最近 {{ history.length }} 次运行（最多 {{ MAX_HISTORY }} 次）</span>
+          <div class="spacer" />
+          <button class="btn" @click="exportHistory">导出 JSON</button>
+          <button class="btn" @click="fileInput?.click()">导入 JSON</button>
+          <button class="btn" @click="history = []">清空</button>
+          <input ref="fileInput" type="file" accept="application/json"
+                 style="display:none" @change="importHistory" />
+        </div>
+        <table class="w-table">
+          <thead>
+            <tr>
+              <th>参数</th><th class="num">累计收益</th><th class="num">年化</th>
+              <th class="num">最大回撤</th><th class="num">逐日回撤</th>
+              <th class="num">夏普</th><th class="num">调仓点</th><th>时间</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="r in history" :key="r.key">
+              <td>{{ r.label }}</td>
+              <td class="num" :class="vcls(r.metrics?.total_return)">
+                {{ pct(r.metrics?.total_return) }}
+              </td>
+              <td class="num" :class="vcls(r.metrics?.annualized)">
+                {{ pct(r.metrics?.annualized) }}
+              </td>
+              <td class="num down">{{ pct(r.metrics?.max_drawdown) }}</td>
+              <td class="num down">{{ pct(r.metrics?.max_drawdown_daily) }}</td>
+              <td class="num">{{ num(r.metrics?.sharpe) }}</td>
+              <td class="num muted">{{ r.metrics?.days ?? '—' }}</td>
+              <td class="muted">{{ r.at }}</td>
+            </tr>
+          </tbody>
+        </table>
       </div>
 
       <div class="panel" style="margin-top:12px">
@@ -183,6 +256,15 @@ const signal = ref('rps')
 const selectTop = ref(null)
 const loading = ref(false)
 const result = ref(null)
+/** 最近几次运行的指标快照，用于换参数后并排比较（页面原先只保留一份结果） */
+const history = ref([])
+/** 导出/导入的隐藏文件选择框 */
+const fileInput = ref(null)
+//: 对比表最多保留几次（再多就看不下了；需要长期留存请导出 JSON）
+const MAX_HISTORY = 6
+/** 调仓记录表：倒序展示最近 12 次调仓 */
+const rebalanceRows = computed(() =>
+  [...(result.value?.equity_curve || [])].reverse().slice(0, 12))
 const warnings = ref([])
 /** 请求失败时页面内的错误条（不用 alert：会打断主线程、自动化里也看不见） */
 const errMsg = ref('')
@@ -229,6 +311,7 @@ async function run() {
     if (!latest.isCurrent(t)) return
     result.value = d
     warnings.value = d.warnings || []
+    remember(d)
   } catch (e) {
     if (!latest.isCurrent(t)) return
     errMsg.value = `回测失败：${e?.message || e}`
@@ -238,11 +321,15 @@ async function run() {
 }
 
 const equityOption = computed(() => {
-  const eq = result.value?.equity_curve || []
+  const pts = result.value?.equity_curve || []
+  // 优先用逐日曲线画净值：调仓点曲线看不见期内的下跌（回撤被低估）
+  const dl = result.value?.daily_curve || []
+  const eq = dl.length > pts.length ? dl : pts
   const bm = result.value?.benchmark_curve || []
   const mk = result.value?.market_curve || []
   const dates = eq.map((x) => x.date)
   const eqv = eq.map((x) => x.equity)
+  const rebSet = new Set(pts.map((x) => x.date))
   const bmMap = Object.fromEntries(bm.map((x) => [x.date, x.equity]))
   const bmv = dates.map((d) => bmMap[d] ?? null)
   // 择时序列按交易日给，净值按调仓点给，两者日期轴不同 —— 按日期映射到净值轴上
@@ -258,6 +345,10 @@ const equityOption = computed(() => {
   const series = [
     { name: '策略净值', type: 'line', data: eqv, showSymbol: false,
       lineStyle: { color: '#f6465d', width: 2 }, z: 5 },
+    // 调仓点单独标出来：逐日曲线看不出"哪几天在换仓"
+    { name: '调仓点', type: 'scatter', symbolSize: 6,
+      data: dates.map((d, i) => (rebSet.has(d) ? eqv[i] : null)),
+      itemStyle: { color: '#f0a020' }, z: 6 },
     { name: '沪深300', type: 'line', data: bmv, showSymbol: false, connectNulls: true,
       lineStyle: { color: '#8b98a9', width: 1.4 }, z: 2 },
   ]
@@ -324,6 +415,71 @@ const bucketOption = computed(() => {
 function pct(v) { return v == null ? '—' : `${(Number(v) * 100).toFixed(2)}%` }
 function num(v) { return v == null ? '—' : Number(v).toFixed(2) }
 function vcls(v) { return v == null ? '' : (v >= 0 ? 'up' : 'down') }
+
+// ── 多次回测的参数对比 ────────────────────────────────────────────
+// 页面同一时刻只有一份结果（新请求直接覆盖），想比较"换参数差多少"只能截图。
+// 这里把每次运行的指标留在内存里并排比较；导出/导入是纯前端 JSON，
+// 不为此新建表 —— 真要跨会话留存再考虑落库。
+function runKey(p) {
+  return JSON.stringify([p.period, p.threshold, p.hold, p.exclude_st,
+    p.exclude_limit_up, p.resonance, p.market_filter,
+    p.cost?.enabled ?? null, p.signal, p.select_top ?? null])
+}
+
+function runLabel(p) {
+  return `${p.signal === 'composite' ? '合成' : 'RPS'}${p.signal === 'composite' ? '' : p.period}`
+    + ` ≥${p.threshold} · 持有${p.hold}`
+    + (p.select_top ? ` · Top${p.select_top}` : '')
+    + (p.market_filter && p.market_filter !== 'none'
+      ? ` · ${MARKET_FILTERS[p.market_filter] || p.market_filter}` : '')
+    + (p.cost?.enabled ? ' · 计成本' : ' · 零成本')
+}
+
+function remember(d) {
+  const row = {
+    key: runKey(d.params || {}),
+    label: runLabel(d.params || {}),
+    metrics: d.metrics || {},
+    at: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+  }
+  history.value = [row, ...history.value.filter((x) => x.key !== row.key)]
+    .slice(0, MAX_HISTORY)
+}
+
+function exportHistory() {
+  const blob = new Blob([JSON.stringify({
+    exported_at: new Date().toISOString(),
+    runs: history.value,
+  }, null, 2)], { type: 'application/json' })
+  const a = document.createElement('a')
+  a.href = URL.createObjectURL(blob)
+  a.download = `backtest-compare-${new Date().toISOString().slice(0, 10)}.json`
+  a.click()
+  URL.revokeObjectURL(a.href)
+}
+
+async function importHistory(ev) {
+  const f = ev.target.files?.[0]
+  if (!f) return
+  try {
+    // 用 File.text() 而不是 FileReader：省掉一个全局构造器（ESLint 的
+    // browser globals 白名单里没有它），代码也更短
+    const data = JSON.parse(await f.text())
+    const incoming = Array.isArray(data?.runs) ? data.runs : []
+    const out = []
+    const seen = new Set()
+    for (const r of [...incoming, ...history.value]) {
+      if (!r?.key || seen.has(r.key)) continue
+      seen.add(r.key)
+      out.push(r)
+    }
+    history.value = out.slice(0, MAX_HISTORY)
+    errMsg.value = ''
+  } catch (e) {
+    errMsg.value = `导入失败：${e?.message || e}`
+  }
+  ev.target.value = ''
+}
 
 // ── 分档结论的自动解读 ──────────────────────────────────────────
 // buckets 是**按 RPS 从高到低**排列的（90-100 在前，0-50 在后）。
