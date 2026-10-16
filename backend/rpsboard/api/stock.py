@@ -10,7 +10,7 @@ import pandas as pd
 from fastapi import APIRouter, HTTPException
 
 from .. import config, db
-from . import jsonable, read_sql
+from . import jsonable, read_sql, resolve_date
 
 logger = logging.getLogger(__name__)
 
@@ -42,9 +42,15 @@ def _num_list(values) -> list:
 
 
 @router.get("/{symbol}")
-def detail(symbol: str) -> dict:
+def detail(symbol: str, date: str | None = None) -> dict:
+    """个股详情。`date` 给定时**回看那一天**（就近回退到有 RPS 的交易日）。
+
+    原先硬编码「最新一行」，想回答「那天这只票 RPS 多少、行业内排第几」只能翻库。
+    数据本来就按日留档，缺的只是这个入口。响应里的 `current.date` 就是实际生效日。
+    """
     conn = db.connect()
     try:
+        d = resolve_date(conn, date)
         row = read_sql(
             conn,
             "SELECT s.symbol, s.name, s.exchange, s.ipo_date, s.is_st, i.industry "
@@ -67,8 +73,9 @@ def detail(symbol: str) -> dict:
             conn,
             "SELECT date, " + ", ".join(f"rps{p}" for p in config.PERIODS)
             + ", " + ", ".join(f"ret{p}" for p in config.PERIODS)
-            + " FROM rps_daily WHERE symbol = ? ORDER BY date DESC LIMIT 1",
-            (symbol,),
+            + " FROM rps_daily WHERE symbol = ? AND date <= ?"
+            " ORDER BY date DESC LIMIT 1",
+            (symbol, d or "9999-12-31"),
         )
 
         current: dict = {}
@@ -143,11 +150,14 @@ def detail(symbol: str) -> dict:
 
 
 @router.get("/{symbol}/patterns")
-def patterns(symbol: str, days: int = 250) -> dict:
+def patterns(symbol: str, days: int = 250, date: str | None = None) -> dict:
     """该股最近的三升底形态记录（用于详情页标注形态位置与状态）。
 
     每条包含：形态确认日、第一根阳线日期、失效位（第一根最低价）、
     形态确认日之后的最低价，据此判定形态是否仍然有效。
+
+    `date` 给定时**只看那一天及之前**：形态表与「此后最低价」都必须砍掉
+    未来数据 —— 复盘时用今天才知道的低点去判一周前的形态是否失效，是偷看未来。
     """
     from .rps import _patterns_ready
 
@@ -156,11 +166,14 @@ def patterns(symbol: str, days: int = 250) -> dict:
         if not _patterns_ready(conn):
             return {"symbol": symbol, "patterns": [], "current": None,
                     "pattern_missing": True}
+        d = resolve_date(conn, date)
+        upper = d or "9999-12-31"
         rows = read_sql(
             conn,
             "SELECT date, base_date, base_low, base_high, strength, body_ratio "
-            "FROM pattern_daily WHERE symbol = ? ORDER BY date DESC LIMIT ?",
-            (symbol, max(1, min(int(days), 2000))),
+            "FROM pattern_daily WHERE symbol = ? AND date <= ?"
+            " ORDER BY date DESC LIMIT ?",
+            (symbol, upper, max(1, min(int(days), 2000))),
         )
         if rows.empty:
             return {"symbol": symbol, "patterns": [], "current": None,
@@ -170,10 +183,12 @@ def patterns(symbol: str, days: int = 250) -> dict:
         # days=250 时旧写法最坏会发 251 次查询（每条形态一次），而这里只需 2 次。
         # rev_min[i] = min(low[i:]) → 「形态确认日之后的最低价」= rev_min[i+1]，
         # 反向累计最小值一次 O(n) 扫描即可（列表按 date 升序）。
+        # 上界同样受 `date` 约束（复盘不许看未来）。
         lo_df = read_sql(
             conn,
-            "SELECT date, low FROM daily_bar WHERE symbol = ? ORDER BY date",
-            (symbol,),
+            "SELECT date, low FROM daily_bar WHERE symbol = ? AND date <= ?"
+            " ORDER BY date",
+            (symbol, upper),
         )
         dates = lo_df["date"].tolist() if not lo_df.empty else []
         lows = (pd.to_numeric(lo_df["low"], errors="coerce")
@@ -192,7 +207,9 @@ def patterns(symbol: str, days: int = 250) -> dict:
                 after = None          # 全是 +inf（后面没有有效 low）等价于没有数据
             p["min_low_after"] = after
             p["active"] = True if after is None else bool(after >= p["base_low"])
-        latest = conn.execute("SELECT MAX(date) AS d FROM rps_daily").fetchone()["d"]
+        # 「最近一次形态是否就在当前交易日附近」：回看历史时基准日是**那一天**，
+        # 不是库里的最新交易日
+        latest = d or conn.execute("SELECT MAX(date) AS d FROM rps_daily").fetchone()["d"]
         current = None
         if pats and pats[0]["active"]:
             # 最近一次形态是否就在当前交易日（或很近）
@@ -207,21 +224,30 @@ def patterns(symbol: str, days: int = 250) -> dict:
 
 
 @router.get("/{symbol}/curve")
-def curve(symbol: str, days: int = 250) -> dict:
-    """RPS 多周期曲线 + 后复权价格 + 涨跌幅（日期轴严格对齐）。"""
+def curve(symbol: str, days: int = 250, date: str | None = None) -> dict:
+    """RPS 多周期曲线 + 后复权价格 + 涨跌幅（日期轴严格对齐）。
+
+    `date` 给定时以那一天为**右端**向过去取 `days` 根（回看历史时曲线不该
+    继续画到最新交易日去），非交易日就近回退。
+    """
     # 夹紧：days=-1 时 SQLite 的 LIMIT -1 表示「无上限」，一次会把该股全部历史
     # 拉出来（同文件 patterns() 已经有同样的保护）
     days = max(1, min(int(days), 2000))
     conn = db.connect()
     try:
+        d = resolve_date(conn, date)
         df = read_sql(
             conn,
             "SELECT date, " + ", ".join(f"rps{p}" for p in config.PERIODS)
-            + " FROM rps_daily WHERE symbol = ? ORDER BY date DESC LIMIT ?",
-            (symbol, days),
+            + " FROM rps_daily WHERE symbol = ? AND date <= ?"
+            " ORDER BY date DESC LIMIT ?",
+            (symbol, d or "9999-12-31", days),
         )
         if df.empty:
-            raise HTTPException(status_code=404, detail=f"该股票暂无 RPS 数据: {symbol}")
+            detail = f"该股票暂无 RPS 数据: {symbol}"
+            if date:
+                detail = f"{symbol} 在 {d or date} 及之前没有 RPS 数据"
+            raise HTTPException(status_code=404, detail=detail)
         df = df.sort_values("date").reset_index(drop=True)
 
         # 关键：价格必须按 **RPS 已有的那些日期** 取，而不是对 daily_bar

@@ -16,6 +16,16 @@
         <div class="muted" style="margin-top:8px;font-size:12px">
           数据起始 {{ info.first_bar_date || '—' }}
           <span v-if="dataDate"> · 数据日期 {{ dataDate }}</span>
+          <label style="margin-left:12px">回看
+            <select v-model="reviewDate" style="margin-left:6px;font-size:12px"
+                    @change="reloadAll">
+              <option value="">最新</option>
+              <option v-for="d in availableDates" :key="d" :value="d">{{ d }}</option>
+            </select>
+          </label>
+          <span v-if="reviewDate" class="muted">
+            （已回看 {{ dataDate }}；曲线/形态都只到这一天，不掺未来数据）
+          </span>
         </div>
       </div>
 
@@ -144,7 +154,7 @@
 <script setup>
 import { ref, computed, onMounted, watch } from 'vue'
 import { useRoute } from 'vue-router'
-import { stockApi } from '../api'
+import { stockApi, metaApi } from '../api'
 import { usePeriods } from '../composables/usePeriods'
 import { useLatestRequest } from '../composables/useLatestRequest'
 
@@ -160,6 +170,9 @@ const industryRps = ref(null)
 const curve = ref({ dates: [], close: [] })
 const pattern = ref(null)
 const days = ref(250)
+/** 回看日期（空 = 最新）；选项来自 /api/meta/dates，与排行榜同一套 */
+const reviewDate = ref('')
+const availableDates = ref([])
 /** RPS 曲线配色（按系列下标取用，周期数增减都不改写法） */
 const RPS_COLORS = ['#4c9aff', '#f6465d', '#f0a020', '#2ebd85', '#b06cf0', '#38bdf8']
 /** 代表中期强弱的周期：加粗 + 画 80/90 参考线（按周期值判断，不看下标） */
@@ -184,7 +197,7 @@ const latestPatterns = useLatestRequest()
 async function loadDetail() {
   const t = latestDetail.begin()
   try {
-    const d = await stockApi.detail(symbol.value)
+    const d = await stockApi.detail(symbol.value, reviewDate.value)
     if (!latestDetail.isCurrent(t)) return
     info.value = d.info
     cur.value = d.current || {}
@@ -202,7 +215,7 @@ async function loadDetail() {
 async function loadCurve() {
   const t = latestCurve.begin()
   try {
-    const d = await stockApi.curve(symbol.value, days.value)
+    const d = await stockApi.curve(symbol.value, days.value, reviewDate.value)
     if (!latestCurve.isCurrent(t)) return
     curve.value = d
   } catch (e) {
@@ -215,7 +228,7 @@ async function loadCurve() {
 async function loadPatterns() {
   const t = latestPatterns.begin()
   try {
-    const d = await stockApi.patterns(symbol.value, days.value)
+    const d = await stockApi.patterns(symbol.value, days.value, reviewDate.value)
     if (!latestPatterns.isCurrent(t)) return
     pattern.value = d
   } catch (e) {
@@ -326,7 +339,13 @@ function reloadAll() {
   loadDetail(); loadCurve(); loadPatterns()
 }
 watch(symbol, reloadAll)
-onMounted(reloadAll)
+onMounted(() => {
+  reloadAll()
+  // 回看日期清单：不传 limit，后端默认 2000 覆盖全部 rps 历史
+  metaApi.dates()
+    .then((ds) => { availableDates.value = ds || [] })
+    .catch((e) => console.error('日期清单加载失败（不影响最新视图）', e))
+})
 </script>
 
 <style scoped>

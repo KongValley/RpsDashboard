@@ -215,6 +215,61 @@ def test_stock_curve_aligned(seeded):
         assert len(body[key]) == n, f"{key} 长度与日期轴不一致"
 
 
+def test_stock_detail_and_curve_follow_date(seeded):
+    """`?date=` 让个股详情与曲线锚在历史某天（非交易日就近回退）。"""
+    client, df, _ = seeded
+    sym = df["symbol"].iloc[0]
+    with dbmod.connect() as conn:
+        dates = [r["date"] for r in conn.execute(
+            "SELECT DISTINCT date FROM rps_daily WHERE symbol = ? ORDER BY date",
+            (sym,))]
+    assert len(dates) > 20
+    mid = dates[len(dates) // 2]
+
+    body = client.get(f"/api/stock/{sym}", params={"date": mid}).json()
+    assert body["current"]["date"] == mid, "详情必须锚在指定日"
+    # 分位与行业都按那一天算（不是最新一天）
+    assert set(body["market_percentile"]) == {f"rps{p}" for p in PERIODS}
+
+    curve = client.get(f"/api/stock/{sym}/curve",
+                       params={"days": 50, "date": mid}).json()
+    assert curve["dates"][-1] == mid, "曲线右端必须是指定日"
+    assert len(curve["dates"]) <= 50 and all(d <= mid for d in curve["dates"])
+
+    # 早于该股第一根 RPS → 就近回退到第一天（不是换成最新一天）
+    early = client.get(f"/api/stock/{sym}", params={"date": "1990-01-01"}).json()
+    assert early["current"]["date"] == dates[0]
+
+
+def test_stock_patterns_do_not_look_ahead_when_reviewing(seeded):
+    """回看历史形态时不许看到未来：`min_low_after` 必须只算到那一天为止。"""
+    client, df, _ = seeded
+    sym = df["symbol"].iloc[0]
+    with dbmod.connect() as conn:
+        dates = [r["date"] for r in conn.execute(
+            "SELECT DISTINCT date FROM rps_daily WHERE symbol = ? ORDER BY date",
+            (sym,))]
+        d0, d_last = dates[5], dates[-1]
+        conn.execute("DELETE FROM pattern_daily WHERE symbol = ?", (sym,))
+        conn.execute(
+            "INSERT INTO pattern_daily(symbol, date, base_date, base_low, base_high,"
+            " strength, body_ratio) VALUES (?,?,?,?,?,?,?)",
+            (sym, d0, d0, 5.0, 6.0, 0.1, 0.4))
+        # 形态之后某天的最低价远低于 base_low：看今天已失效
+        conn.execute("UPDATE daily_bar SET low = 1.0 WHERE symbol = ? AND date = ?",
+                     (sym, d_last))
+        conn.commit()
+
+    now = client.get(f"/api/stock/{sym}/patterns").json()
+    assert now["patterns"][0]["active"] is False, "按最新数据应判为失效"
+
+    past = client.get(f"/api/stock/{sym}/patterns", params={"date": d0}).json()
+    assert past["patterns"][0]["active"] is True, \
+        "回看 d0 当天不许用未来的低点判失效"
+    assert past["patterns"][0]["min_low_after"] is None, \
+        "回看当天「此后最低」应为空，而不是未来低点"
+
+
 def test_stock_404(seeded):
     client, *_ = seeded
     assert client.get("/api/stock/999999").status_code == 404

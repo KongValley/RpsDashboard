@@ -165,9 +165,12 @@ export const rpsApi = {
   conceptHeatmap: (params) => get('/rps/concept-heatmap', params),
 }
 export const stockApi = {
-  detail: (symbol) => get(`/stock/${symbol}`),
-  curve: (symbol, days = 250) => get(`/stock/${symbol}/curve`, { days }),
-  patterns: (symbol, days = 250) => get(`/stock/${symbol}/patterns`, { days }),
+  // date 可空：给了就回看历史某天（后端就近回退到有 RPS 的交易日）
+  detail: (symbol, date) => get(`/stock/${symbol}`, date ? { date } : undefined),
+  curve: (symbol, days = 250, date) =>
+    get(`/stock/${symbol}/curve`, date ? { days, date } : { days }),
+  patterns: (symbol, days = 250, date) =>
+    get(`/stock/${symbol}/patterns`, date ? { days, date } : { days }),
 }
 
 export const backtestApi = {
