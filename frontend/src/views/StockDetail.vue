@@ -1,6 +1,9 @@
 <template>
   <div class="detail">
-    <div v-if="!info" class="panel muted">加载中…</div>
+    <div v-if="errMsg" class="warnbar soft inset">{{ errMsg }}</div>
+    <div v-if="!info" class="panel muted">
+      {{ errMsg ? '加载失败，请查看上方提示' : '加载中…' }}
+    </div>
     <template v-else>
       <div class="panel head">
         <div class="flex items-center gap-3">
@@ -40,8 +43,6 @@
         </div>
       </div>
 
-      <div v-if="errMsg" class="warnbar soft inset">{{ errMsg }}</div>
-
       <div v-if="pattern && pattern.current" class="panel pat-now">
         <div class="flex items-center gap-3">
           <span class="badge pat big">三升底成立</span>
@@ -73,7 +74,7 @@
         <h3 style="margin-top:0">
           三升底历史形态
           <span class="muted" style="font-weight:400;font-size:12px">
-            （近 {{ days }} 个交易日，共 {{ pattern.patterns.length }} 次）
+            （最近最多 {{ days }} 次，本次返回 {{ pattern.patterns.length }} 次）
           </span>
         </h3>
         <div class="muted note" style="margin-top:0">
@@ -126,7 +127,7 @@
             <select v-model.number="days" @change="() => { loadCurve(); loadPatterns() }" style="margin-left:6px">
               <option :value="120">120 日</option>
               <option :value="250">250 日</option>
-              <option :value="400">全部</option>
+              <option :value="400">400 日</option>
             </select>
           </label>
         </div>

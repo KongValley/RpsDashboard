@@ -374,9 +374,14 @@ def evaluate_all(
     *,
     period: int = config.DEFAULT_PERIOD,
     hold: int = 20,
-    train_days: int = DEFAULT_TRAIN_DAYS,
 ) -> dict:
-    """把因子库串成一份可直接 JSON 序列化的 payload（`cli factors` 与页面共用）。"""
+    """把因子库串成一份可直接 JSON 序列化的 payload（`cli factors` 与页面共用）。
+
+    **全样本口径**：`evaluate` 用全部有效日期的 IC，衡量因子本身的预测力，
+    不涉及滚动训练窗（那是策略侧 `composite_score` 的事）。曾经这里收一个
+    `train_days` 参数并原样写进 `params`，但评估完全没用它 —— 传 30 或 250
+    给出的数字逐项相同，页面却按它显示「训练窗」，等于误导。
+    """
     if period not in config.PERIODS:
         period = config.DEFAULT_PERIOD
     ctx = load_context(conn, None, with_ohlcv=True)
@@ -386,6 +391,6 @@ def evaluate_all(
     return {
         "factors": evaluate(z, fwd),
         "corr": factor_corr(z),
-        "params": {"period": int(period), "hold": int(hold), "train_days": int(train_days)},
+        "params": {"period": int(period), "hold": int(hold)},
         "notes": list(NOTES),
     }

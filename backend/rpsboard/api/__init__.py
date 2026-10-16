@@ -105,6 +105,23 @@ def nth_previous_date(conn: sqlite3.Connection, after: str, n: int) -> str | Non
     return row["date"] if row and row["date"] else None
 
 
+def _operational_error(exc: BaseException) -> sqlite3.OperationalError | None:
+    """从异常链里取出真正的 `sqlite3.OperationalError`（若有）。
+
+    `pandas.read_sql_query` 会把底层错误包成 `pd.errors.DatabaseError`，
+    并把 `sqlite3.OperationalError` 挂在 `__cause__` 上 —— 直接
+    `except sqlite3.OperationalError` 永远接不到。
+    """
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        if isinstance(cur, sqlite3.OperationalError):
+            return cur
+        seen.add(id(cur))
+        cur = cur.__cause__ or cur.__context__
+    return None
+
+
 def read_sql(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> pd.DataFrame:
     """执行只读查询。
 
@@ -113,8 +130,9 @@ def read_sql(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> pd.DataF
     """
     try:
         return pd.read_sql_query(sql, conn, params=params)
-    except sqlite3.OperationalError as exc:
-        if "no such table" in str(exc):
+    except (sqlite3.OperationalError, pd.errors.DatabaseError) as exc:
+        cause = _operational_error(exc)
+        if cause is not None and "no such table" in str(cause):
             return pd.DataFrame()
         raise
 

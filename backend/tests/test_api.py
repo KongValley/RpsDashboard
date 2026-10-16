@@ -699,7 +699,11 @@ def test_trade_summary_shape_and_no_qmt_call(trade_client, monkeypatch):
 
 
 def test_trade_summary_reads_last_status_run(trade_client):
-    """账号/资金来自最近一次 cli trade status（message 里的 JSON），且已脱敏。"""
+    """账号/资金来自最近一次**成功的账户状态**（`cli trade status`）。
+
+    同一 task='trade' 下还写着页面快照（source=api）与发单（source=qmt）的
+    普通文字记录；它们不能把已知账号/资金清空。
+    """
     import json
 
     client = trade_client
@@ -710,10 +714,71 @@ def test_trade_summary_reads_last_status_run(trade_client):
             (dbmod.now(), dbmod.now(), json.dumps(
                 {"account_masked": "****0123", "asset": {"cash": 5000.0}}, ensure_ascii=False)))
         conn.commit()
-    s = client.get("/api/trade/summary").json()
+
+    def summary():
+        from rpsboard.api import trade as trade_api
+        trade_api._summary_cache.clear()
+        return client.get("/api/trade/summary").json()
+
+    s = summary()
     assert s["connected"] is True
     assert s["account_masked"] == "****0123"
     assert s["asset"]["cash"] == 5000.0
+    assert s["last_run"]["run_id"] == "r1", s["last_run"]
+
+    # 更晚的非账户记录：页面快照 / 发单成功 / 发单失败 / running —— 都不能顶掉账户状态
+    later = [
+        ("snap", "api", "success", "持仓快照（页面触发）"),
+        ("exec", "qmt", "success", "提交 2 笔"),
+        ("execfail", "qmt", "failed", "对账差异"),
+        ("running", "api", "running", "进行中"),
+        ("badjson", "qmt", "success", "not-json"),
+        ("nulljson", "qmt", "success", "null"),
+    ]
+    with dbmod.connect() as conn:
+        for run_id, source, status, msg in later:
+            conn.execute(
+                "INSERT INTO collect_log(run_id, task, source, status, started_at, finished_at,"
+                " message) VALUES (?, 'trade', ?, ?, '2099-01-01T00:00:00',"
+                " '2099-01-01T00:00:01', ?)",
+                (run_id, source, status, msg))
+        conn.commit()
+
+    s = summary()
+    assert s["connected"] is True
+    assert s["account_masked"] == "****0123", s
+    assert s["asset"]["cash"] == 5000.0
+    assert s["last_run"]["run_id"] == "r1"
+
+    # 新的有效账户状态必须接管
+    with dbmod.connect() as conn:
+        conn.execute(
+            "INSERT INTO collect_log(run_id, task, source, status, started_at, finished_at,"
+            " message) VALUES ('r2','trade','qmt','success','2099-01-02T00:00:00',"
+            " '2099-01-02T00:00:01', ?)",
+            (json.dumps({"account_masked": "****9999", "asset": {"cash": 6000.0}}),))
+        conn.commit()
+    s = summary()
+    assert s["last_run"]["run_id"] == "r2"
+    assert s["account_masked"] == "****9999"
+    assert s["asset"]["cash"] == 6000.0
+
+
+def test_trade_summary_without_account_state(trade_client):
+    """没有任何合格账户状态（或缺表）时返回空结构，不 500。"""
+    client = trade_client
+    from rpsboard.api import trade as trade_api
+
+    with dbmod.connect() as conn:
+        conn.execute(
+            "INSERT INTO collect_log(run_id, task, source, status, started_at, finished_at,"
+            " message) VALUES ('r1','trade','qmt','failed',?,?,?)",
+            (dbmod.now(), dbmod.now(), "连接失败"))
+        conn.commit()
+    trade_api._summary_cache.clear()
+    s = client.get("/api/trade/summary").json()
+    assert s["connected"] is False
+    assert s["account_masked"] is None and s["asset"] is None
 
 
 def test_trade_list_endpoints(trade_client):
@@ -861,3 +926,45 @@ def test_backtest_cache_key_includes_signal(seeded, monkeypatch):
     assert second["params"]["select_top"] == 3
     assert first.get("cached") is False, "第一次不该命中缓存"
     assert second.get("cached") is False, "参数不同就不该命中同一条缓存"
+
+
+# ── 空库容错：未 init 时列表接口返回空，而不是 500 ───────────────────
+def test_read_sql_missing_table_and_real_errors():
+    """缺表 → 空表；真正的 SQL 错误（错误列/语法）必须继续抛。
+
+    `pandas.read_sql_query` 把底层的 `sqlite3.OperationalError` 包成
+    `pd.errors.DatabaseError`，所以 `except sqlite3.OperationalError`
+    永远接不到 —— 未 init 的库上 `/api/meta/dates` 会直接 500。
+    """
+    from rpsboard.api import read_sql
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    try:
+        assert read_sql(conn, "SELECT * FROM absent_table").empty
+        assert read_sql(conn, "SELECT 42 AS value")["value"].iloc[0] == 42
+        for sql in ("SELECT nonexistent_col FROM sqlite_master", "SELEC 1"):
+            with pytest.raises(pd.errors.DatabaseError):
+                read_sql(conn, sql)
+    finally:
+        conn.close()
+
+
+def test_meta_lists_before_init(monkeypatch):
+    """全新未建表的库：日期/行业/概念清单都是空列表，不是 500。"""
+    import rpsboard.api as apimod
+    from rpsboard.api import create_app, perf
+
+    def fresh_conn():
+        c = sqlite3.connect(":memory:", check_same_thread=False)
+        c.row_factory = sqlite3.Row
+        return c
+
+    monkeypatch.setattr(dbmod, "connect", fresh_conn)
+    monkeypatch.setattr(perf, "_append_jsonl", lambda entry: None)   # 不写真实日志
+    monkeypatch.setattr(apimod, "_cache", {"conn": None, "opened": None})
+    client = TestClient(create_app())
+    for ep in ("/api/meta/dates", "/api/meta/industries", "/api/rps/concepts"):
+        r = client.get(ep)
+        assert r.status_code == 200, f"{ep} → {r.status_code}"
+        assert r.json() == [], ep

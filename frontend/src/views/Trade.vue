@@ -40,12 +40,12 @@
           <strong>{{ money(s?.asset?.market_value) }}</strong>
         </div>
         <div class="stat">
-          <span class="muted">上次拉取</span>
+          <span class="muted">账户状态时间</span>
           <strong>{{ s?.last_run?.finished_at || '—' }}</strong>
         </div>
       </div>
       <p class="muted tip">
-        账号与资金来自最近一次 <code>cli trade status</code>（本页面不连 QMT 客户端）。
+        账号与资金来自最近一次<strong>成功</strong>的 <code>cli trade status</code>；重取持仓快照只更新持仓，不改动它们。
         生成计划与发单都在命令行：<code>cli trade plan</code> → <code>cli trade execute --plan-id N --i-know-this-is-sim</code>。
       </p>
     </div>
@@ -78,7 +78,7 @@
           </div>
           <div class="stat">
             <span class="muted">区间收益</span>
-            <strong :class="paper.return >= 0 ? 'down' : 'up'">
+            <strong :class="paper.return >= 0 ? 'up' : 'down'">
               {{ pct(paper.return) }}
             </strong>
           </div>

@@ -17,7 +17,7 @@
           <h3 style="margin:0">因子评估</h3>
           <span class="muted">
             {{ data.run_at || '—' }}｜period {{ data.params.period }}｜
-            hold {{ data.params.hold }}｜训练窗 {{ data.params.train_days }} 交易日
+            hold {{ data.params.hold }}｜全样本研究口径
           </span>
           <div class="spacer" />
           <button class="btn" @click="load">刷新</button>

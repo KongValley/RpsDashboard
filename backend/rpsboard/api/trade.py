@@ -47,20 +47,33 @@ def _rows(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> list[dict]:
 
 
 def _last_trade_run(conn: sqlite3.Connection) -> dict[str, Any]:
-    """最近一次 `cli trade status` 的结果（账号/资金存在它的 message 里）。"""
-    row = conn.execute(
+    """最近一次**成功的账户状态**（`cli trade status`）的结果。
+
+    `collect_log.task='trade'` 下有四个写入者：`cli trade status`（账户/资金
+    JSON）、页面快照、`cli trade execute`、失败任务。只有 status 的成功
+    message 是账户状态；取最新一行会让一次持仓快照把账号和资金清成 None。
+    这里按 source='qmt' + status='success' 且 message 是**含 account_masked
+    与 asset 的 JSON 对象**过滤，跳过其余记录。
+    """
+    rows = _rows(
+        conn,
         "SELECT run_id, status, started_at, finished_at, rows_affected, message"
-        " FROM collect_log WHERE task='trade' ORDER BY started_at DESC, rowid DESC"
-        " LIMIT 1"
-    ).fetchone()
-    if not row:
-        return {}
-    out = dict(row)
-    try:
-        out["payload"] = json.loads(out.get("message") or "{}")
-    except ValueError:
-        out["payload"] = {}
-    return out
+        " FROM collect_log WHERE task='trade' AND source='qmt' AND status='success'"
+        " ORDER BY started_at DESC, rowid DESC",
+    )
+    for out in rows:
+        try:
+            payload = json.loads(out.get("message") or "")
+        except ValueError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if "account_masked" not in payload or not isinstance(payload.get("asset"), dict):
+            continue
+        out["payload"] = payload
+        return out
+    return {}
+
 
 
 def _summary(conn: sqlite3.Connection) -> dict:

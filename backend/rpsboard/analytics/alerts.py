@@ -98,14 +98,19 @@ def _hit_sanxingdi(conn, date: str, params: dict) -> list[tuple[str, str]]:
 
 
 def _hit_limit_up(conn, date: str, params: dict) -> list[tuple[str, str]]:
-    from .limits import TOLERANCE_PCT
+    from .limits import NO_LIMIT_STATUSES, TOLERANCE_PCT
 
+    # 与 limits.limit_mask 同口径：`limit_ratio > 0` 且 status 不属于
+    # NO_LIMIT_STATUSES 才算「当日有涨跌停约束」。少了这两条，ratio=0 的
+    # 新股前五日/复牌日会被 `pct >= 0 - 容差` 判成涨停，凭空制造误报。
+    marks = ",".join("?" * len(NO_LIMIT_STATUSES))
     rows = conn.execute(
         "SELECT p.symbol AS symbol, p.limit_ratio AS ratio, b.pct_chg AS pct "
         "FROM price_limit_daily p JOIN daily_bar b "
         "  ON b.symbol = p.symbol AND b.date = p.date "
-        "WHERE p.date = ? AND p.limit_ratio IS NOT NULL AND b.pct_chg IS NOT NULL",
-        (date,),
+        "WHERE p.date = ? AND p.limit_ratio > 0 AND b.pct_chg IS NOT NULL"
+        f"  AND (p.status IS NULL OR p.status NOT IN ({marks}))",
+        (date, *NO_LIMIT_STATUSES),
     ).fetchall()
     out = []
     for r in rows:
@@ -154,16 +159,19 @@ def run_rules(conn: sqlite3.Connection, date: str | None = None) -> list[dict]:
         except (sqlite3.Error, ValueError, TypeError) as exc:
             print(f"[alert] 规则 {rule['id']} 评估失败：{exc}")
             continue
+        # 「清旧 + 写新」同一事务：只追加的话，行情修正后旧误报会永远留着；
+        # 而删除若不回滚，插入失败就会留下「已删未写」的空结果。
+        # 评估失败时提前 continue，历史记录保持原样。
+        with conn:
+            conn.execute("DELETE FROM alert_hit WHERE rule_id=? AND date=?",
+                         (rule["id"], date))
+            for symbol, detail in matched:
+                conn.execute(
+                    "INSERT OR REPLACE INTO alert_hit(rule_id, date, symbol, detail) "
+                    "VALUES (?,?,?,?)",
+                    (rule["id"], date, symbol, detail),
+                )
         for symbol, detail in matched:
-            conn.execute(
-                "INSERT OR REPLACE INTO alert_hit(rule_id, date, symbol, detail) "
-                "VALUES (?,?,?,?)",
-                (rule["id"], date, symbol, detail),
-            )
             hits.append({"rule_id": rule["id"], "rule_name": rule["name"],
                          "date": date, "symbol": symbol, "detail": detail})
-        # 每条规则单独提交：只在最后 commit 的话，后面一条规则抛错会把前面
-        # 已经算好并写入的命中一起回滚掉（并且异常还会中断整轮评估）。
-        conn.commit()
-    conn.commit()
     return hits

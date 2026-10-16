@@ -1238,7 +1238,7 @@ def _fmt_opt(v, digits: int = 4) -> str:
 
 def _print_factor_table(payload: dict) -> None:
     p = payload["params"]
-    print(f"参数: period={p['period']} hold={p['hold']} train_days={p['train_days']}")
+    print(f"参数: period={p['period']} hold={p['hold']}（全样本研究口径）")
     print(f"{'因子':<14}{'IC均值':>9}{'IC_IR':>8}{'胜率':>8}{'样本':>8}{'自相关':>9}  说明")
     for f in payload["factors"]:
         print(
@@ -1282,7 +1282,7 @@ def cmd_factors(args: argparse.Namespace) -> int:
         t0 = time.time()
         try:
             payload = fac.evaluate_all(
-                conn, period=args.period, hold=args.hold, train_days=args.train_days
+                conn, period=args.period, hold=args.hold
             )
         except Exception as exc:  # noqa: BLE001
             db.finish_run(conn, run_id, "failed", 0, f"{type(exc).__name__}: {exc}")
@@ -1449,15 +1449,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("patterns", help="计算三升底形态").set_defaults(func=cmd_patterns)
 
-    from .analytics.factors import DEFAULT_TRAIN_DAYS
-
     sp = sub.add_parser("factors", help="多因子评估：全样本 IC/IR、分层收益、相关矩阵")
     sp.add_argument("--period", type=int, default=config.DEFAULT_PERIOD,
                     choices=list(config.PERIODS), help="动量因子用哪个周期的 ret")
     sp.add_argument("--hold", type=int, default=20,
                     help="前瞻收益的持有期，必须与回测的 --hold 相同")
-    sp.add_argument("--train-days", type=int, default=DEFAULT_TRAIN_DAYS,
-                    help="滚动训练窗长度（交易日）")
     sp.add_argument("--dry-run", action="store_true", help="只打印，不写库")
     sp.set_defaults(func=cmd_factors)
 

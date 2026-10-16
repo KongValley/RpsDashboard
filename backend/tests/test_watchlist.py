@@ -144,6 +144,85 @@ def test_run_rules_limit_up_uses_tolerance(client):
     conn.close()
 
 
+def test_run_rules_limit_up_ignores_unrestricted_days(client):
+    """无涨跌幅限制的日期不能算涨停，且重算要清掉旧的误报。
+
+    口径真源是 `limits.limit_mask`：`limit_ratio > 0` 且 status 不在
+    `NO_LIMIT_STATUSES` 里，才算「当日有涨跌停约束」。预警此前不看这两条，
+    ratio=0 时 `pct >= 0 - 0.2` 对任何上涨都为真 → 新股/复牌日全天误报。
+    """
+    c, path = client
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    day = "2026-01-05"
+    extra = [
+        # (symbol, ratio, status, pct_chg, 期望命中)
+        ("000003", 10.0, None, 0.10, True),                 # NULL status = 正常
+        ("000004", 0.0, "no_price_limit", 0.40, False),      # 无限制日，大涨也不算
+        ("000005", 10.0, "missing_pre_close", 0.40, False),  # 缺前收盘
+        ("000006", 0.0, "normal", 0.0, False),               # ratio=0 不算
+        ("000007", -5.0, "normal", 0.0, False),              # 负比率不算
+        ("000008", None, "normal", 0.10, False),             # ratio 缺失不算
+    ]
+    conn.executemany(
+        "INSERT INTO price_limit_daily(date, symbol, limit_ratio, limit_up, limit_down,"
+        " rule, status) VALUES (?,?,?,0,0,'main',?)",
+        [(day, s, r, st) for s, r, st, _p, _hit in extra],
+    )
+    conn.executemany(
+        "INSERT INTO daily_bar(symbol, date, close, pct_chg, tradestatus, is_st)"
+        " VALUES (?,?,11,?,1,0)",
+        [(s, day, p) for s, _r, _st, p, _hit in extra],
+    )
+    conn.execute(
+        "INSERT INTO alert_rule(name, kind, params, enabled, created_at)"
+        " VALUES ('涨停', 'limit_up', '{}', 1, '2026-01-05')")
+    conn.commit()
+
+    hits = alerts_engine.run_rules(conn, day)
+    assert {h["symbol"] for h in hits} == {"000001", "000003"}, hits
+
+    # 行情修正（000001 不再涨停）后重算：必须清掉旧命中，而不是只追加
+    conn.execute("UPDATE daily_bar SET pct_chg = 0.05 WHERE symbol='000001' AND date=?",
+                 (day,))
+    conn.commit()
+    again = alerts_engine.run_rules(conn, day)
+    stored = {r["symbol"] for r in conn.execute(
+        "SELECT symbol FROM alert_hit WHERE rule_id=1 AND date=?", (day,))}
+    conn.close()
+    assert "000001" not in {h["symbol"] for h in again}
+    assert "000001" not in stored, "重算必须清掉不再成立的旧命中"
+
+    # 命中端点同样不再返回它
+    assert "000001" not in {h["symbol"] for h in c.get("/api/alerts/hits").json()}
+
+
+def test_run_rules_refresh_is_atomic_on_insert_failure(client):
+    """重算的「清旧 + 写新」必须同一事务：写入失败不得留下已删未写的空结果。"""
+    c, path = client
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    day = "2026-01-05"
+    conn.execute(
+        "INSERT INTO alert_rule(name, kind, params, enabled, created_at)"
+        " VALUES ('涨停', 'limit_up', '{}', 1, '2026-01-05')")
+    # 先落一条旧命中（模拟上一轮结果），再加一个必然失败的触发器
+    conn.execute("INSERT INTO alert_hit(rule_id, date, symbol, detail)"
+                 " VALUES (1, ?, '000001', '涨停 10.00%')", (day,))
+    conn.execute(
+        "CREATE TRIGGER fail_hit BEFORE INSERT ON alert_hit"
+        " BEGIN SELECT RAISE(ABORT, 'test insert failure'); END")
+    conn.commit()
+
+    with pytest.raises(sqlite3.Error):
+        alerts_engine.run_rules(conn, day)
+
+    kept = conn.execute("SELECT symbol FROM alert_hit WHERE rule_id=1 AND date=?",
+                        (day,)).fetchall()
+    conn.close()
+    assert [r["symbol"] for r in kept] == ["000001"], "写入失败时必须回滚删除"
+
+
 def test_run_rules_skips_bad_params(client):
     """params 不是 JSON 对象时跳过该规则，不影响其它规则与调用方。"""
     c, path = client
