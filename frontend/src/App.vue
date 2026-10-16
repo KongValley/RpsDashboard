@@ -8,6 +8,7 @@
       <nav class="nav">
         <router-link to="/" :class="{ active: $route.path === '/' }">排行榜</router-link>
         <router-link to="/sectors" :class="{ active: $route.path === '/sectors' }">板块强弱</router-link>
+        <router-link to="/review" :class="{ active: $route.path === '/review' }">每日复盘</router-link>
         <router-link to="/backtest" :class="{ active: $route.path === '/backtest' }">策略回测</router-link>
         <router-link to="/watchlist" :class="{ active: $route.path === '/watchlist' }">自选预警</router-link>
         <router-link to="/factors" :class="{ active: $route.path === '/factors' }">因子研究</router-link>

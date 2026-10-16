@@ -292,6 +292,27 @@ def test_update_pipeline_runs_industry_and_alerts(tmp_path, monkeypatch):
     assert "industry" not in phases2, "已有行业数据时必须跳过，不能悄悄换口径"
 
 
+def test_review_limit_list_matches_alert_rule(client):
+    """复盘页的当日涨停清单与 `limit_up` 预警规则必须给同一批股票。
+
+    两者共用 `limits.daily_limit_lists` —— 这条用例就是防止哪天有人在其中
+    一处又抄一遍判据（涨跌停口径分叉过一次，代价是整批误报）。
+    """
+    c, path = client
+    c.post("/api/alerts/rules", json={"name": "涨停", "kind": "limit_up",
+                                      "params": {}})
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    hits = alerts_engine.run_rules(conn, "2026-01-05")
+    conn.close()
+
+    body = c.get("/api/review/day",
+                 params={"date": "2026-01-05", "threshold": 0}).json()
+    assert {h["symbol"] for h in hits} == {x["symbol"] for x in body["limit_up"]}
+    assert {x["symbol"] for x in body["limit_up"]} == {"000001"}, body["limit_up"]
+    assert all(x["streak"] >= 1 for x in body["limit_up"])
+
+
 def test_update_pipeline_paper_phase_is_opt_in(tmp_path, monkeypatch):
     """`paper=True` 才推进模拟盘；且续跑参数取库里记录的那一份。
 

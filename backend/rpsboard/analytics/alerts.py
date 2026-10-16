@@ -98,26 +98,15 @@ def _hit_sanxingdi(conn, date: str, params: dict) -> list[tuple[str, str]]:
 
 
 def _hit_limit_up(conn, date: str, params: dict) -> list[tuple[str, str]]:
-    from .limits import NO_LIMIT_STATUSES, TOLERANCE_PCT
+    """涨停命中。
 
-    # 与 limits.limit_mask 同口径：`limit_ratio > 0` 且 status 不属于
-    # NO_LIMIT_STATUSES 才算「当日有涨跌停约束」。少了这两条，ratio=0 的
-    # 新股前五日/复牌日会被 `pct >= 0 - 容差` 判成涨停，凭空制造误报。
-    marks = ",".join("?" * len(NO_LIMIT_STATUSES))
-    rows = conn.execute(
-        "SELECT p.symbol AS symbol, p.limit_ratio AS ratio, b.pct_chg AS pct "
-        "FROM price_limit_daily p JOIN daily_bar b "
-        "  ON b.symbol = p.symbol AND b.date = p.date "
-        "WHERE p.date = ? AND p.limit_ratio > 0 AND b.pct_chg IS NOT NULL"
-        f"  AND (p.status IS NULL OR p.status NOT IN ({marks}))",
-        (date, *NO_LIMIT_STATUSES),
-    ).fetchall()
-    out = []
-    for r in rows:
-        pct = float(r["pct"]) * 100.0
-        if pct >= float(r["ratio"]) - TOLERANCE_PCT:
-            out.append((r["symbol"], f"涨停 {pct:.2f}%"))
-    return out
+    判据放在 `limits.daily_limit_lists`（与 `limit_mask` 共用常量）——
+    这里只负责格式化成 `(symbol, detail)`，避免第二处口径。
+    """
+    from .limits import daily_limit_lists
+
+    ups, _ = daily_limit_lists(conn, date)
+    return [(u["symbol"], f"涨停 {u['pct']:.2f}%") for u in ups]
 
 
 _EVALUATORS = {

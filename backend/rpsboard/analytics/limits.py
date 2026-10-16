@@ -192,6 +192,41 @@ def load_ratio_frames(
     )
 
 
+def daily_limit_lists(
+    conn: sqlite3.Connection, date: str, *, tolerance_pct: float = TOLERANCE_PCT
+) -> tuple[list[dict], list[dict]]:
+    """某一天的涨停/跌停清单（**实测口径**），返回 `(ups, downs)`。
+
+    判据与 `limit_mask` 共用同一套常量，避免两处口径分叉：
+    `limit_ratio > 0` 且 status 不在 `NO_LIMIT_STATUSES` 才算「当日有约束」；
+    涨跌幅取 `daily_bar.pct_chg`（小数）与实测比例比，并留容差
+    （交易所价位四舍五入）。
+
+    元素形如 `{"symbol", "pct", "ratio"}`，`pct` 是百分数（如 10.02）。
+    """
+    rows = conn.execute(
+        "SELECT p.symbol AS symbol, p.limit_ratio AS ratio, p.status AS status,"
+        " b.pct_chg AS pct"
+        " FROM price_limit_daily p JOIN daily_bar b"
+        "   ON b.symbol = p.symbol AND b.date = p.date"
+        " WHERE p.date = ? AND p.limit_ratio > 0 AND b.pct_chg IS NOT NULL",
+        (date,),
+    ).fetchall()
+    ups: list[dict] = []
+    downs: list[dict] = []
+    for r in rows:
+        if (r["status"] or "normal") in NO_LIMIT_STATUSES:
+            continue
+        pct = float(r["pct"]) * 100.0
+        ratio = float(r["ratio"])
+        item = {"symbol": r["symbol"], "pct": round(pct, 2), "ratio": ratio}
+        if pct >= ratio - tolerance_pct:
+            ups.append(item)
+        elif pct <= -ratio + tolerance_pct:
+            downs.append(item)
+    return ups, downs
+
+
 def coverage(conn: sqlite3.Connection, dates: list[str]) -> tuple[int, int]:
     """回测区间内 price_limit_daily 有数据的交易日数 / 总交易日数。
 

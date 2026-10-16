@@ -14,6 +14,7 @@ RPS 把全市场个股按区间涨幅做**横截面百分位排名**：RPS=90 �
 | **Δ名次** | 与 N 个交易日前的名次对比，看「这只票是最近在走强还是掉队」 |
 | **板块强弱** | **证监会行业 / 概念题材**两套口径，等权涨幅的横截面 RPS + 领涨股 + 行业×周期热力图（**行按当前周期独立排序**） |
 | **个股详情** | 单只股票的多周期 RPS 曲线 vs 后复权价格双轴图、跑赢全市场分位、所属行业强弱；可**回看历史某一天**（曲线与形态都只到那天，不掺未来数据） |
+| **每日复盘** | 选任意交易日的全局扫描：市场宽度（涨跌/涨跌停家数、中位涨跌）、**涨停板（含连板）**、跌停板、行业当日涨跌、当日信号名单；详见「每日复盘页」 |
 | **策略回测** | 净值 vs 沪深300、风险指标、**RPS 分档前瞻收益**（自动解读单调方向）、**大盘择时**、**交易成本**、**涨跌停可交易性**；还能换**买法**（只买分数最高的 N 只）和**信号源**（单因子 RPS 或 13 因子合成分） |
 | **因子研究** | 13 个因子的体检报告：IC/IR、分档收益、自相关、两两相关矩阵（`cli factors` 跑一次存库，页面直接读）。合成分可以直接拿去回测和模拟盘当信号 |
 | **自选预警** | 自选股池（行首 ☆ 即加入）+ 条件预警规则（RPS 阈值 / 三升底 / 涨停）与命中记录；命中可**手动**推送到微信 |
@@ -396,6 +397,37 @@ RPS 与回测的前瞻收益共用同一个矩阵）：
 - **回测存在幸存者偏差**：用当前证券池回溯历史，中途退市的股票缺失，结果偏乐观。
   回测页面已常驻标注，**不可直接用于实盘决策**。
 - **仅供研究学习，不构成投资建议**。
+
+## 每日复盘页（`/review`）
+
+对**某一天**做全局扫描，回答"今天是什么日子"：
+
+| 区块 | 内容 |
+|---|---|
+| 市场宽度 | 有行情只数 / 上涨 / 下跌 / 平盘 / 涨停 / 跌停 / **中位涨跌** |
+| 涨停板 | 代码、名称、行业、涨幅、实测涨跌停比例、**连板数**（往前看 10 个交易日连续涨停） |
+| 跌停板 | 同上（不含连板） |
+| 行业当日涨跌 | 按 `industry_map` 等权平均的**单日**涨跌 + 上涨家数 / 家数（全部行业，页面列首尾各 10） |
+| 当日信号名单 | 该日 `RPS{period} ≥ threshold` 且非 ST，按区间涨幅排序；点代码进个股页 |
+
+口径（都与其它页面共用，不另立一套）：
+
+- **宽度分母是「当日有 K 线且未停牌」的只数**，不是全市场股票数 —— 停牌不计入，
+  否则宽度会被停牌股稀释。
+- **涨停/跌停判据的唯一实现在 `analytics/limits.daily_limit_lists()`**：
+  `limit_ratio > 0` 且 status 不在 `NO_LIMIT_STATUSES` 才算"当日有约束"，
+  用 `daily_bar.pct_chg` 与实测比例比并留容差。**预警规则 `limit_up` 用的是同一个
+  函数**（`test_review_limit_list_matches_alert_rule` 锁住这一点），所以"复盘页看到的
+  涨停板"与"预警命中的涨停"必然一致。
+- **信号名单只做"RPS 阈值 + ST 过滤"这一层**：共振与大盘择时要加载全市场矩阵，
+  属于「策略回测」页的活。响应里的 `signals_note` 与页面都会写明这一点，
+  免得两个口径看起来一样、实际不一样。
+- `date` 走全项目统一的就近回退（非交易日落到最近的有数据交易日），响应回显生效日。
+
+```powershell
+# 命令行等价（只读接口，直接看 JSON）
+curl "http://127.0.0.1:8000/api/review/day?date=2026-10-14&threshold=80"
+```
 
 ## 回测结论（实测，务必先读）
 
@@ -1046,10 +1078,12 @@ backend/rpsboard/
                          + perf.py 性能监测
     watchlist.py         自选 / 预警规则的写入口
     factors.py           因子评估只读接口（读 factor_eval 最新一行，不现算）
-    trade.py             交易只读接口 + halt 开关 + 后台重取快照（唯一连客户端的端点）
+    trade.py             交易只读接口（含模拟盘复盘）+ halt 开关 + 后台重取快照（唯一连客户端的端点）
+    review.py            当日复盘：宽度 / 涨跌停清单（含连板）/ 行业当日涨跌 / 信号名单
 frontend/src/
   api/index.js           唯一网络出口（顺带计时上报、超时中止）
-  views/                 Rankings / Sectors / StockDetail / Backtest / Factors / Watchlist / Trade
+  views/                 Rankings / Sectors / Review（每日复盘）/ StockDetail / Backtest
+                         / Factors / Watchlist / Trade
   components/RpsTable.vue  排行榜表格（RPS 列随 period 参数变化）
   composables/           usePeriods.js（周期清单唯一来源）/ useLatestRequest.js（竞态守卫）
                          / useResizableColumns.js
@@ -1311,6 +1345,7 @@ $env:RPSBOARD_TRADE_MODE = "sim"
 | `GET /api/rps/ranking/export` | 同一组筛选条件（含 `sort`/`direction`）的**全量 CSV** |
 | `GET /api/rps/sector` · `/heatmap` | 行业排行+领涨股 / 行业 × 周期矩阵 |
 | `GET /api/rps/concepts` · `/concept-ranking` · `/concept-heatmap` | 概念口径的同三件套 |
+| `GET /api/review/day?date=&period=&threshold=&exclude_st=` | 当日复盘：市场宽度 + 涨停板（含连板）/跌停板 + 行业当日涨跌 + 信号名单（`date` 就近回退并回显） |
 | `GET /api/stock/{symbol}?date=` | 个股详情：多周期 RPS、全市场分位、所属行业 RPS；`date` 回看历史某日（就近回退） |
 | `GET /api/stock/{symbol}/curve?days=&date=` · `/patterns?days=&date=` | 多周期曲线 + 后复权价 / 三升底历史；`date` 为**右端**，形态的「此后最低价」也只算到那天 |
 | `GET /api/backtest/run` | 回测：`period`、`threshold`、`hold`、`resonance`、`market_filter`、涨跌停与成本开关 |

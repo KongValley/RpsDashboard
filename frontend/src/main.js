@@ -31,6 +31,8 @@ const routes = [
     meta: { title: 'RPS 排行榜' } },
   { path: '/sectors', name: 'sectors', component: () => import('./views/Sectors.vue'),
     meta: { title: '板块强弱' } },
+  { path: '/review', name: 'review', component: () => import('./views/Review.vue'),
+    meta: { title: '每日复盘' } },
   { path: '/stock/:symbol', name: 'stock',
     component: () => import('./views/StockDetail.vue'), meta: { title: '个股详情' } },
   { path: '/backtest', name: 'backtest', component: () => import('./views/Backtest.vue'),

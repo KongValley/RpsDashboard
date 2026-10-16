@@ -215,6 +215,76 @@ def test_stock_curve_aligned(seeded):
         assert len(body[key]) == n, f"{key} 长度与日期轴不一致"
 
 
+# ── 当日复盘 ────────────────────────────────────────────────────────
+def test_review_day_breadth_limits_and_signals(seeded):
+    """当日复盘：宽度自洽、涨跌停清单带连板、行业排序、信号名单。"""
+    client, df, _ = seeded
+    conn = dbmod.connect()
+    try:
+        dates = [r["date"] for r in conn.execute(
+            "SELECT DISTINCT date FROM rps_daily ORDER BY date")]
+        day, prev = dates[-1], dates[-2]
+        hot, cold = sorted(df["symbol"].unique())[:2]
+        for d in (prev, day):        # hot 连续两天涨停 → 连板 2
+            conn.execute(
+                "INSERT OR REPLACE INTO price_limit_daily(date, symbol, limit_ratio,"
+                " rule, status) VALUES (?,?,10.0,'main','normal')", (d, hot))
+            conn.execute("UPDATE daily_bar SET pct_chg = 0.10"
+                         " WHERE symbol = ? AND date = ?", (hot, d))
+        conn.execute(          # cold 当日跌停
+            "INSERT OR REPLACE INTO price_limit_daily(date, symbol, limit_ratio,"
+            " rule, status) VALUES (?,?,10.0,'main','normal')", (day, cold))
+        conn.execute("UPDATE daily_bar SET pct_chg = -0.10"
+                     " WHERE symbol = ? AND date = ?", (cold, day))
+        conn.commit()
+    finally:
+        conn.close()
+
+    body = client.get("/api/review/day",
+                      params={"date": day, "threshold": 0}).json()
+    assert body["date"] == day
+    b = body["breadth"]
+    assert b["traded"] == b["up"] + b["down"] + b["flat"] > 0
+    assert b["limit_up"] == len(body["limit_up"]) == 1
+    assert b["limit_down"] == len(body["limit_down"]) == 1
+
+    up = body["limit_up"][0]
+    assert up["symbol"] == hot and up["streak"] == 2, up
+    assert up["limit_ratio"] == 10.0 and up["name"]
+    assert body["limit_down"][0]["symbol"] == cold
+
+    assert body["sectors"], "行业当日涨跌不该为空"
+    avg = [s["avg_pct"] for s in body["sectors"]]
+    assert avg == sorted(avg, reverse=True)
+    assert all(s["up"] <= s["n"] for s in body["sectors"])
+
+    assert body["signals"], "threshold=0 时应有信号名单"
+    assert {"symbol", "rps", "period_return"} <= set(body["signals"][0])
+    assert "共振" in body["signals_note"], "必须写明不含共振/择时"
+
+    # 非交易日就近回退，并回显生效日
+    fallback = client.get("/api/review/day", params={"date": "2030-01-01"}).json()
+    assert fallback["date"] == day
+
+
+def test_review_day_on_empty_db(monkeypatch):
+    """空库不 500：返回空结构并给出提示。"""
+    import rpsboard.api as apimod
+    from rpsboard.api import create_app, perf
+
+    def fresh():
+        c = sqlite3.connect(":memory:", check_same_thread=False)
+        c.row_factory = sqlite3.Row
+        return c
+
+    monkeypatch.setattr(dbmod, "connect", fresh)
+    monkeypatch.setattr(perf, "_append_jsonl", lambda entry: None)
+    monkeypatch.setattr(apimod, "_cache", {"conn": None, "opened": None})
+    body = TestClient(create_app()).get("/api/review/day").json()
+    assert body["date"] is None and body["breadth"] is None
+    assert body["limit_up"] == [] and body["message"]
+
+
 def test_stock_detail_and_curve_follow_date(seeded):
     """`?date=` 让个股详情与曲线锚在历史某天（非交易日就近回退）。"""
     client, df, _ = seeded

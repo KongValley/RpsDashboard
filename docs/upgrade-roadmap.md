@@ -11,7 +11,7 @@
 
 | 主线 | 完成度 | 最大缺口（一句话） |
 |---|---|---|
-| **复盘** | ~70%（本轮 +） | 模拟盘与**个股**都能按日回看了；仍缺**自选按日**与"当日全局复盘"页 |
+| **复盘** | ~85%（本轮 +） | 模拟盘/个股按日回看 + **当日复盘页**都有了；仍缺**自选按日**、回测逐日与多参数对比 |
 | **模拟持仓** | ~85%（本轮 +） | 撮合、续跑、复盘都齐了；缺**多账户/多策略对照**、成交量约束、年化/夏普 |
 | **金融工具** | ~35% | 缺当日市场宽度、涨停板清单、板块当日涨跌、风险工具、导出中心；数据源只有行情（无基本面） |
 
@@ -33,13 +33,13 @@
 | 任选历史交易日（就近回退，不 400） | **有** | `api/__init__.py:53-90` `resolve_date`；日期清单 `api/meta.py:138-153`（取自 `rps_daily`，≤2000 天） |
 | 排行榜按日看 RPS + 当日涨跌 + Δ名次 | **有** | `frontend/src/views/Rankings.vue:84-88`（日期下拉）、`:29-33`（排序键）、`:60-67`（Δ名次 0/1/5/20/60）；后端 `api/rps.py:343-445` |
 | 板块按日看（行业/概念 + 热力图，可切日） | **有** | `Sectors.vue:20-23`、`api/rps.py:631-680` |
-| 板块**当日**涨跌 | **无** | 板块接口只给 `rps{p}` 与区间 `ret{p}`：`api/rps.py:641-645`；前端列只有"区间涨幅" `Sectors.vue:196-204` |
+| 板块**当日**涨跌 | ✅ **已有**（本轮新增） | `/api/review/day` 的 `sectors`：按 `industry_map` 等权聚合 `daily_bar.pct_chg`（板块页本身仍只给区间 `ret{p}`） |
 | 个股按日回看 | ✅ **已有**（本轮新增） | `api/stock.py::detail/curve/patterns` 都接受 `date` 并先过 `resolve_date`；形态的「此后最低价」也以该日为上界（不偷看未来）；页面头部有「回看」下拉 |
 | 自选按日回看 | **无** | `api/watchlist.py:96-115` 硬编码 `r.date = (SELECT MAX(date) FROM rps_daily)` |
 | 模拟盘按日查看 | ✅ **已有**（本轮新增） | `/api/trade/paper?date=`（`api/trade.py::_paper_date` 就近回退）+ 页面「回看」下拉；`paper_nav`/`paper_position` 本身按日留档（`db.py:292-313`） |
-| 当日市场宽度（涨跌家数 / 涨停家数 / 情绪） | **无** | `api/meta.py:94-136` 只有行数与质量计数；顶栏只显示日K行数/涨跌停覆盖/复权异常（`App.vue:158-200`） |
-| 涨停板清单 | **无独立入口** | 涨停判定只作为预警规则存在（`analytics/alerts.py:100-121`），要在「自选预警」页自己建一条规则才看得到（`Watchlist.vue:130-131`，且不带日期） |
-| 历史某日的策略信号名单 | **无** | 计划落库在 `trade_plan`/`trade_plan_item`，但 `api/trade.py:162-168` 只返回计划行**不含 items**；items 仅随 `summary` 返回**最新一份**（`api/trade.py:117-122`） |
+| 当日市场宽度（涨跌家数 / 涨停家数 / 情绪） | ✅ **已有**（本轮新增） | `/api/review/day` 的 `breadth`：有行情/上涨/下跌/平盘/涨停/跌停/中位涨跌；分母是当日有 K 线且未停牌 |
+| 涨停板清单 | ✅ **已有**（含连板） | `/review` 页「涨停板」表；判据来自 `analytics/limits.daily_limit_lists()`，与 `limit_up` 预警规则**同一个函数** |
+| 历史某日的策略信号名单 | ◑ **部分**（本轮新增） | `/api/review/day` 给「RPS 阈值 + ST 过滤」的名单；**entry_mask 的完整口径（共振/择时）**仍只在回测页，`trade_plan` 的 items 也依旧只能取最新一份 |
 | 回测逐日对照 | **无（数据本身不存在）** | 净值曲线只在调仓点有点，字段固定 `{date, equity, holdings, deferred}`：`analytics/backtest.py:640-643` |
 | 回测/模拟盘导出 | **无** | 全仓唯一导出是排行榜 CSV（`api/rps.py:450-515`）；`backtestApi` 只有 `run`（`api/index.js:173-177`） |
 | 多次回测参数对比 | **无** | 页面同一时刻只有一份结果（`Backtest.vue:185` `const result = ref(null)`，新请求直接覆盖） |
@@ -339,6 +339,13 @@ ORDER BY trade_date, id
 
 **成本**：2~3 天（新页面）。
 
+**落地状态：✅ 已完成**
+- 新增 `api/review.py`（`GET /api/review/day?date=&period=&threshold=&exclude_st=`）：市场宽度（分母=当日有 K 线且未停牌）、涨停板（含**连板数**）/跌停板、行业当日等权涨跌、当日信号名单。
+- **涨停判据抽成 `analytics/limits.daily_limit_lists()`**，预警规则 `limit_up` 改为调用它 —— 复盘页与预警不可能再各写一套判据（`test_review_limit_list_matches_alert_rule` 锁住）。
+- 信号名单只做"RPS 阈值 + ST 过滤"，响应里 `signals_note` 与页面都写明**不含**共振/择时（那两层在回测页）。
+- 前端新增 `/review` 页 + 导航入口；日期/周期/阈值可切。
+- 测试：`test_review_day_breadth_limits_and_signals`（宽度自洽、连板=2、行业排序、信号名单、非交易日回退）、`test_review_day_on_empty_db`；浏览器冒烟确认五个区块与切换日期发出的 `?date=`。
+
 ### P1-5 回测逐日持仓落库 + 多参数对比（工具）
 
 **改动点**：`analytics/backtest.py` 的 `equity_curve` 补 `date` 逐日点与每期 `holdings_list`；新增 `backtest_run` 表按参数指纹存结果；`Backtest.vue` 支持"保存本次 / 叠加对比"。
@@ -398,8 +405,8 @@ P0-2 顺延委托重试                          ✅ 已完成
 P0-3 成交落费用与已实现盈亏                ✅ 已完成（并修掉「部分卖出不减仓」）
 P0-4 模拟盘复盘面板（review/接口/页面/回看）✅ 已完成
 P1-3 个股按日锚定                          ✅ 已完成（详情/曲线/形态都支持 ?date=）
-P1-4 当日复盘页                            ⏳ 下一步
-P1-5 回测逐日 + 对比                       ⏳
+P1-4 当日复盘页                            ✅ 已完成
+P1-5 回测逐日 + 对比                       ⏳ 下一步
 P1-6 批次与多策略对照（破坏性迁移，放最后）⏳
 P2   小清理 / 导出中心 / 自选按日 / 风险工具 / 筛选保存 / 流动性约束 / 年化夏普 ⏳
 ```

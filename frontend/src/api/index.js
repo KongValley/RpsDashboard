@@ -214,6 +214,11 @@ export const tradeApi = {
   paper: (params) => get('/trade/paper', params),
 }
 
+/** 当日复盘：市场宽度 + 涨跌停清单 + 行业当日涨跌 + 信号名单（只读库） */
+export const reviewApi = {
+  day: (params) => get('/review/day', params),
+}
+
 /** 因子研究：最近一次 `cli factors` 的评估结果（只读库，见 api/factors.py） */
 export const factorApi = {
   latest: () => get('/factors'),
