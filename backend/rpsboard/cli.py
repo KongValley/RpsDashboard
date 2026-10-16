@@ -868,7 +868,7 @@ def cmd_trade_paper_run(args: argparse.Namespace) -> int:
                 cash=args.cash, period=args.period, threshold=args.threshold,
                 hold=args.hold, max_positions=args.max_positions,
                 exclude_st=not args.no_exclude_st, resonance=args.resonance,
-                signal=args.signal,
+                signal=args.signal, participation=args.max_participation,
                 reset=args.reset and args.yes_reset, progress=progress)
         except sim.SimError as exc:
             db.finish_run(conn, run_id, "failed", 0, str(exc))
@@ -895,6 +895,9 @@ def cmd_trade_paper_run(args: argparse.Namespace) -> int:
           f"委托 {res['orders']} 笔，成交 {res['filled']} 笔，"
           f"限价未触及 {res['canceled']} 笔，涨停/停牌顺延 {res['deferred']} 笔")
     print(f"[paper] 累计费用 {_money(res['fee'])}")
+    if res.get("capped") or res.get("illiquid"):
+        print(f"[paper] 参与率限制：{res.get('capped', 0)} 笔只吃下部分量（剩余顺延），"
+              f"{res.get('illiquid', 0)} 笔当日量不足一手")
     return 0
 
 
@@ -1637,6 +1640,9 @@ def build_parser() -> argparse.ArgumentParser:
     t_run.add_argument("--no-exclude-st", action="store_true")
     t_run.add_argument("--signal", choices=("rps", "composite"), default="rps",
                        help="信号源：rps 单因子 / composite 多因子等权合成")
+    t_run.add_argument("--max-participation", type=float, default=None,
+                       help="单日最多吃掉该股成交量的比例（默认 0.10，0=不限制）；"
+                            "当日成交量未知时不做限制")
     t_run.add_argument("--reset", action="store_true", help="先清空模拟盘再跑（不可恢复）")
     t_run.add_argument("--yes-reset", action="store_true", help="确认 --reset")
     tsub.add_parser("paper", help="打印模拟盘净值与持仓")

@@ -489,3 +489,97 @@ def test_build_plan_rejects_unknown_signal(trade_db):
     path, plan_date, _ = trade_db
     with dbmod.session(path) as conn, pytest.raises(plan_mod.PlanError, match="signal="):
         _build(conn, plan_date, signal="ml")
+
+
+# ── 参与率（成交量）约束 ────────────────────────────────────────────
+def _bars_v(conn, rows, date):
+    """带成交量的日 K：rows = (symbol, open, high, low, close, volume)"""
+    conn.executemany(
+        "INSERT OR REPLACE INTO daily_bar(symbol, date, open, high, low, close,"
+        " pct_chg, tradestatus, is_st, volume) VALUES (?,?,?,?,?,?,0,1,0,?)",
+        [(s, date, o, h, lo, c, v) for s, o, h, lo, c, v in rows])
+    conn.commit()
+
+
+def test_participation_cap_splits_fill_across_days(simdb):
+    """当日成交量吃不下整笔委托时：只成交一部分，剩余写回订单、次日接着撮合。
+
+    这条同时守住"剩余量"这个洞：原先部分成交后订单量不变，下次撮合会拿原始量
+    再买一遍 → 超买。
+    """
+    with dbmod.session(simdb) as conn:
+        sim.init_account(conn, CASH)
+        _bars_v(conn, [("000001", 10.0, 10.1, 9.9, 10.0, 5000)], "2026-01-02")
+        _bars_v(conn, [("000001", 10.0, 10.6, 9.9, 10.5, 5000)], "2026-01-05")
+        # 次日最低价要 ≤ 限价 10.05，否则挂不进去（那是另一条规则，别混进来）
+        _bars_v(conn, [("000001", 10.5, 10.8, 10.0, 10.6, 5000)], "2026-01-06")
+        _order(conn, 1, "2026-01-05", "000001", "buy", 1000, 10.05)
+
+        acc = sim.load_account(conn)
+        d1 = sim.settle_day(conn, acc, "2026-01-05", "2026-01-02", participation=0.1)
+        # 5000 × 10% = 500 股（5 手）
+        assert d1["filled"] == 1 and d1["capped"] == 1
+        assert acc.positions["000001"] == 500
+        row = conn.execute("SELECT volume, status FROM trade_order").fetchone()
+        assert row["volume"] == 500, "剩余量必须写回订单，否则下次会超买"
+        assert row["status"] == "part"
+
+        d2 = sim.settle_day(conn, acc, "2026-01-06", "2026-01-05", participation=0.1)
+        assert d2["filled"] == 1 and d2["capped"] == 0, "剩余 500 一次就吃完了"
+        assert acc.positions["000001"] == 1000, "合计正好是委托量，不能超买"
+        assert conn.execute("SELECT status FROM trade_order").fetchone()["status"] == "filled"
+
+
+def test_participation_zero_means_unlimited(simdb):
+    """0 = 关闭限制（老行为），与"量未知"是两条不同的路。"""
+    with dbmod.session(simdb) as conn:
+        sim.init_account(conn, CASH)
+        _bars_v(conn, [("000001", 10.0, 10.1, 9.9, 10.0, 5000)], "2026-01-02")
+        _bars_v(conn, [("000001", 10.0, 10.6, 9.9, 10.5, 5000)], "2026-01-05")
+        _order(conn, 1, "2026-01-05", "000001", "buy", 1000, 10.05)
+        acc = sim.load_account(conn)
+        st = sim.settle_day(conn, acc, "2026-01-05", "2026-01-02", participation=0)
+    assert st["filled"] == 1 and st["capped"] == 0 and acc.positions["000001"] == 1000
+
+
+def test_unknown_volume_is_not_capped(simdb):
+    """当日成交量未知（库里 NULL）时不做限制 —— 没数据不等于没流动性。"""
+    with dbmod.session(simdb) as conn:
+        sim.init_account(conn, CASH)
+        _bars(conn, [("000001", 10.0, 10.1, 9.9, 10.0, 1)], "2026-01-02")   # 无 volume
+        _bars(conn, [("000001", 10.0, 10.6, 9.9, 10.5, 1)], "2026-01-05")
+        _order(conn, 1, "2026-01-05", "000001", "buy", 1000, 10.05)
+        acc = sim.load_account(conn)
+        st = sim.settle_day(conn, acc, "2026-01-05", "2026-01-02", participation=0.1)
+    assert st["filled"] == 1 and st["capped"] == 0 and acc.positions["000001"] == 1000
+
+
+def test_illiquid_day_defers_instead_of_cancelling(simdb):
+    """当日量不足一手：顺延（不撤单），并单独计数。"""
+    with dbmod.session(simdb) as conn:
+        sim.init_account(conn, CASH)
+        _bars_v(conn, [("000001", 10.0, 10.1, 9.9, 10.0, 500)], "2026-01-02")
+        _bars_v(conn, [("000001", 10.0, 10.6, 9.9, 10.5, 500)], "2026-01-05")
+        _order(conn, 1, "2026-01-05", "000001", "buy", 1000, 10.05)
+        acc = sim.load_account(conn)
+        st = sim.settle_day(conn, acc, "2026-01-05", "2026-01-02", participation=0.1)
+    assert st["filled"] == 0 and st["deferred"] == 1 and st["illiquid"] == 1
+    assert "000001" not in acc.positions
+    with dbmod.session(simdb) as conn:
+        assert conn.execute("SELECT status FROM trade_order").fetchone()["status"] == "pending"
+
+
+def test_participation_cap_applies_to_sells_too(simdb):
+    """卖出同样受参与率限制（跌停卖不掉的另一半情形：量太小）。"""
+    with dbmod.session(simdb) as conn:
+        sim.init_account(conn, CASH)
+        acc = sim.load_account(conn)
+        acc.positions["000001"] = 1000
+        acc.avg_cost["000001"] = 10.0
+        conn.execute("UPDATE paper_account SET cash = 0 WHERE id = 1")
+        _bars_v(conn, [("000001", 10.0, 10.1, 9.9, 10.0, 2000)], "2026-01-02")
+        _bars_v(conn, [("000001", 10.0, 10.2, 9.8, 10.1, 2000)], "2026-01-05")
+        _order(conn, 1, "2026-01-05", "000001", "sell", 1000, 9.95)
+        st = sim.settle_day(conn, acc, "2026-01-05", "2026-01-02", participation=0.1)
+    assert st["filled"] == 1 and st["capped"] == 1
+    assert acc.positions["000001"] == 800, "2000×10% = 200 股"

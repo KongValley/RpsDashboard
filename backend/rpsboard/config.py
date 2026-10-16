@@ -186,6 +186,13 @@ TRADE_MODES = ("paper", "local", "sim")
 TRADE_HALT_FILE = Path(os.environ.get(
     "RPSBOARD_TRADE_HALT_FILE", DATA_DIR / "trade.halt"))
 
+# ── 自建模拟盘的成交假设 ────────────────────────────────────────────
+#: 单日最多吃掉该股成交量的百分之几。一次调仓要买几十只票，若假设
+#: "想买多少就能成交多少"，小盘股的当日成交量根本吃不下，净值会系统性偏乐观。
+#: 0 = 不限制（老行为）；当日成交量未知（NULL/0）时也不限制。
+PAPER_MAX_PARTICIPATION = float(os.environ.get(
+    "RPSBOARD_PAPER_MAX_PARTICIPATION", "0.10"))
+
 # ── 组合风险阈值（cli trade risk / GET /api/trade/risk）────────────────
 #: 单票权重上限（持仓市值 / 总权益）。等权 20 只时单票约 5%，
 #: 超过 25% 说明某只票的仓位已经明显偏离策略设定。

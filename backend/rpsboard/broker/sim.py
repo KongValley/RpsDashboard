@@ -40,6 +40,10 @@ PRICE_OFFSET = 0.005
 #: 本地委托号段起点。刻意选一个大号段，避免与任何券商返回的号混淆。
 ORDER_ID_BASE = 900_000_000
 
+#: 一手 = 100 股（A 股统一口径）。与 `plan.LOT` 同值；刻意不 import plan，
+#: 因为 plan 会拉起 pandas 与回测矩阵，而 sim 在 CLI 里被大量导入。
+LOT = 100
+
 #: 单个交易日最多撮合几笔（防御性上限，正常远小于此）
 MAX_ORDERS_PER_DAY = 200
 
@@ -69,6 +73,10 @@ class Bar:
     low: float
     close: float
     tradable: bool = True
+    #: 当日成交量（股）。库里为 NULL 时按 0 处理 = "量未知"，
+    #: 此时**不做参与率限制**（见 `_participation_cap`）——
+    #: 没有成交量数据不等于没有流动性，硬按 0 处理会让所有成交都被顺延掉。
+    volume: float = 0.0
 
 
 @dataclass
@@ -147,7 +155,8 @@ def _initial_cash(conn: sqlite3.Connection) -> float:
 def _day_bars(conn: sqlite3.Connection, trade_date: str) -> dict[str, Bar]:
     """某交易日的全市场日 K（一次索引 seek，约 5500 行）。"""
     rows = conn.execute(
-        "SELECT symbol, open, high, low, close, tradestatus FROM daily_bar WHERE date = ?",
+        "SELECT symbol, open, high, low, close, tradestatus, volume"
+        " FROM daily_bar WHERE date = ?",
         (trade_date,)).fetchall()
     out: dict[str, Bar] = {}
     for r in rows:
@@ -156,7 +165,8 @@ def _day_bars(conn: sqlite3.Connection, trade_date: str) -> dict[str, Bar]:
         out[r["symbol"]] = Bar(
             symbol=r["symbol"], open=float(r["open"]), high=float(r["high"]),
             low=float(r["low"]), close=float(r["close"]),
-            tradable=int(r["tradestatus"] or 0) == 1)
+            tradable=int(r["tradestatus"] or 0) == 1,
+            volume=float(r["volume"] or 0.0))
     return out
 
 
@@ -178,6 +188,7 @@ def settle_day(
     prev_date: str,
     *,
     cost_model: costs_mod.CostModel | None = None,
+    participation: float | None = None,
 ) -> dict:
     """撮合 `trade_date` 当天到期、且来自自建模拟盘的全部挂单。
 
@@ -187,6 +198,11 @@ def settle_day(
     返回当天的统计：``{"filled", "pending", "canceled", "deferred", "fee"}``。
     """
     model = cost_model or costs_mod.default_cost_model(enabled=True)
+    # 参与率上限：一次调仓要买几十只票，若假设"想买多少就能成交多少"，
+    # 小盘股的成交量根本吃不下，净值会系统性偏乐观。默认取 config 的值，
+    # 0 = 关闭（老行为）。
+    cap_ratio = (config.PAPER_MAX_PARTICIPATION if participation is None
+                 else float(participation))
     bars = _day_bars(conn, trade_date)
     ratios = _limit_ratios(conn, trade_date)
     prev_close = {s: b.close for s, b in _day_bars(conn, prev_date).items()} \
@@ -194,7 +210,9 @@ def settle_day(
     on = _as_date(trade_date)
 
     stats = {"filled": 0, "pending": 0, "canceled": 0, "deferred": 0,
-             "fee": 0.0, "trade_date": trade_date}
+             "fee": 0.0, "trade_date": trade_date,
+             # 受参与率限制没吃满的笔数 / 当日量太小一手都吃不下的笔数
+             "capped": 0, "illiquid": 0}
     # 顺延（停牌 / 涨跌停）会把订单留在**原 `trade_date`** 上，所以只捞「当天
     # 日期」的挂单是错的：第二天按新日期查询就再也看不到它，委托会永久卡在
     # `pending`，既不成交也不撤销（文档承诺的"顺延到下一个交易日"从未生效）。
@@ -228,6 +246,19 @@ def settle_day(
             continue
 
         want = int(o["volume"])
+        cap = _participation_cap(bar, cap_ratio)
+        if cap is not None and cap < LOT:
+            # 当日成交量小到买不到一手：顺延，不撤单（撤单会让"策略想买"
+            # 变成"静默没买"，而顺延至少会在下一个调仓点被重新评估）
+            stats["deferred"] += 1
+            stats["illiquid"] += 1
+            continue
+        if cap is not None and cap < want:
+            # 只吃下当日能吃的部分，**剩下的量写回订单**，明天接着撮合。
+            # 不写回的话，下一次撮合会拿原始量再买一遍 → 超买（原实现就有这个洞，
+            # 只是过去没有参与率限制，部分成交极难触发）。
+            want = cap
+            stats["capped"] += 1
         got, fee, realized, unit_cost = _apply(acc, sym, side, want, limit_px, model, on)
         if got <= 0:
             _set_status(conn, int(o["id"]), "rejected", err_msg="现金或持仓不足")
@@ -239,13 +270,30 @@ def settle_day(
             " realized_pnl, avg_cost) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (trade_date, int(o["broker_order_id"]), 1, sym, side, got, limit_px,
              db.now(), fee, realized, unit_cost))
-        _set_status(conn, int(o["id"]),
-                    "filled" if got == want else "part", err_msg=None)
+        if got < int(o["volume"]):
+            # 部分成交：订单量缩减为剩余量（绝对目标不变，由下一份计划重算）
+            conn.execute("UPDATE trade_order SET volume = volume - ? WHERE id = ?",
+                         (got, int(o["id"])))
+            _set_status(conn, int(o["id"]), "part", err_msg="部分成交（参与率上限）")
+        else:
+            _set_status(conn, int(o["id"]), "filled", err_msg=None)
         stats["filled"] += 1
         stats["fee"] += fee
 
     conn.commit()
     return stats
+
+
+def _participation_cap(bar: Bar, participation: float) -> int | None:
+    """当日最多能成交多少股（按成交量 × 参与率，向下取整到整手）。
+
+    返回 None 表示**不做限制**：参与率 ≤ 0（显式关闭），或当日成交量未知（NULL/0）。
+    成交量未知时不限制 —— 没有数据不等于没有流动性，按 0 处理会把所有委托
+    永远顺延掉（合成库与早期数据都没有 volume）。
+    """
+    if participation <= 0 or bar.volume <= 0:
+        return None
+    return int(bar.volume * participation) // LOT * LOT
 
 
 def _limit_blocked(bar: Bar, ratio, prev_close: float | None, side: str) -> bool:
@@ -867,6 +915,7 @@ def run(
     resonance: bool = False,
     signal: str = "rps",
     reset: bool = False,
+    participation: float | None = None,
     progress=None,
 ) -> dict:
     """把「出计划 → 次日撮合 → 盯市」推进到 `to_date`（缺省至今）。
@@ -950,7 +999,7 @@ def run(
 
     step = max(1, int(hold))
     totals = {"orders": 0, "filled": 0, "canceled": 0, "deferred": 0, "fee": 0.0,
-              "plans": 0, "days": 0}
+              "plans": 0, "days": 0, "capped": 0, "illiquid": 0}
 
     def _plan_and_submit(k: int) -> None:
         """在第 k 个信号日收盘后为下一个交易日挂单。"""
@@ -977,11 +1026,13 @@ def run(
         prev = dates[k - 1] if k > 0 else None
         today_filled = 0
         if prev is not None:
-            st = settle_day(conn, acc, day, prev)
+            st = settle_day(conn, acc, day, prev, participation=participation)
             totals["filled"] += st["filled"]
             totals["canceled"] += st["canceled"]
             totals["deferred"] += st["deferred"]
             totals["fee"] += st["fee"]
+            totals["capped"] += st.get("capped", 0)
+            totals["illiquid"] += st.get("illiquid", 0)
             today_filled = st["filled"]
         mark_to_market(conn, acc, day, filled_orders=today_filled)
         totals["days"] += 1
