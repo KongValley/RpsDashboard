@@ -153,6 +153,51 @@
         </table>
       </div>
 
+      <div class="panel" style="margin-top:12px">
+        <div class="flex items-center gap-3" style="margin-bottom:8px">
+          <h3 style="margin:0">已保存的回测</h3>
+          <span class="muted">存库、跨会话保留；「载入」把整份结果（含曲线）放回页面</span>
+          <div class="spacer" />
+          <button class="btn" :disabled="!result" @click="saveCurrent">保存本次</button>
+          <button class="btn" :disabled="!result" @click="exportCsv">导出 CSV</button>
+          <button class="btn" :disabled="!result" @click="exportJson">导出 JSON</button>
+        </div>
+        <p v-if="!savedRuns.length" class="muted">
+          还没有保存过。跑完一次点「保存本次」即可；导出 CSV 是逐日净值，
+          导出 JSON 是完整结果（两条曲线 + 指标 + 分档 + 警告）。
+        </p>
+        <table v-else class="w-table">
+          <thead>
+            <tr>
+              <th>名称</th><th class="num">累计收益</th><th class="num">年化</th>
+              <th class="num">最大回撤</th><th class="num">逐日回撤</th>
+              <th class="num">夏普</th><th>保存时间</th><th></th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="r in savedRuns" :key="r.id">
+              <td>{{ r.label }}</td>
+              <td class="num" :class="vcls(r.metrics?.total_return)">
+                {{ pct(r.metrics?.total_return) }}
+              </td>
+              <td class="num" :class="vcls(r.metrics?.annualized)">
+                {{ pct(r.metrics?.annualized) }}
+              </td>
+              <td class="num down">{{ pct(r.metrics?.max_drawdown) }}</td>
+              <td class="num down">{{ pct(r.metrics?.max_drawdown_daily) }}</td>
+              <td class="num">{{ num(r.metrics?.sharpe) }}</td>
+              <td class="muted" style="font-size:11px">
+                {{ (r.created_at || '').replace('T', ' ') }}
+              </td>
+              <td>
+                <button class="btn" @click="loadSaved(r.id)">载入</button>
+                <button class="btn" @click="removeSaved(r)">删除</button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
       <div v-if="history.length" class="panel" style="margin-top:12px">
         <div class="flex items-center gap-3" style="margin-bottom:8px">
           <h3 style="margin:0">参数对比</h3>
@@ -258,6 +303,8 @@ const loading = ref(false)
 const result = ref(null)
 /** 最近几次运行的指标快照，用于换参数后并排比较（页面原先只保留一份结果） */
 const history = ref([])
+/** 已保存的回测（存库，跨会话保留） */
+const savedRuns = ref([])
 /** 导出/导入的隐藏文件选择框 */
 const fileInput = ref(null)
 //: 对比表最多保留几次（再多就看不下了；需要长期留存请导出 JSON）
@@ -294,17 +341,22 @@ function topParam() {
   return Number.isFinite(n) && n >= 1 ? Math.min(n, 500) : null
 }
 
+/** 当前控件对应的请求参数（跑回测与保存用同一份，避免两处漂移） */
+function runParams() {
+  return {
+    period: period.value, threshold: threshold.value, hold: hold.value,
+    exclude_st: excludeSt.value, exclude_limit_up: excludeLimitUp.value,
+    resonance: resonance.value, market_filter: marketFilter.value,
+    use_cost: useCost.value, signal: signal.value, select_top: topParam(),
+  }
+}
+
 async function run() {
   const t = latest.begin()
   loading.value = true
   errMsg.value = ''
   try {
-    const d = await backtestApi.run({
-      period: period.value, threshold: threshold.value, hold: hold.value,
-      exclude_st: excludeSt.value, exclude_limit_up: excludeLimitUp.value,
-      resonance: resonance.value, market_filter: marketFilter.value,
-      use_cost: useCost.value, signal: signal.value, select_top: topParam(),
-    },
+    const d = await backtestApi.run(runParams(),
     // 合成分要先建 13 个全市场因子矩阵（缓存冷时实测 3~4 分钟），
     // 沿用回测默认的 3 分钟会必然超时
     signal.value === 'composite' ? 600_000 : undefined)
@@ -446,6 +498,81 @@ function remember(d) {
     .slice(0, MAX_HISTORY)
 }
 
+async function loadSavedRuns() {
+  try {
+    savedRuns.value = (await backtestApi.saved({ limit: 20 })).rows || []
+  } catch (e) {
+    console.warn('已保存回测加载失败', e)
+  }
+}
+
+async function saveCurrent() {
+  if (!result.value) return
+  const label = window.prompt('保存名（留空按参数自动生成）', '')
+  if (label === null) return
+  try {
+    const r = await backtestApi.save(runParams(), label || null)
+    if (!r.ok) {
+      errMsg.value = '保存失败'
+      return
+    }
+    await loadSavedRuns()
+  } catch (e) {
+    errMsg.value = `保存失败：${e?.message || e}`
+  }
+}
+
+async function loadSaved(id) {
+  try {
+    const r = await backtestApi.savedDetail(id)
+    if (!r.ok) {
+      errMsg.value = r.error || '载入失败'
+      return
+    }
+    result.value = r.result
+    warnings.value = r.result.warnings || []
+    errMsg.value = ''
+  } catch (e) {
+    errMsg.value = `载入失败：${e?.message || e}`
+  }
+}
+
+async function removeSaved(row) {
+  if (!window.confirm(`删除已保存的回测「${row.label}」？`)) return
+  try {
+    await backtestApi.removeSaved(row.id)
+    await loadSavedRuns()
+  } catch (e) {
+    errMsg.value = `删除失败：${e?.message || e}`
+  }
+}
+
+/** 下载一个字符串文件（导出 CSV/JSON 都在前端生成，不需要后端再算一遍） */
+function downloadText(name, text, type) {
+  const blob = new Blob([text], { type })
+  const a = document.createElement('a')
+  a.href = URL.createObjectURL(blob)
+  a.download = name
+  a.click()
+  URL.revokeObjectURL(a.href)
+}
+
+function exportCsv() {
+  const d = result.value
+  if (!d) return
+  const rows = (d.daily_curve?.length ? d.daily_curve : d.equity_curve || [])
+  const lines = ['date,equity', ...rows.map((p) => `${p.date},${p.equity}`)]
+  downloadText(`backtest_${d.params?.period}_${rows[0]?.date || 'x'}.csv`,
+    lines.join('\r\n'), 'text/csv;charset=utf-8')
+}
+
+function exportJson() {
+  const d = result.value
+  if (!d) return
+  downloadText(`backtest_${d.params?.period}_${new Date().toISOString().slice(0, 10)}.json`,
+    JSON.stringify(d, null, 2), 'application/json')
+}
+
 function exportHistory() {
   const blob = new Blob([JSON.stringify({
     exported_at: new Date().toISOString(),
@@ -538,7 +665,10 @@ const findingBody = computed(() => {
     `而不是「RPS 失效」。想贴近原方法，应改用 250 日窗口、加入市场择时与基本面过滤。`
 })
 
-onMounted(run)
+onMounted(() => {
+  run()
+  loadSavedRuns()
+})
 </script>
 
 <style scoped>

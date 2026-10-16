@@ -285,6 +285,49 @@ def test_review_day_on_empty_db(monkeypatch):
     assert body["limit_up"] == [] and body["message"]
 
 
+def test_backtest_save_and_reload(seeded):
+    """回测存库：列表不带 payload、详情能载入完整结果、删除可用。"""
+    client, *_ = seeded
+    params = {"period": 20, "threshold": 80, "hold": 20}
+    saved = client.post("/api/backtest/save", params=params).json()
+    assert saved["ok"] is True and saved["id"] >= 1
+    assert "RPS20" in saved["label"] and "计成本" in saved["label"]
+
+    rows = client.get("/api/backtest/saved").json()["rows"]
+    assert [r["id"] for r in rows] == [saved["id"]]
+    assert "payload" not in rows[0], "列表不该带 payload（对比表只需参数与指标）"
+    assert rows[0]["metrics"].get("total_return") is not None
+    assert rows[0]["params"]["period"] == 20
+
+    detail = client.get(f"/api/backtest/saved/{saved['id']}").json()
+    assert detail["ok"] is True
+    assert detail["result"]["saved"]["id"] == saved["id"]
+    assert detail["result"]["equity_curve"] and detail["result"]["metrics"]
+
+    # 与实时跑一次同参数的结果一致（同一口径，不是另算一套）
+    live = client.get("/api/backtest/run", params=params).json()
+    assert detail["result"]["metrics"]["total_return"] == live["metrics"]["total_return"]
+
+    assert client.delete(f"/api/backtest/saved/{saved['id']}").json()["ok"] is True
+    assert client.get("/api/backtest/saved").json()["rows"] == []
+    assert client.delete("/api/backtest/saved/999").json()["ok"] is False
+    assert client.get("/api/backtest/saved/999").json()["ok"] is False
+
+
+def test_backtest_auto_label_covers_variants(seeded):
+    """自动名要把关键参数写进去，否则列表里一堆「RPS20」分不清。"""
+    client, *_ = seeded
+    a = client.post("/api/backtest/save", params={
+        "period": 20, "threshold": 0, "hold": 20, "select_top": 5}).json()
+    b = client.post("/api/backtest/save", params={
+        "period": 60, "threshold": 90, "hold": 10, "market_filter": "ma200",
+        "use_cost": False}).json()
+    rows = {r["id"]: r["label"] for r in client.get("/api/backtest/saved").json()["rows"]}
+    assert "Top5" in rows[a["id"]]
+    assert "RPS60" in rows[b["id"]] and "零成本" in rows[b["id"]]
+    assert "200 日均线" in rows[b["id"]], rows[b["id"]]
+
+
 def test_stock_detail_and_curve_follow_date(seeded):
     """`?date=` 让个股详情与曲线锚在历史某天（非交易日就近回退）。"""
     client, df, _ = seeded

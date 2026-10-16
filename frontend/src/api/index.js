@@ -177,6 +177,14 @@ export const backtestApi = {
   // 回测是同步算的（大库上可达数十秒），单独放宽超时；
   // 合成分还要多走一遍全市场因子矩阵，调用方可再放宽（见 Backtest.vue 的 signal）
   run: (params, timeoutMs) => get('/backtest/run', params, timeoutMs ?? BACKTEST_TIMEOUT_MS),
+  // 存库（跨会话保留）：参数放 query 上，与 /run 同一套签名
+  save: (params, label) =>
+    post(`/backtest/save${qs({ ...params, label })}`, {}, BACKTEST_TIMEOUT_MS),
+  // 列表不带 payload（对比表只要参数与指标）；详情才回完整结果
+  saved: (params) => get('/backtest/saved', params),
+  savedDetail: (id) => get(`/backtest/saved/${id}`),
+  removeSaved: (id) =>
+    request(`/backtest/saved/${id}`, undefined, { method: 'DELETE' }),
 }
 
 export const adminApi = {

@@ -74,27 +74,13 @@ def clear_backtest_cache() -> None:
 BENCHMARKS = ("000300", "000001", "399001")
 
 
-@router.get("/backtest/run")
-def run(
-    period: int = config.DEFAULT_PERIOD,
-    threshold: float = 80.0,
-    hold: int = 20,
-    rebalance: int | None = None,
-    resonance: bool = False,
-    exclude_st: bool = True,
-    exclude_limit_up: bool = True,
-    benchmark: str = "000300",
-    market_filter: str = "none",
-    use_cost: bool = True,
-    use_price_limits: bool = True,
-    lookback_days: int | None = None,
-    signal: str = "rps",
-    select_top: int | None = None,
+def _normalize(
+    period: int, threshold: float, hold: int, rebalance: int | None,
+    resonance: bool, exclude_st: bool, exclude_limit_up: bool, benchmark: str,
+    market_filter: str, use_cost: bool, use_price_limits: bool,
+    lookback_days: int | None, signal: str, select_top: int | None,
 ) -> dict:
-    """执行 RPS 策略回测。
-
-    同参数请求走进程内缓存直接返回；返回值中始终携带幸存者偏差警示。
-    """
+    """把请求参数归一化成引擎能吃的形状（越界/非法一律回落，不是 500）。"""
     if period not in config.PERIODS:
         period = config.DEFAULT_PERIOD
     hold = max(1, min(int(hold), 250))
@@ -117,13 +103,25 @@ def run(
         signal = "rps"
     if select_top is not None:
         select_top = max(1, min(int(select_top), 500))
+    return {
+        "period": period, "threshold": round(threshold, 4), "hold": hold,
+        "rebalance": rebalance, "resonance": resonance, "exclude_st": exclude_st,
+        "exclude_limit_up": exclude_limit_up, "benchmark": benchmark,
+        "market_filter": market_filter, "use_cost": use_cost,
+        "use_price_limits": use_price_limits, "lookback_days": lookback_days,
+        "signal": signal, "select_top": select_top,
+    }
 
+
+def _execute(norm: dict) -> dict:
+    """按归一化参数执行回测（同参数走进程内缓存）。"""
     key = (
-        period, round(threshold, 4), hold, rebalance, resonance,
-        exclude_st, exclude_limit_up, benchmark, market_filter,
-        use_cost, use_price_limits, lookback_days, signal, select_top,
+        norm["period"], norm["threshold"], norm["hold"], norm["rebalance"],
+        norm["resonance"], norm["exclude_st"], norm["exclude_limit_up"],
+        norm["benchmark"], norm["market_filter"], norm["use_cost"],
+        norm["use_price_limits"], norm["lookback_days"], norm["signal"],
+        norm["select_top"],
     )
-
     conn = db.connect()
     try:
         token = _cache_token(conn)
@@ -133,20 +131,20 @@ def run(
 
         res = engine.run_backtest(
             conn,
-            period=period,
-            threshold=threshold,
-            hold=hold,
-            rebalance=rebalance,
-            resonance=resonance,
-            exclude_st=exclude_st,
-            exclude_limit_up=exclude_limit_up,
-            benchmark_symbol=benchmark,
-            market_filter=market_filter,
-            use_price_limits=use_price_limits,
-            cost_model=engine_cost_model(use_cost),
-            lookback_days=lookback_days,
-            signal=signal,
-            select_top=select_top,
+            period=norm["period"],
+            threshold=norm["threshold"],
+            hold=norm["hold"],
+            rebalance=norm["rebalance"],
+            resonance=norm["resonance"],
+            exclude_st=norm["exclude_st"],
+            exclude_limit_up=norm["exclude_limit_up"],
+            benchmark_symbol=norm["benchmark"],
+            market_filter=norm["market_filter"],
+            use_price_limits=norm["use_price_limits"],
+            cost_model=engine_cost_model(norm["use_cost"]),
+            lookback_days=norm["lookback_days"],
+            signal=norm["signal"],
+            select_top=norm["select_top"],
         )
         payload = {
             "equity_curve": res.equity_curve,
@@ -166,6 +164,141 @@ def run(
         return payload
     finally:
         conn.close()
+
+
+@router.get("/backtest/run")
+def run(
+    period: int = config.DEFAULT_PERIOD,
+    threshold: float = 80.0,
+    hold: int = 20,
+    rebalance: int | None = None,
+    resonance: bool = False,
+    exclude_st: bool = True,
+    exclude_limit_up: bool = True,
+    benchmark: str = "000300",
+    market_filter: str = "none",
+    use_cost: bool = True,
+    use_price_limits: bool = True,
+    lookback_days: int | None = None,
+    signal: str = "rps",
+    select_top: int | None = None,
+) -> dict:
+    """执行 RPS 策略回测。
+
+    同参数请求走进程内缓存直接返回；返回值中始终携带幸存者偏差警示。
+    """
+    return _execute(_normalize(
+        period, threshold, hold, rebalance, resonance, exclude_st,
+        exclude_limit_up, benchmark, market_filter, use_cost, use_price_limits,
+        lookback_days, signal, select_top))
+
+
+@router.post("/backtest/save")
+def save(
+    period: int = config.DEFAULT_PERIOD,
+    threshold: float = 80.0,
+    hold: int = 20,
+    rebalance: int | None = None,
+    resonance: bool = False,
+    exclude_st: bool = True,
+    exclude_limit_up: bool = True,
+    benchmark: str = "000300",
+    market_filter: str = "none",
+    use_cost: bool = True,
+    use_price_limits: bool = True,
+    lookback_days: int | None = None,
+    signal: str = "rps",
+    select_top: int | None = None,
+    label: str | None = None,
+) -> dict:
+    """跑一次并**存库**（跨会话保留，供「已保存」列表对比/载入）。写库。"""
+    import json
+
+    norm = _normalize(
+        period, threshold, hold, rebalance, resonance, exclude_st,
+        exclude_limit_up, benchmark, market_filter, use_cost, use_price_limits,
+        lookback_days, signal, select_top)
+    payload = _execute(norm)
+    name = (label or "").strip() or _auto_label(norm)
+    with db.session() as conn:
+        cur = conn.execute(
+            "INSERT INTO backtest_run(label, params, metrics, payload, created_at)"
+            " VALUES (?,?,?,?,?)",
+            (name, json.dumps(norm, ensure_ascii=False),
+             json.dumps(payload.get("metrics") or {}, ensure_ascii=False),
+             json.dumps(payload, ensure_ascii=False), db.now()))
+        # db.session() **不自动提交**（见 db.py）：漏了这一行插入会被回滚，
+        # 接口却照样返回一个看起来正常的 id。
+        conn.commit()
+    return {"ok": True, "id": int(cur.lastrowid), "label": name}
+
+
+def _auto_label(norm: dict) -> str:
+    """自动名：把关键参数写进去，列表里一眼能分辨。"""
+    bits = [norm["signal"] if norm["signal"] == "composite" else f"RPS{norm['period']}",
+            f"≥{norm['threshold']:g}", f"持有{norm['hold']}"]
+    if norm["select_top"]:
+        bits.append(f"Top{norm['select_top']}")
+    if norm["market_filter"] != "none":
+        bits.append(engine.MARKET_FILTER_LABELS.get(norm["market_filter"],
+                                                    norm["market_filter"]))
+    bits.append("计成本" if norm["use_cost"] else "零成本")
+    return " · ".join(bits)
+
+
+@router.get("/backtest/saved")
+def saved(limit: int = 20) -> dict:
+    """已保存的回测（**不含** payload，对比表只需要参数与指标）。"""
+    import json
+
+    limit = max(1, min(int(limit), 100))
+    conn = db.connect()
+    try:
+        if not db.table_exists(conn, "backtest_run"):
+            return {"rows": []}
+        rows = []
+        for r in conn.execute(
+                "SELECT id, label, params, metrics, created_at FROM backtest_run"
+                " ORDER BY id DESC LIMIT ?", (limit,)):
+            d = dict(r)
+            for k in ("params", "metrics"):
+                try:
+                    d[k] = json.loads(d[k])
+                except (TypeError, ValueError):
+                    d[k] = {}
+            rows.append(d)
+        return {"rows": rows}
+    finally:
+        conn.close()
+
+
+@router.get("/backtest/saved/{run_id}")
+def saved_detail(run_id: int) -> dict:
+    """载入一份已保存的回测（**含**完整 payload：曲线/分档/警告）。"""
+    import json
+
+    conn = db.connect()
+    try:
+        if not db.table_exists(conn, "backtest_run"):
+            return {"ok": False, "error": "还没有保存过回测"}
+        row = conn.execute("SELECT * FROM backtest_run WHERE id = ?",
+                           (int(run_id),)).fetchone()
+        if row is None:
+            return {"ok": False, "error": f"没有 id={run_id} 的记录"}
+        payload = json.loads(row["payload"])
+        payload["saved"] = {"id": int(row["id"]), "label": row["label"],
+                            "created_at": row["created_at"]}
+        return {"ok": True, "result": payload}
+    finally:
+        conn.close()
+
+
+@router.delete("/backtest/saved/{run_id}")
+def saved_delete(run_id: int) -> dict:
+    with db.session() as conn:
+        cur = conn.execute("DELETE FROM backtest_run WHERE id = ?", (int(run_id),))
+        conn.commit()
+    return {"ok": bool(cur.rowcount), "id": int(run_id)}
 
 
 class CollectRequest(BaseModel):

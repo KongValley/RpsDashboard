@@ -345,6 +345,20 @@ CREATE TABLE IF NOT EXISTS paper_archive (
   created_at   TEXT NOT NULL
 );
 
+-- 已保存的回测（跨会话对比用）。**纯新增表**：既有库由
+-- `CREATE TABLE IF NOT EXISTS` 直接获得，不动任何老表。
+-- payload 是完整结果 JSON（逐日曲线约 890 点 + 分档 + 警告，约 50 KB），
+-- 存下来才能"载入"回页面重看；对比表只读 params/metrics 两列。
+CREATE TABLE IF NOT EXISTS backtest_run (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  label      TEXT NOT NULL,
+  params     TEXT NOT NULL,   -- JSON：归一化后的请求参数
+  metrics    TEXT NOT NULL,   -- JSON：指标（列表接口只回这两列）
+  payload    TEXT NOT NULL,   -- JSON：完整结果（曲线/分档/警告）
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_backtest_run_created ON backtest_run(id DESC);
+
 -- 因子评估结果：每次 `cli factors` 一行，payload 是完整 JSON（约 30 KB）。
 -- 页面只读最新一行；保留历史是为了能对比「改过因子之后 IC 变了多少」。
 -- 因子矩阵本身**不落库**（13 × 1285 × 5574 × 8B ≈ 750 MB），落库的只有这份结果。
@@ -373,6 +387,12 @@ def connect(path: Path | str | None = None) -> sqlite3.Connection:
 
 @contextmanager
 def session(path: Path | str | None = None) -> Iterator[sqlite3.Connection]:
+    """借一个连接（用完关掉）。
+
+    **不自动提交**：调用方写完必须自己 `conn.commit()`（只读查询不用）。
+    漏提交不会报错，只是改动在 close 时被回滚 —— 接口却照常返回成功，
+    排查起来很难（2026-10-17 回测存档就踩过一次）。
+    """
     conn = connect(path)
     try:
         yield conn
