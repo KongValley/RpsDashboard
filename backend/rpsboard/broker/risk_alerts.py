@@ -42,9 +42,13 @@ def thresholds(
     }
 
 
-def current_drawdown(conn: sqlite3.Connection) -> float | None:
+def current_drawdown(conn: sqlite3.Connection, *,
+                     account_id: int | None = None,
+                     date: str | None = None) -> float | None:
     """**当前**回撤幅度（0.2 = 距历史峰值跌了 20%）。没有曲线时 None。"""
-    curve = sim.nav_curve(conn)
+    if account_id is None:
+        return None
+    curve = sim.nav_curve(conn, account_id=int(account_id), date=date)
     if not curve:
         return None
     peak = max(float(r["total"]) for r in curve)
@@ -54,12 +58,17 @@ def current_drawdown(conn: sqlite3.Connection) -> float | None:
 
 
 def evaluate(conn: sqlite3.Connection, **over) -> list[dict]:
-    """按阈值检查当前模拟盘，返回触发的告警（**不推送、不落库**）。
+    """按阈值检查某个模拟账户，返回触发的告警（**不推送、不落库**）。
 
     账户为空时返回空列表：没有持仓就没有组合风险可谈。
+    `account_id` 必须显式给出（没有「默认账户」这回事）。
     """
+    account_id = over.pop("account_id", None)
+    date = over.pop("date", None)
+    if account_id is None:
+        return []
     t = thresholds(**over)
-    review = sim.review(conn)
+    review = sim.review(conn, account_id=int(account_id), date=date)
     risk = review.get("risk") or {}
     if not risk:
         return []
@@ -88,7 +97,7 @@ def evaluate(conn: sqlite3.Connection, **over) -> list[dict]:
             + (f"（最像的一对 {worst.get('a')}·{worst.get('b')} = {worst.get('value')}）"
                if worst else ""))
 
-    dd = current_drawdown(conn)
+    dd = current_drawdown(conn, account_id=account_id, date=date)
     if dd is not None and dd > t["max_drawdown"]:
         add("drawdown", dd, t["max_drawdown"],
             f"当前回撤 {dd:.2%} > 上限 {t['max_drawdown']:.0%}（距历史峰值）")

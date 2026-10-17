@@ -51,6 +51,24 @@ function qs(params = {}) {
   return s ? `?${s}` : ''
 }
 
+/** 从响应里取出后端给的错误说明（Pydantic 422 的 detail 可能是数组）。 */
+async function errorDetail(res, url) {
+  let body = null
+  try {
+    body = await res.json()
+  } catch {
+    return `HTTP ${res.status} ${url}`
+  }
+  const d = body?.detail
+  if (typeof d === 'string' && d) return d
+  if (Array.isArray(d) && d.length) {
+    // Pydantic 校验错误：[{loc:[...], msg}] → 拼成一句人话
+    return d.map((x) => `${(x.loc || []).slice(1).join('.') || '参数'}: ${x.msg}`)
+      .join('；')
+  }
+  return `HTTP ${res.status} ${url}`
+}
+
 async function request(path, params, init, timeoutMs = TIMEOUT_MS) {
   const url = `/api${path}${qs(params)}`
   const t0 = performance.now()
@@ -63,7 +81,9 @@ async function request(path, params, init, timeoutMs = TIMEOUT_MS) {
       ...(init || {}),
       signal: guard.signal,
     })
-    if (!res.ok) throw new Error(`HTTP ${res.status} ${url}`)
+    // 后端把原因写在 detail 里（业务冲突 409 / 校验 422 都是）；
+    // 只显示「HTTP 409」让用户无从下手。
+    if (!res.ok) throw new Error(await errorDetail(res, url))
     return await res.json()
   } catch (e) {
     if (e?.name === 'AbortError') {
@@ -117,7 +137,7 @@ async function download(path, params, fallbackName = 'export.csv') {
   }
 }
 
-async function post(path, body, timeoutMs = TIMEOUT_MS) {
+async function post(path, body, timeoutMs = TIMEOUT_MS, extraInit = null) {
   const url = `/api${path}`
   const t0 = performance.now()
   const guard = timeoutGuard(timeoutMs)
@@ -128,9 +148,10 @@ async function post(path, body, timeoutMs = TIMEOUT_MS) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
+      ...(extraInit || {}),
       signal: guard.signal,
     })
-    if (!res.ok) throw new Error(`HTTP ${res.status} ${path}`)
+    if (!res.ok) throw new Error(await errorDetail(res, path))
     return await res.json()
   } catch (e) {
     if (e?.name === 'AbortError') {
@@ -214,7 +235,7 @@ export const alertApi = {
   hits: (params) => get('/alerts/hits', params),
 }
 
-/** QMT 交易（只读库 + 两个写入口；summary 不连客户端，见 api/trade.py） */
+/** QMT 交易接入（只读库 + 两个写入口；自建模拟盘已迁到 portfolioApi） */
 export const tradeApi = {
   summary: () => get('/trade/summary'),
   positions: () => get('/trade/positions'),
@@ -225,22 +246,59 @@ export const tradeApi = {
   // 重取快照会起子进程连 QMT，单独放宽超时
   snapshot: () => post('/trade/snapshot', {}, 120_000),
   snapshotStatus: () => get('/trade/snapshot/status'),
-  // 自建模拟盘：净值曲线 + 复盘指标 + 持仓（只读库）；date 可回看历史某日
-  paper: (params) => get('/trade/paper', params),
-  // 曲线归档（策略对照）：跑新策略前先存下旧曲线
-  archives: (params) => get('/trade/paper/archives', params),
-  archive: (label) => post('/trade/paper/archive', { label }),
-  removeArchive: (id) =>
-    request(`/trade/paper/archives/${id}`, undefined, { method: 'DELETE' }),
-  // 导出 CSV：净值 / 委托 / 成交（复盘留档用）
-  exportPaper: (kind, name) => download('/trade/paper/export.csv', { kind }, name),
-  // 组合风险体检（只读，不推送；推送走 cli trade risk --push）
-  risk: (params) => get('/trade/risk', params),
+}
+
+/**
+ * 自建模拟盘（多账户、原价撮合、独立流水）。
+ *
+ * 写操作超时放宽到 45 秒（服务端最多等 25 秒 SQLite 写锁），推进放宽到 180 秒：
+ * 推进要逐日结算，大区间会跑一会儿。超时后重试是安全的 —— 服务端按
+ * 「已结算日绝不重算」处理。
+ */
+export const portfolioApi = {
+  config: () => get('/portfolio/config'),
+  accounts: () => get('/portfolio/accounts'),
+  createAccount: (body) => post('/portfolio/accounts', body, 45_000),
+  archiveAccount: (id) => post(`/portfolio/accounts/${id}/archive`, {}, 45_000),
+  detail: (id, params) => get(`/portfolio/accounts/${id}`, params),
+  dates: (id) => get(`/portfolio/accounts/${id}/dates`),
+  orders: (id, params) => get(`/portfolio/accounts/${id}/orders`, params),
+  fills: (id, params) => get(`/portfolio/accounts/${id}/fills`, params),
+  submitOrder: (id, body) => post(`/portfolio/accounts/${id}/orders`, body, 45_000),
+  cancelOrder: (id, orderId) =>
+    post(`/portfolio/accounts/${id}/orders/${orderId}/cancel`, {}, 45_000),
+  reviewOrder: (id, orderId, reviewNote) =>
+    post(`/portfolio/accounts/${id}/orders/${orderId}/review`,
+      { review_note: reviewNote }, 45_000),
+  advance: (id, toDate) =>
+    post(`/portfolio/accounts/${id}/advance`, { to_date: toDate || null }, 180_000),
+  actions: (id) => get(`/portfolio/accounts/${id}/actions`),
+  registerAction: (id, body) => post(`/portfolio/accounts/${id}/actions`, body, 45_000),
+  risk: (id, params) => get(`/portfolio/accounts/${id}/risk`, params),
+  archives: (params) => get('/portfolio/archives', params),
+  exportCsv: (id, kind, name) =>
+    download(`/portfolio/accounts/${id}/export.csv`, { kind }, name),
+  confirmSuspension: (body) => post('/portfolio/suspensions', body, 45_000),
+}
+
+/**
+ * 交易工具：仓位预算 / 往返成本 / 持仓压力测试。
+ *
+ * 前两个是**纯计算**（不查证券表、不读行情），所以空库也能用；
+ * 压力测试要账户快照。
+ */
+export const toolsApi = {
+  positionSize: (body) => post('/tools/position-size', body),
+  roundTrip: (body) => post('/tools/round-trip', body),
+  stress: (body) => post('/tools/stress', body),
 }
 
 /** 当日复盘：市场宽度 + 涨跌停清单 + 行业当日涨跌 + 信号名单（只读库） */
 export const reviewApi = {
   day: (params) => get('/review/day', params),
+  // 市场笔记（symbol=''）与个股笔记共用；日期必须是有效交易日，否则后端 422
+  note: (params) => get('/review/note', params),
+  saveNote: (body) => post('/review/note', body),
 }
 
 /** 因子研究：最近一次 `cli factors` 的评估结果（只读库，见 api/factors.py） */

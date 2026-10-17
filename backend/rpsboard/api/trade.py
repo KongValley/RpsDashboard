@@ -19,11 +19,11 @@ import time
 from typing import Any
 
 from fastapi import APIRouter, Query
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from .. import config, db
-from . import csv_response, get_conn
+from ..broker.accounts import LEGACY_ORDER_ID_BASE
+from . import get_conn
 
 router = APIRouter(prefix="/api/trade", tags=["trade"])
 
@@ -80,7 +80,10 @@ def _last_trade_run(conn: sqlite3.Connection) -> dict[str, Any]:
 def _summary(conn: sqlite3.Connection) -> dict:
     last = _last_trade_run(conn)
     payload = last.get("payload") or {}
-    plans = _rows(conn, "SELECT * FROM trade_plan ORDER BY id DESC LIMIT 1")
+    # 只展示 **QMT** 的计划：`mode='local'` 是旧自建模拟盘的遗留（它的委托/成交
+    # 也留在共用表里），混进券商页会让「最新计划」指向一次跟券商无关的运行。
+    plans = _rows(conn, "SELECT * FROM trade_plan WHERE mode != 'local'"
+                        " ORDER BY id DESC LIMIT 1")
     plan = plans[0] if plans else None
     if plan:
         plan["params"] = json.loads(plan["params"] or "{}")
@@ -102,8 +105,21 @@ def _summary(conn: sqlite3.Connection) -> dict:
                      ("run_id", "status", "started_at", "finished_at", "rows_affected")},
         "positions": positions,
         "plan": plan,
-        "orders": _rows(conn, "SELECT * FROM trade_order ORDER BY id DESC LIMIT 200"),
-        "fills": _rows(conn, "SELECT * FROM trade_fill ORDER BY traded_at DESC LIMIT 200"),
+        # 本地号段（>= LEGACY_ORDER_ID_BASE）是旧自建模拟盘的记录，且其 plan 为 local：
+        # 一并排除，券商页只看券商/影子的回报。
+        "orders": _rows(
+            conn, "SELECT * FROM trade_order WHERE COALESCE(broker_order_id, 0) < ?"
+                  " AND (plan_id IS NULL OR plan_id NOT IN"
+                  "      (SELECT id FROM trade_plan WHERE mode = 'local'))"
+                  " ORDER BY id DESC LIMIT 200",
+            (LEGACY_ORDER_ID_BASE,)),
+        "fills": _rows(
+            conn, "SELECT * FROM trade_fill WHERE COALESCE(broker_order_id, 0) < ?"
+                  " AND (broker_order_id IS NULL OR broker_order_id NOT IN"
+                  "      (SELECT broker_order_id FROM trade_order WHERE plan_id IN"
+                  "       (SELECT id FROM trade_plan WHERE mode = 'local')))"
+                  " ORDER BY traded_at DESC LIMIT 200",
+            (LEGACY_ORDER_ID_BASE,)),
         "reconcile": reconcile,
     }
 
@@ -224,179 +240,6 @@ def start_snapshot() -> dict:
         return {"ok": True, "run_id": run_id, "running": True}
     finally:
         _snapshot_lock.release()
-
-
-def _paper_date(conn: sqlite3.Connection, raw: str | None) -> str | None:
-    """把请求日期解析为净值曲线上**实际存在**的一天。
-
-    与 `api/__init__.py::resolve_date` 同一条就近回退策略：优先不晚于该日的
-    最近一天（周末/长假落回），一个都没有才取更早的下一天。直接退回"最新一天"
-    是错的 —— 用户选 2026-05-05 会被无声换成 2026-10-14，看到的完全是另一天。
-    """
-    latest_row = conn.execute("SELECT MAX(trade_date) AS d FROM paper_nav").fetchone()
-    latest = latest_row["d"] if latest_row and latest_row["d"] else None
-    if not raw or not str(raw).strip():
-        return latest
-    raw = str(raw).strip()
-    hit = conn.execute("SELECT 1 FROM paper_nav WHERE trade_date = ?", (raw,)).fetchone()
-    if hit:
-        return raw
-    near = conn.execute(
-        "SELECT trade_date AS d FROM paper_nav WHERE trade_date <= ?"
-        " ORDER BY trade_date DESC LIMIT 1", (raw,)).fetchone()
-    if near and near["d"]:
-        return near["d"]
-    near = conn.execute(
-        "SELECT trade_date AS d FROM paper_nav WHERE trade_date > ?"
-        " ORDER BY trade_date ASC LIMIT 1", (raw,)).fetchone()
-    return near["d"] if near and near["d"] else latest
-
-
-@router.get("/paper")
-def paper(date: str | None = Query(
-        default=None, description="YYYY-MM-DD：回看历史某日；缺省=最新一天")) -> dict:
-    """自建模拟盘：净值曲线 + 权益摘要 + 复盘指标 + 当前/指定日持仓。
-
-    **只读库，不连任何券商。** `date` 落在非交易日时按就近回退，并在
-    `date` 字段回显实际生效的交易日。
-    """
-    from ..broker import sim
-
-    conn = get_conn()
-    try:
-        out = sim.summary(conn)
-        out["review"] = sim.review(conn)
-        effective = _paper_date(conn, date)
-        out["date"] = effective
-        if out.get("days") and effective and effective != out.get("to"):
-            out["positions"] = sim.positions_at(conn, effective)
-            row = conn.execute(
-                "SELECT trade_date, cash, market_value, total, nav, n_positions"
-                " FROM paper_nav WHERE trade_date = ?", (effective,)).fetchone()
-            out["nav_row"] = dict(row) if row else None
-        return out
-    except sim.SimError as exc:
-        return {"error": str(exc), "days": 0, "curve": [], "positions": [],
-                "round_trips": [], "review": {}}
-
-
-@router.get("/paper/archives")
-def paper_archives(limit: int = Query(default=10, ge=1, le=50)) -> dict:
-    """模拟盘曲线归档列表（**含曲线**，供策略对照页叠加画图）。只读库。"""
-    from ..broker import sim
-
-    conn = get_conn()
-    try:
-        return {"rows": sim.list_archives(conn, limit=int(limit))}
-    except sim.SimError as exc:
-        return {"rows": [], "error": str(exc)}
-
-
-class ArchiveBody(BaseModel):
-    label: str | None = None
-
-
-@router.post("/paper/archive")
-def paper_archive(body: ArchiveBody | None = None) -> dict:
-    """把**当前**曲线归档一份。写库（与 halt / snapshot 同类）。
-
-    模拟盘只有一个活动账户：跑第二种策略前先归档，否则 `--reset` 之后
-    这条曲线就再也拿不回来了。
-    """
-    from ..broker import sim
-
-    with db.session() as conn:
-        try:
-            res = sim.archive(conn, (body.label if body else None) or None)
-        except sim.SimError as exc:
-            return {"ok": False, "error": str(exc)}
-    _summary_cache.pop("v", None)
-    return {"ok": True, **res}
-
-
-@router.delete("/paper/archives/{arch_id}")
-def paper_archive_delete(arch_id: int) -> dict:
-    from ..broker import sim
-
-    with db.session() as conn:
-        removed = sim.delete_archive(conn, int(arch_id))
-    return {"ok": removed, "id": int(arch_id)}
-
-
-_EXPORTS = {
-    # kind: (表头, 取值函数)
-    "nav": (["日期", "现金", "持仓市值", "总权益", "净值", "持仓数"],
-            lambda r: [r["trade_date"], r["cash"], r["market_value"], r["total"],
-                       r["nav"], r["n_positions"]]),
-    "orders": (["日期", "代码", "方向", "数量", "价格", "状态", "券商委托号", "错误"],
-               lambda r: [r["trade_date"], r["symbol"], r["side"], r["volume"],
-                          r["price"], r["status"], r["broker_order_id"],
-                          r["err_msg"]]),
-    "fills": (["日期", "代码", "方向", "数量", "价格", "费用", "已实现盈亏"],
-              lambda r: [r["trade_date"], r["symbol"], r["side"], r["volume"],
-                         r["price"], r["fee"], r["realized_pnl"]]),
-}
-
-
-@router.get("/paper/export.csv")
-def paper_export(
-    kind: str = Query(default="nav", pattern="^(nav|orders|fills)$"),
-    limit: int = Query(default=5000, ge=1, le=100_000),
-) -> StreamingResponse:
-    """把模拟盘的净值 / 委托 / 成交导出为 CSV（复盘与留档用）。
-
-    只导出**模拟盘自建的**记录（`paper_nav` + 本地号段委托/成交），
-    券商回报那部分在 `/api/trade/*` 里看，不混进这份文件。
-    """
-    from ..broker import sim
-
-    conn = get_conn()
-    try:
-        if kind == "nav":
-            rows = sim.nav_curve(conn, limit=limit)
-        elif kind == "orders":
-            rows = [dict(r) for r in conn.execute(
-                "SELECT * FROM trade_order WHERE broker_order_id >= ?"
-                " ORDER BY trade_date, id LIMIT ?", (sim.ORDER_ID_BASE, limit))]
-        else:
-            rows = [dict(r) for r in conn.execute(
-                "SELECT * FROM trade_fill WHERE broker_order_id >= ?"
-                " ORDER BY trade_date, broker_order_id, broker_trade_id LIMIT ?",
-                (sim.ORDER_ID_BASE, limit))]
-    except sqlite3.OperationalError:
-        rows = []          # 老库缺列/缺表时不 500，导出一份带表头的空文件
-    headers, pick = _EXPORTS[kind]
-    dates = [r["trade_date"] for r in rows if r.get("trade_date")]
-    stamp = max(dates) if dates else "empty"
-    return csv_response(headers, [pick(r) for r in rows],
-                        f"paper_{kind}_{stamp}.csv")
-
-
-@router.get("/risk")
-def risk(
-    max_single: float | None = Query(default=None, gt=0, le=1),
-    max_industry: float | None = Query(default=None, gt=0, le=1),
-    max_avg_corr: float | None = Query(default=None, gt=0, le=1),
-    max_drawdown: float | None = Query(default=None, gt=0, le=1),
-) -> dict:
-    """模拟盘组合风险体检（只读，**不推送**）。
-
-    与 `cli trade risk` 同一套判据（`broker/risk_alerts.py`）；
-    推送只走命令行，页面只负责显示。
-    """
-    from ..broker import risk_alerts
-
-    conn = get_conn()
-    try:
-        over = {k: v for k, v in (
-            ("max_single", max_single), ("max_industry", max_industry),
-            ("max_avg_corr", max_avg_corr), ("max_drawdown", max_drawdown),
-        ) if v is not None}
-        return {"thresholds": risk_alerts.thresholds(**over),
-                "alerts": risk_alerts.evaluate(conn, **over),
-                "current_drawdown": risk_alerts.current_drawdown(conn)}
-    except Exception as exc:  # noqa: BLE001 - 没有曲线时不该 500
-        return {"thresholds": {}, "alerts": [], "error": str(exc)}
 
 
 @router.get("/snapshot/status")

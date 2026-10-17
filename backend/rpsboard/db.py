@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 import uuid
@@ -287,50 +288,121 @@ CREATE TABLE IF NOT EXISTS position_snapshot (
 );
 CREATE INDEX IF NOT EXISTS idx_position_snapshot_taken ON position_snapshot(taken_at);
 
--- ── 自建模拟盘（mode='local'；**不连任何券商**）────────────────────
--- 撮合用库内后复权日 K：T 日收盘后下单 → T+1 日内按限价判定成交。
--- 现金是账户的**当前**余额（单行），持仓与净值按日留档，便于事后审计。
-CREATE TABLE IF NOT EXISTS paper_account (
-  id          INTEGER PRIMARY KEY CHECK (id = 1),   -- 只有一个模拟账户
-  cash        REAL NOT NULL,                        -- 可用现金（元）
-  created_at  TEXT NOT NULL,
-  updated_at  TEXT NOT NULL
-);
+"""
 
-CREATE TABLE IF NOT EXISTS paper_position (
-  trade_date  TEXT NOT NULL,       -- 该日收盘时的持仓快照
-  symbol      TEXT NOT NULL,
-  volume      INTEGER NOT NULL,
-  avg_price   REAL NOT NULL,       -- 累计成本（含费用）/ 股
-  close       REAL NOT NULL,       -- 该日后复权收盘价
+#: 四张**需要重建**的模拟盘表：老库的主键/列清单与新结构不兼容，SQLite 又
+#: 不支持改主键，只能「建临时表 → 复制 → 删旧表 → 改名」。
+#: 它们是 SCHEMA 与 db.ensure_paper_accounts 的**唯一真源**（{name} 由两处各自
+#: 填真实表名），避免同一段 DDL 抄两遍后悄悄漂移。
+_PAPER_TABLE_DDL: dict[str, str] = {
+    "paper_account": """CREATE TABLE IF NOT EXISTS {name} (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  name         TEXT NOT NULL,
+  kind         TEXT NOT NULL CHECK (kind IN ('manual','strategy','legacy_hfq')),
+  price_basis  TEXT NOT NULL CHECK (price_basis IN ('raw','hfq')),
+  initial_cash REAL NOT NULL,
+  cash         REAL NOT NULL,
+  start_date   TEXT,
+  status       TEXT NOT NULL CHECK (status IN ('active','archived')),
+  created_at   TEXT NOT NULL,
+  updated_at   TEXT NOT NULL
+)""",
+    "paper_position": """CREATE TABLE IF NOT EXISTS {name} (
+  account_id   INTEGER NOT NULL,
+  trade_date   TEXT NOT NULL,
+  symbol       TEXT NOT NULL,
+  volume       INTEGER NOT NULL,
+  available_volume INTEGER NOT NULL DEFAULT 0,
+  avg_price    REAL NOT NULL,
+  cost_basis   REAL NOT NULL DEFAULT 0,
+  close        REAL NOT NULL,
+  price_date   TEXT,
   market_value REAL NOT NULL,
-  PRIMARY KEY (trade_date, symbol)
-);
-CREATE INDEX IF NOT EXISTS idx_paper_position_date ON paper_position(trade_date);
-
--- 净值曲线：initial_cash 固定一次，之后用 total / nav（倍数）看
-CREATE TABLE IF NOT EXISTS paper_nav (
+  PRIMARY KEY (account_id, trade_date, symbol)
+)""",
+    "paper_nav": """CREATE TABLE IF NOT EXISTS {name} (
+  account_id    INTEGER NOT NULL,
   trade_date    TEXT NOT NULL,
   cash          REAL NOT NULL,
   market_value  REAL NOT NULL,
+  receivable    REAL NOT NULL DEFAULT 0,
   total         REAL NOT NULL,
-  nav           REAL NOT NULL,     -- total / initial_cash
+  nav           REAL NOT NULL,
   n_positions   INTEGER NOT NULL,
   filled_orders INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY (trade_date)
-);
-CREATE TABLE IF NOT EXISTS paper_meta (
-  key   TEXT PRIMARY KEY,
-  value TEXT NOT NULL
+  PRIMARY KEY (account_id, trade_date)
+)""",
+    "paper_meta": """CREATE TABLE IF NOT EXISTS {name} (
+  account_id INTEGER NOT NULL,
+  key        TEXT NOT NULL,
+  value      TEXT NOT NULL,
+  PRIMARY KEY (account_id, key)
+)""",
+}
+
+#: 重建顺序：先建谁、复制谁、删谁、改名谁，都按这个序列走。
+PAPER_REBUILD_TABLES = ("paper_account", "paper_position", "paper_nav", "paper_meta")
+
+SCHEMA = SCHEMA + "".join(
+    _PAPER_TABLE_DDL[t].format(name=t) + ";\n" for t in PAPER_REBUILD_TABLES
+) + """
+-- 模拟盘本地委托：与券商 trade_order 彻底分开（原先共用一张表，
+-- 结果本地 reset 会把 QMT/影子成交一起删掉）。
+CREATE TABLE IF NOT EXISTS paper_order (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id    INTEGER NOT NULL,
+  request_id    TEXT NOT NULL,
+  trade_date    TEXT NOT NULL,      -- 收盘决策日；只在**以后**的市场日撮合
+  symbol        TEXT NOT NULL,
+  side          TEXT NOT NULL CHECK (side IN ('buy','sell')),
+  volume        INTEGER NOT NULL CHECK (volume > 0),  -- 原始委托量，永不改写
+  price         REAL NOT NULL CHECK (price > 0),
+  status        TEXT NOT NULL,
+  source        TEXT NOT NULL CHECK (source IN ('manual','strategy')),
+  thesis        TEXT NOT NULL DEFAULT '',
+  review_note   TEXT NOT NULL DEFAULT '',
+  err_msg       TEXT,
+  closed_trade_date TEXT,           -- 撤单/拒绝/成交结束发生在哪个账户业务日
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL,
+  UNIQUE (account_id, request_id)
 );
 
--- 模拟盘曲线归档：模拟盘只有**一个**活动账户（paper_account.id CHECK (id=1)），
--- 跑第二种策略必须先 --reset 清掉第一种；归档就是把清掉之前的证据留下来，
--- 供「策略对照」页叠加比较（原先这份对照只能手写进 README）。
--- 纯新增表，不动任何既有表结构。
+-- 本地成交：一日一单一行（UNIQUE(order_id, trade_date)），跨日**追加**，
+-- 绝不 INSERT OR REPLACE —— 那会把前一天的成交盖掉（费用与已实现盈亏随之丢失）。
+CREATE TABLE IF NOT EXISTS paper_fill (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id  INTEGER NOT NULL,
+  order_id    INTEGER NOT NULL,
+  trade_date  TEXT NOT NULL,
+  symbol      TEXT NOT NULL,
+  side        TEXT NOT NULL,
+  volume      INTEGER NOT NULL CHECK (volume > 0),
+  price       REAL NOT NULL CHECK (price > 0),
+  fee         REAL NOT NULL,
+  realized_pnl REAL,
+  avg_cost    REAL,
+  traded_at   TEXT NOT NULL,
+  UNIQUE (order_id, trade_date)
+);
+
+-- 每次调仓的候选与跳过原因（复盘「为什么没买这只」的依据）
+CREATE TABLE IF NOT EXISTS paper_rebalance (
+  account_id  INTEGER NOT NULL,
+  signal_date TEXT NOT NULL,
+  params      TEXT NOT NULL,
+  selected    TEXT NOT NULL,
+  skipped     TEXT NOT NULL,
+  PRIMARY KEY (account_id, signal_date)
+);
+
+-- 模拟盘曲线归档（策略对照）：跨账户保留一份不可变的曲线证据。
+-- price_basis 标记口径；老归档一律 'hfq'，其指标不重算。
 CREATE TABLE IF NOT EXISTS paper_archive (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id   INTEGER,
   label        TEXT NOT NULL,      -- 展示名（缺省按信号源 + 时间生成）
+  price_basis  TEXT NOT NULL DEFAULT 'hfq',
   params       TEXT NOT NULL,      -- JSON：创建曲线时的 paper_meta.params
   initial_cash REAL NOT NULL,
   from_date    TEXT,
@@ -343,6 +415,79 @@ CREATE TABLE IF NOT EXISTS paper_archive (
   metrics      TEXT NOT NULL,      -- JSON：review().summary + 基准对照
   curve        TEXT NOT NULL,      -- JSON：paper_nav 各行（点数受 nav_curve 上限约束）
   created_at   TEXT NOT NULL
+);
+
+-- ── 原价（不复权）行情与采集覆盖（模拟账户的成交/估值基准）──────────
+-- volume 单位统一是**股**（取 SDK volume_wire_value）；daily_bar.volume 仍是手。
+CREATE TABLE IF NOT EXISTS raw_bar (
+  symbol      TEXT NOT NULL,
+  date        TEXT NOT NULL,
+  open        REAL,
+  high        REAL,
+  low         REAL,
+  close       REAL,
+  volume      REAL,
+  amount      REAL,
+  tradestatus INTEGER,
+  PRIMARY KEY (symbol, date)
+);
+CREATE INDEX IF NOT EXISTS idx_raw_bar_date ON raw_bar(date);
+
+-- 每只股票「已完整取回」的市场日期区间。账户结算只看相关股票是否覆盖，
+-- 不被无关股票的一次失败冻住；全市场完整日另由 collect_log 检查点决定。
+CREATE TABLE IF NOT EXISTS raw_coverage (
+  symbol     TEXT PRIMARY KEY,
+  date_from  TEXT NOT NULL,
+  date_to    TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+-- 缺 bar 的停牌确认（用户按公告核对）：没有确认的缺 bar 一律 raw_bar_missing，
+-- 不能用 tradestatus 的复牌间隔诊断去猜停牌。
+CREATE TABLE IF NOT EXISTS suspension_confirmation (
+  symbol      TEXT NOT NULL,
+  date        TEXT NOT NULL,
+  source_note TEXT NOT NULL,
+  created_at  TEXT NOT NULL,
+  PRIMARY KEY (symbol, date)
+);
+
+-- ── 公司行为（权息）────────────────────────────────────────────────
+-- 供应商事件（capital_changes）：日期/类别/四业务字段，**只够发现事件**，
+-- 推不出登记日、到账日、可卖日与个人分红税。
+CREATE TABLE IF NOT EXISTS corporate_event (
+  symbol     TEXT NOT NULL,
+  event_date TEXT NOT NULL,
+  category   INTEGER NOT NULL,
+  payload    TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (symbol, event_date, category)
+);
+CREATE TABLE IF NOT EXISTS corporate_sync (
+  symbol          TEXT PRIMARY KEY,
+  checked_through TEXT NOT NULL,
+  updated_at      TEXT NOT NULL
+);
+
+-- 用户核对后的账户权益方案（resolution 是固定结构的 JSON，见
+-- broker/corporate_actions.py）。金额是**账户总额**，不是每股数。
+CREATE TABLE IF NOT EXISTS paper_action (
+  account_id INTEGER NOT NULL,
+  symbol     TEXT NOT NULL,
+  event_date TEXT NOT NULL,
+  category   INTEGER NOT NULL,
+  resolution TEXT NOT NULL,
+  PRIMARY KEY (account_id, symbol, event_date, category)
+);
+
+-- ── 复盘笔记（市场级 + 个股级）──────────────────────────────────────
+-- symbol='' 是市场笔记，6 位代码是个股笔记。日期一律存 resolve_date 后的生效日。
+CREATE TABLE IF NOT EXISTS review_note (
+  date       TEXT NOT NULL,
+  symbol     TEXT NOT NULL DEFAULT '',
+  note       TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (date, symbol)
 );
 
 -- 已保存的横截面筛选条件（排行榜的"我的看板"）。**纯新增表**。
@@ -379,6 +524,25 @@ CREATE TABLE IF NOT EXISTS factor_eval (
 );
 """
 
+#: 需要 account_id 列的索引：**只能**在 ensure_paper_accounts 确认表结构
+#: 之后执行。放进 SCHEMA 会在老库上引用不存在的列而整个 execute 失败。
+PAPER_INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_paper_position_date
+  ON paper_position(account_id, trade_date);
+CREATE INDEX IF NOT EXISTS idx_paper_nav_date
+  ON paper_nav(account_id, trade_date);
+CREATE INDEX IF NOT EXISTS idx_paper_order_date
+  ON paper_order(account_id, trade_date);
+CREATE INDEX IF NOT EXISTS idx_paper_fill_date
+  ON paper_fill(account_id, trade_date);
+CREATE INDEX IF NOT EXISTS idx_paper_action_symbol
+  ON paper_action(account_id, symbol, event_date);
+"""
+
+#: SCHEMA 的版本：写进 `PRAGMA user_version`。0 = 迁移前的老库。
+#: 1 = 多账户 paper 结构（本文件当前形态）。大于 1 说明库比程序新，拒绝启动。
+SCHEMA_VERSION = 1
+
 
 def now() -> str:
     return datetime.now().isoformat(timespec="seconds")
@@ -412,17 +576,40 @@ def session(path: Path | str | None = None) -> Iterator[sqlite3.Connection]:
 
 def init_db(path: Path | str | None = None) -> None:
     with session(path) as conn:
+        _guard_schema_version(conn)
         conn.executescript(SCHEMA)
         conn.commit()
         # 旧库不会因为 CREATE TABLE IF NOT EXISTS 而获得新增的周期列（如 rps15）
         added = ensure_period_columns(conn)
         if added:
             print(f"[db] 新增周期列 {', '.join(added)}（需 cli compute-rps --full 填值）")
-        if ensure_fill_columns(conn):
+        # 顺序要紧：先补 trade_fill 的费用列，才能据此判断老成交的费用是否可信；
+        # 补列之前的库，其历史成交**没有**费用记录，legacy 账户要标「未知」而不是 0。
+        fill_added = ensure_fill_columns(conn)
+        if fill_added:
             print("[db] trade_fill 已补 fee/realized_pnl/avg_cost 列"
                   "（历史行无费用记录，显示为 0/未知）")
+        actions = ensure_paper_accounts(
+            conn, legacy_costs_complete=not fill_added)
+        for a in actions:
+            print(f"[db] 模拟盘迁移 {a}")
         if ensure_indexes(conn):
             print("[db] 已重建 rps_daily 覆盖索引（并删除冗余的 idx_rps_date）")
+
+
+def _guard_schema_version(conn: sqlite3.Connection) -> None:
+    """库比程序新就拒绝启动：降级覆写会静默丢字段。
+
+    `PRAGMA user_version` 只在库文件里，内存库一律 0。
+    """
+    try:
+        v = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    except (sqlite3.Error, TypeError):
+        return
+    if v > SCHEMA_VERSION:
+        raise RuntimeError(
+            f"数据库 schema 版本 {v} 比本程序支持的 {SCHEMA_VERSION} 新，"
+            "拒绝启动（降级运行会丢字段）。请更新程序或改用正确的库文件。")
 
 
 #: 带周期列的三张表（列名由 config.PERIODS 决定，见 config.period_columns）
@@ -470,6 +657,201 @@ def ensure_fill_columns(conn: sqlite3.Connection) -> list[str]:
             added.append(f"trade_fill.{col}")
     conn.commit()
     return added
+
+
+# ── 模拟盘多账户迁移 ────────────────────────────────────────────────
+def _paper_schema_is_current(conn: sqlite3.Connection) -> bool:
+    """既有库是否已是多账户结构。
+
+    按**列清单**判断，不能只看 `PRAGMA user_version`：版本号是给「库比程序新」
+    的拒绝逻辑用的，老库的版本号一律是 0，重建过的库才是 1。
+    """
+    want = {
+        "paper_account": {"kind", "price_basis", "status", "initial_cash"},
+        "paper_position": {"account_id", "available_volume", "cost_basis", "price_date"},
+        "paper_nav": {"account_id", "receivable"},
+        "paper_meta": {"account_id"},
+    }
+    for table, cols in want.items():
+        if not table_exists(conn, table):
+            return False
+        have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if not cols <= have:
+            return False
+    return True
+
+
+def _backup_db(conn: sqlite3.Connection, dst_dir: Path | None = None) -> Path | None:
+    """迁移前用 `Connection.backup()` 落一份完整副本（含 WAL 已提交内容）。
+
+    源连接**只读**且独立于当前写连接；目标文件名带时间与随机后缀，绝不覆盖
+    已有备份。返回备份文件；没有库文件（内存库）时返回 None。
+    """
+    src_path = _db_file(conn)
+    if not src_path or not Path(src_path).exists():
+        return None
+    src = Path(src_path)
+    base = Path(dst_dir) if dst_dir else src.parent
+    base.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    target = base / f"{src.stem}.pre-workbench-{stamp}-{uuid.uuid4().hex[:6]}.db"
+    ro = sqlite3.connect(f"file:{src.as_posix()}?mode=ro", uri=True)
+    try:
+        dst = sqlite3.connect(str(target))
+        try:
+            ro.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        ro.close()
+    return target
+
+
+def _ensure_archive_columns(conn: sqlite3.Connection) -> list[str]:
+    """老 `paper_archive` 补 account_id/price_basis（纯 ADD COLUMN，不动数据）。
+
+    老归档一律是 HFQ 研究口径，`price_basis` 默认值就写 'hfq'；
+    其 metrics/curve **不重算**（重算等于改写已公布的历史结论）。
+    """
+    added: list[str] = []
+    if not table_exists(conn, "paper_archive"):
+        return added
+    have = {r[1] for r in conn.execute("PRAGMA table_info(paper_archive)")}
+    if "account_id" not in have:
+        conn.execute("ALTER TABLE paper_archive ADD COLUMN account_id INTEGER")
+        added.append("paper_archive.account_id")
+    if "price_basis" not in have:
+        conn.execute(
+            "ALTER TABLE paper_archive ADD COLUMN price_basis TEXT NOT NULL DEFAULT 'hfq'")
+        added.append("paper_archive.price_basis")
+    conn.commit()
+    return added
+
+
+def _set_user_version(conn: sqlite3.Connection) -> None:
+    # PRAGMA 不能参数化；SCHEMA_VERSION 是模块内 int 常量，没有注入面。
+    conn.execute(f"PRAGMA user_version = {int(SCHEMA_VERSION)}")
+
+
+def _legacy_initial_cash(account_row: dict | None, nav_rows: list[dict]) -> float:
+    """legacy 账户的初始资金：老 meta 的 initial_cash → 首日 total/nav → 现金。"""
+    if account_row is None:
+        return 0.0
+    cash = float(account_row.get("cash") or 0.0)
+    if nav_rows:
+        first = nav_rows[0]
+        nav = float(first.get("nav") or 0.0)
+        if nav > 0:
+            return round(float(first.get("total") or 0.0) / nav, 2)
+    return cash
+
+
+def ensure_paper_accounts(
+    conn: sqlite3.Connection,
+    *,
+    backup_dir: Path | None = None,
+    legacy_costs_complete: bool = True,
+) -> list[str]:
+    """把模拟盘迁到多账户结构（幂等）。返回本次动作描述（空 = 无需迁移）。
+
+    老库是**单账户**且 `paper_*` 没有 account_id 列，而 SQLite 改不了主键，
+    只能重建四张表。顺序固定：检测 → 备份 → 单事务重建 → 建索引 → 记版本。
+    事务内逐条 `execute`（不用 `executescript`，它会隐式提交把事务切碎），
+    也不调用自行 commit 的 `ensure_*`；唯一提交点是这里的 `COMMIT`。
+
+    迁移**只搬数值，不重算任何历史结论**：旧曲线/持仓/成交原样进 legacy_hfq
+    只读账户（id=1）；旧本地成交留在共用 `trade_order/trade_fill` 里由号段过滤
+    读取，不复制进新的 `paper_order/paper_fill`。
+    """
+    if _paper_schema_is_current(conn):
+        conn.executescript(PAPER_INDEXES)
+        _ensure_archive_columns(conn)
+        _set_user_version(conn)
+        conn.commit()
+        return []
+
+    backup = _backup_db(conn, backup_dir)
+    actions = [f"backup:{backup.name}" if backup else "backup:skipped(no-file)"]
+
+    conn.isolation_level = None
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        have_account = table_exists(conn, "paper_account")
+        row = (conn.execute("SELECT * FROM paper_account LIMIT 1").fetchone()
+               if have_account else None)
+        account_row = dict(row) if row is not None else None
+        pos_rows = ([dict(r) for r in conn.execute("SELECT * FROM paper_position")]
+                    if table_exists(conn, "paper_position") else [])
+        nav_rows = ([dict(r) for r in conn.execute(
+            "SELECT * FROM paper_nav ORDER BY trade_date")]
+            if table_exists(conn, "paper_nav") else [])
+        meta_rows = ([dict(r) for r in conn.execute("SELECT * FROM paper_meta")]
+                     if table_exists(conn, "paper_meta") else [])
+
+        for t in PAPER_REBUILD_TABLES:
+            conn.execute(_PAPER_TABLE_DDL[t].format(name=f"{t}_new"))
+
+        has_legacy = account_row is not None or bool(pos_rows) or bool(nav_rows)
+        if has_legacy:
+            init_cash = _legacy_initial_cash(account_row, nav_rows)
+            if not init_cash:
+                for m in meta_rows:
+                    if m.get("key") == "initial_cash":
+                        try:
+                            init_cash = float(json.loads(m["value"]))
+                        except (TypeError, ValueError):
+                            init_cash = 0.0
+            conn.execute(
+                "INSERT INTO paper_account_new(id, name, kind, price_basis, initial_cash,"
+                " cash, start_date, status, created_at, updated_at)"
+                " VALUES (1,?,?,?,?,?,?,?,?,?)",
+                ("旧后复权研究账户", "legacy_hfq", "hfq", init_cash,
+                 float((account_row or {}).get("cash") or 0.0),
+                 nav_rows[0]["trade_date"] if nav_rows else None,
+                 "archived",
+                 (account_row or {}).get("created_at") or now(),
+                 (account_row or {}).get("updated_at") or now()))
+            conn.executemany(
+                "INSERT INTO paper_position_new(account_id, trade_date, symbol, volume,"
+                " available_volume, avg_price, cost_basis, close, price_date, market_value)"
+                " VALUES (1,?,?,?,?,?,?,?,?,?)",
+                [(r["trade_date"], r["symbol"], int(r["volume"]), int(r["volume"]),
+                  float(r["avg_price"]), float(r["avg_price"]) * int(r["volume"]),
+                  float(r["close"]), r["trade_date"], float(r["market_value"]))
+                 for r in pos_rows])
+            conn.executemany(
+                "INSERT INTO paper_nav_new(account_id, trade_date, cash, market_value,"
+                " receivable, total, nav, n_positions, filled_orders)"
+                " VALUES (1,?,?,?,0,?,?,?,?)",
+                [(r["trade_date"], float(r["cash"]), float(r["market_value"]),
+                  float(r["total"]), float(r["nav"]), int(r["n_positions"]),
+                  int(r.get("filled_orders") or 0)) for r in nav_rows])
+            legacy_meta = {m["key"]: m["value"] for m in meta_rows}
+            legacy_meta["costs_complete"] = json.dumps(bool(legacy_costs_complete))
+            conn.executemany(
+                "INSERT INTO paper_meta_new(account_id, key, value) VALUES (1,?,?)",
+                list(legacy_meta.items()))
+            actions.append(f"legacy-account:1(nav={len(nav_rows)},pos={len(pos_rows)})")
+        else:
+            actions.append("legacy-account:none")
+
+        for t in PAPER_REBUILD_TABLES:
+            conn.execute(f"DROP TABLE IF EXISTS {t}")
+            conn.execute(f"ALTER TABLE {t}_new RENAME TO {t}")
+
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.isolation_level = ""
+
+    conn.executescript(PAPER_INDEXES)
+    _ensure_archive_columns(conn)
+    _set_user_version(conn)
+    conn.commit()
+    return actions
 
 
 def drop_period_index(conn: sqlite3.Connection) -> None:
@@ -600,7 +982,9 @@ def finish_run(
     conn.execute(
         "UPDATE collect_log SET status=?, finished_at=?, rows_affected=?, message=?"
         " WHERE run_id=?",
-        (status, now(), rows, message[:2000], run_id),
+        # **不截断**：检查点 JSON（raw-bar-sync 的完整日与失败名单）要靠它读回，
+        # 截到 2000 字符会把 JSON 切碎到无法解析。展示层自己截。
+        (status, now(), rows, message, run_id),
     )
     conn.commit()
 
@@ -612,6 +996,81 @@ def last_log(conn: sqlite3.Connection) -> dict[str, Any] | None:
         "SELECT * FROM collect_log ORDER BY started_at DESC, rowid DESC LIMIT 1"
     ).fetchone()
     return dict(row) if row else None
+
+
+# ── 原价采集检查点 / 市场交易日 ─────────────────────────────────────
+#: 原价采集写入 collect_log 的任务名与固定 JSON 结构。
+#: `latest_complete_date` 是「全市场原价都取齐了」的那一天；账户推进的默认终点
+#: 取 `market_date`，再逐股票查各自的覆盖，不被无关股票的失败冻住。
+RAW_SYNC_TASK = "raw-bar-sync"
+RAW_CHECKPOINT_FIELDS = ("scope", "market_date", "latest_complete_date",
+                         "raw_failed_symbols", "hfq_failed_symbols")
+
+
+def market_date(conn: sqlite3.Connection) -> str | None:
+    """市场交易日 = 上证指数（benchmark_bar 000001）的最新日期。
+
+    刻意不用 `MAX(daily_bar.date)`：个股停牌会让某些票的行情比市场晚，
+    而 `MAX(rps_daily.date)` 又受横截面门槛影响；指数日期是唯一干净的日历。
+    """
+    if not table_exists(conn, "benchmark_bar"):
+        return None
+    row = conn.execute(
+        "SELECT MAX(date) AS d FROM benchmark_bar WHERE symbol='000001'").fetchone()
+    return row["d"] if row and row["d"] else None
+
+
+def write_raw_checkpoint(
+    conn: sqlite3.Connection,
+    *,
+    scope: str,
+    market_date_value: str | None,
+    latest_complete_date: str | None,
+    raw_failed: list[str],
+    hfq_failed: list[str],
+) -> str:
+    """落一条原价采集检查点（collect_log）。返回 run_id。
+
+    message 是固定 JSON —— 读取方（`read_raw_checkpoint`）按结构解析，
+    所以 `finish_run` 里那个 2000 字符截断必须已经去掉。
+    """
+    payload = json.dumps({
+        "scope": scope,
+        "market_date": market_date_value,
+        "latest_complete_date": latest_complete_date,
+        "raw_failed_symbols": sorted(raw_failed),
+        "hfq_failed_symbols": sorted(hfq_failed),
+    }, ensure_ascii=False)
+    run_id = start_run(conn, task=RAW_SYNC_TASK, source=config.DATA_SOURCE)
+    status = "success" if not raw_failed else "partial"
+    finish_run(conn, run_id, status, len(raw_failed), payload)
+    return run_id
+
+
+def read_raw_checkpoint(conn: sqlite3.Connection) -> dict[str, Any] | None:
+    """最近一次已结束的原价采集检查点；从未跑过返回 None。
+
+    最近一条存在但**结构非法就报错**：静默退回 None（或改用
+    `MAX(raw_bar.date)`）会让「推进到哪一天」在数据损坏时悄悄取到错值，
+    比直接失败危险得多。
+    """
+    if not table_exists(conn, "collect_log"):
+        return None
+    row = conn.execute(
+        "SELECT message FROM collect_log WHERE task=? AND status IN"
+        " ('success','partial','failed') ORDER BY finished_at DESC, rowid DESC LIMIT 1",
+        (RAW_SYNC_TASK,)).fetchone()
+    if row is None:
+        return None
+    # 不假设连接设了 row_factory（裸 sqlite3 连接下 fetchone() 返回 tuple）
+    raw = row[0] if not isinstance(row, sqlite3.Row) else row["message"]
+    try:
+        data = json.loads(raw or "")
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"raw-bar-sync 检查点不是合法 JSON：{raw!r}") from exc
+    if not isinstance(data, dict) or not set(RAW_CHECKPOINT_FIELDS) <= set(data):
+        raise RuntimeError(f"raw-bar-sync 检查点结构非法：{data!r}")
+    return data
 
 
 # ── 写入辅助 ────────────────────────────────────────────────────────

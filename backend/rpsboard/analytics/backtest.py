@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import sqlite3
 import time
@@ -754,19 +755,26 @@ def run_backtest(
         )
 
     # ── 指标 ─────────────────────────────────────────────────────
-    eq = pd.Series([c["equity"] for c in result.equity_curve], dtype="float64")
-    result.metrics = compute_metrics(
-        eq,
+    # 主口径统一到**逐日**净值：调仓点净值看不见期内的下跌，回撤会被低估
+    # （实测同一段行情两个数字能差几个百分点）。调仓点口径另存一份，
+    # 保证 README 里已公布过的数字仍然查得到。
+    rebalance_eq = pd.Series([c["equity"] for c in result.equity_curve],
+                             dtype="float64")
+    rebalance = compute_metrics(
+        rebalance_eq,
         n_days_per_point=step,
         dates=[c["date"] for c in result.equity_curve],
     )
     if len(result.daily_curve) > 2:
-        # 逐日口径的回撤：调仓点口径看不见期内的下跌，会**低估**回撤
-        # （实测同一段行情两个数字能差几个百分点）。两个都留着并标注口径，
-        # 不偷偷替换 —— README 里已公布的数字是按调仓点口径记的。
-        eq_d = pd.Series([c["equity"] for c in result.daily_curve], dtype="float64")
-        result.metrics["max_drawdown_daily"] = round(
-            float((eq_d / eq_d.cummax() - 1.0).min()), 4)
+        result.metrics = compute_metrics_from_points(
+            [c["equity"] for c in result.daily_curve],
+            [c["date"] for c in result.daily_curve])
+        result.metrics["max_drawdown_daily"] = result.metrics["max_drawdown"]
+    else:
+        result.metrics = dict(rebalance)
+        result.metrics["max_drawdown_daily"] = result.metrics["max_drawdown"]
+    result.metrics["max_drawdown_rebalance"] = rebalance["max_drawdown"]
+    result.metrics["annualized_rebalance"] = rebalance["annualized"]
 
     # ── 分档前瞻收益（核心验证图）───────────────────────────────
     # 刻意**不扣成本**：这张图衡量的是「信号本身有没有预测力」，
@@ -794,15 +802,18 @@ def compute_metrics(
     否则点数少时会算出天文数字（早期 bug：25 个点被当成 25 天，
     年化直接变成 61875%）。
 
-    `dates` 给出每个净值点的真实日期时**优先按首末日期跨度折算**：
-    被跳过的调仓点（矩阵前几行 RPS 全 NaN 必然发生）会让
-    `点数 × 调仓周期` 系统性低估已用时长、抬高年化（实测约 7%）。
+    波动与夏普**按序列自身的单期收益**算，再乘 `sqrt(252 / n_days_per_point)`
+    折算到年 —— 这样同一套公式同时适用于「逐日净值」（n=1）与「调仓点净值」
+    （n=hold），模拟盘与回测不再各写一份、各得一个数。
+
+    `dates` 给出每个净值点的真实日期时**优先按首末日期跨度折算年数**：
+    被跳过的调仓点会让 `点数 × 调仓周期` 系统性低估已用时长、抬高年化。
     """
     if equity.empty or len(equity) < 2:
-        return {"total_return": 0.0, "annualized": 0.0, "volatility": 0.0,
-                "max_drawdown": 0.0, "sharpe": 0.0, "calmar": 0.0,
-                "days": int(len(equity))}
-
+        return {"total_return": 0.0, "annualized": None, "volatility": None,
+                "max_drawdown": 0.0, "max_drawdown_daily": 0.0,
+                "sharpe": None, "calmar": None, "days": int(len(equity)),
+                "years": 0.0, "metrics_basis": "daily-v1"}
     rets = equity.pct_change().dropna()
     total = float(equity.iloc[-1] / equity.iloc[0] - 1.0)
     n_pts = len(equity)
@@ -813,21 +824,38 @@ def compute_metrics(
         years = max(1e-9, (n_pts - 1) * max(1, n_days_per_point) / 252.0)
 
     ann = (1.0 + total) ** (1.0 / years) - 1.0 if total > -1 else -1.0
-    vol = float(rets.std(ddof=1) * np.sqrt(1.0 / years)) if len(rets) > 1 else 0.0
+    scale = math.sqrt(252.0 / max(1, n_days_per_point))
+    if len(rets) > 1:
+        sd = float(rets.std(ddof=1))
+        vol = sd * scale
+    else:
+        sd, vol = 0.0, 0.0
     dd = equity / equity.cummax() - 1.0
     mdd = float(dd.min())
-    sharpe = float(ann / vol) if vol > 0 else 0.0
-    calmar = float(ann / abs(mdd)) if mdd < 0 else 0.0
+    # 样本不足（<2 个收益）或零方差时不编造一个 0 当成「无风险」
+    sharpe = (float(rets.mean()) / sd * scale) if (len(rets) > 1 and sd > 0) else None
     return {
         "total_return": round(total, 4),
-        "annualized": round(float(ann), 4),
-        "volatility": round(vol, 4),
+        "annualized": round(float(ann), 4) if len(rets) > 1 else None,
+        "volatility": round(vol, 4) if len(rets) > 1 else None,
         "max_drawdown": round(mdd, 4),
-        "sharpe": round(sharpe, 2),
-        "calmar": round(calmar, 2),
-        "days": int(n_pts),
+        "sharpe": round(sharpe, 2) if sharpe is not None else None,
+        "calmar": round(float(ann) / abs(mdd), 2) if mdd < 0 else None,
+        "days": n_pts,
         "years": round(years, 3),
+        # 口径标记：旧存档没有这个键，页面据此显示「旧口径」，不与新数混比。
+        "metrics_basis": "daily-v1",
     }
+
+
+def compute_metrics_from_points(equity: list[float],
+                                dates: list[str]) -> dict:
+    """逐日净值点 → 指标（模拟盘与回测统一入口）。
+
+    曲线本身就是逐日的（每个结算交易日一行），所以 `n_days_per_point=1`。
+    """
+    return compute_metrics(pd.Series(equity, dtype="float64"),
+                           n_days_per_point=1, dates=list(dates))
 
 
 def compute_buckets(rps: pd.DataFrame, fwd: pd.DataFrame) -> list[dict]:

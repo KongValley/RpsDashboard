@@ -42,4 +42,14 @@ export default [
       'vue/multiline-html-element-content-newline': 'off',
     },
   },
+  {
+    // 测试里的组件是**内联桩**（router-link / VChart 的最小替身），
+    // 用内联模板渲染真实 SFC 模板；下面几条组件规范对它们没有意义。
+    files: ['tests/**/*.mjs'],
+    rules: {
+      'vue/component-definition-name-casing': 'off',
+      'vue/one-component-per-file': 'off',
+      'vue/require-prop-types': 'off',
+    },
+  },
 ]

@@ -282,7 +282,15 @@ function rpsWidth(v) {
   return v == null ? '0px' : `${Math.max(2, (v / 100) * 40)}px`
 }
 function goIndustry(name) {
-  router.push({ path: '/', query: { industries: name } })
+  // 带上当前日期：从板块跳到排行榜时不要莫名其妙跳回「最新一天」
+  router.push({ path: '/', query: {
+    industries: name, ...(date.value ? { date: date.value } : {}) } })
+}
+
+// 日期在 **setup 阶段**就从 URL 读进来：放在 onMounted 里会先按默认值发一次请求，
+// 再被覆盖成正确日期，等于白跑一次（而且中间那一帧显示的是别的数据）。
+if (typeof route.query.date === 'string' && route.query.date) {
+  date.value = route.query.date
 }
 
 onMounted(() => {
@@ -301,7 +309,6 @@ onMounted(() => {
       hasConcepts.value = false
       errMsg.value = `概念清单加载失败：${e?.message || e}`
     })
-  if (route.query.date) date.value = String(route.query.date)
 })
 </script>
 

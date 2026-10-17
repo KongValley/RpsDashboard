@@ -18,7 +18,8 @@ RPS 把全市场个股按区间涨幅做**横截面百分位排名**：RPS=90 �
 | **策略回测** | 净值 vs 沪深300、风险指标、**RPS 分档前瞻收益**（自动解读单调方向）、**大盘择时**、**交易成本**、**涨跌停可交易性**；还能换**买法**（只买分数最高的 N 只）和**信号源**（单因子 RPS 或 13 因子合成分）；净值按**逐日**盯市、附**调仓记录**（每期买入名单）、**参数对比**（多次运行并排）、**存库与导出**（保存本次 / 载入 / 导出 CSV·JSON） |
 | **因子研究** | 13 个因子的体检报告：IC/IR、分档收益、自相关、两两相关矩阵（`cli factors` 跑一次存库，页面直接读）。合成分可以直接拿去回测和模拟盘当信号 |
 | **自选预警** | 自选股池（行首 ☆ 即加入）+ 条件预警规则（RPS 阈值 / 三升底 / 涨停）与命中记录；命中可**手动**推送到微信 |
-| **自建模拟盘** | 不连任何券商的撮合引擎：按回测口径出计划、按日 K 逐笔撮合、产出净值曲线与持仓；**可增量推进**（每天再跑一次即可，历史不重算）、有**绩效复盘**（逐笔回合/胜率/盈亏比/持有天数/费用/基准超额）与**策略对照**（曲线归档后叠加比较）；**不需要券商账号**，详见「自建模拟盘」 |
+| **模拟持仓** | 不连任何券商的撮合引擎：**多账户**（手动 / 策略各自一条曲线，互不干扰）、按**不复权原价**撮合与估值、逐日增量推进（历史不重算）、有**绩效复盘**（逐笔回合/胜率/盈亏比/持有天数/费用/分红/基准超额）与**公司行为核对**；**不需要券商账号**，详见「模拟持仓」 |
+| **交易工具** | 仓位/止损预算（按 `risk%` 反推可买数量）、往返成本与**保本价**（0.01 元网格上精确求解）、持仓**压力测试**；仓位与费用是纯计算，空库也能用 |
 | **QMT 接入** | 迅投 miniQMT **只读 / 影子 / 券商模拟盘**：账户与持仓快照、交易计划、影子成交与成本校准；**没有实盘分支**，详见「QMT 交易接入」 |
 | **性能监测** | 后端 ASGI 中间件逐请求计时（`x-perf-ms`）+ 前端上报，两端在同一接口里对照；详见「性能监测点」 |
 | **一键更新** | 页面按钮触发后台线程串起「日K → 涨跌停 → 行业分类（仅空表）→ RPS → 形态 → 预警」，实时显示阶段与失败原因；命令行入口 `update.bat`（`cli update --paper` 可附带增量推进模拟盘） |
@@ -796,10 +797,9 @@ rpsboard.cli backtest --period 60 --threshold 0 --hold 20 --select-top 20 --sign
 
 命令行等价入口：`update.bat` 或 `python -m rpsboard.cli update`。
 
-`cli update --paper` 会在末尾多跑一步「推进模拟盘」（把自建模拟盘增量结算到今天；
-阶段名 `paper`）。**页面上的按钮不带这一步** —— 它要加载全市场矩阵，耗时以分钟计，
-不该塞进每次「更新数据」。模拟盘还没建曲线时这一步会跳过并提示，
-先手动跑一次 `cli trade run --from <日期>`。
+`cli update --paper` 会在末尾多跑一步「推进模拟账户」（把所有 **active 的策略账户**
+增量结算到今天；阶段名 `paper`）。**页面上的按钮不带这一步** —— 它要加载全市场矩阵，
+耗时以分钟计，不该塞进每次「更新数据」。手动账户只能由你自己下单推进（页面或 CLI）。
 
 ## 测试与检查
 
@@ -812,10 +812,9 @@ cd frontend; npm run lint; npm run build             # 前端 lint + 构建
 全部测试离线运行，使用合成数据，不触网。
 
 - **覆盖率**：`pytest` 默认带 `--cov=rpsboard --cov-report=term-missing`；**门槛
-  `--cov-fail-under=50` 只写在 CI 命令里**（全套 **306 项测试、实测 TOTAL 67%**，门槛按实测值
-  向下取整）——放进 `addopts` 会让「只跑一个测试文件」也因总覆盖率不足而失败。`cli.py` 与
-  `sources/*` 目前覆盖较少（本轮补了 tradestatus / price-limits / backfill 退出码的用例），
-  门槛按实测值设，不虚设高线。
+  `--cov-fail-under=80` 只写在 CI 命令里**（实测 TOTAL 80.9%）——放进 `addopts` 会让
+  「只跑一个测试文件」也因总覆盖率不足而失败。`cli.py` 里的一次性采集命令（需要联网）
+  覆盖较少，其余模块基本在 85% 以上；门槛按实测值设，不虚设高线。
 - **lint**：ruff（`select = E,F,W,I,UP,B`，`ignore` 里三条都在 pyproject 注明理由）；
   一次性调研脚本（`probe_*` / `debug_*` / `diag_*` / `verify_*`）用
   `extend-exclude` 排除在外 —— 它们是现场临时脚本，重排风格只会淹没真实改动。
@@ -1094,7 +1093,8 @@ backend/rpsboard/
   db.py                  SQLite schema、旧库迁移（ensure_period_columns / ensure_indexes）与幂等写入
   cli.py                 init / status / backfill(=sync) / update / tradestatus / quality
                          / price-limits / concept / patterns / factors / compute-rps
-                         / backtest / watch / alert / notify / trade（含自建模拟盘 run/paper）
+                         / backtest / watch / alert / notify / corporate
+                         / trade（account new|list · run|paper|risk|archive · QMT 侧）
   sources/
     tdxnet_src.py        【唯一数据源】eltdx 通达信协议，TCP 直连，209 秒全市场
     board_src.py         概念/题材板块清单与成分股
@@ -1194,41 +1194,64 @@ POST `title`/`content` 到你的专属地址，消息进微信）。**只手动�
 - `.env.local` 由 `backend/rpsboard/config.py` 在导入时读取（已存在的环境变量优先），
   其它 `RPSBOARD_*` 变量也可以放这个文件里。
 
-## 自建模拟盘（mode=local）：不连任何券商
+## 模拟持仓：多账户、原价记账、不连任何券商
 
 QMT 客户端自带的那 11 个「模拟」通道**全是期货**，股票的模拟账户得券商开，拿不到就没有
 交易对手。但 RPS 策略真正想验的东西 —— 限价挂不挂得进去、整手取整吃掉多少、停牌要
 顺延几次、5 元最低佣金对小资金有多狠 —— 用**库里已有的日 K** 就能回答清楚，而且这份
 数据跟回测用的是同一份，结论可以直接对着看。
 
-```powershell
-# 首次：建曲线并逐日跑到今天（--from 只决定起点，之后的运行会忽略它）
-.venv\Scripts\python.exe -m rpsboard.cli trade run --from 2026-01-01 --cash 1000000 \
-    --period 60 --threshold 80 --hold 20 --max-positions 20
+**账户是隔离边界**：手动账户（你自己下单）与策略账户（按信号自动调仓）各自一条曲线、
+各自一套流水，互不干扰；迁移前的单账户曲线进只读的 `legacy_hfq` 研究账户，
+数值原样保留、**不重算**。成交与估值都用 `raw_bar` 的**不复权**价 —— 后复权价不是钱
+（实测同一只票 hfq/raw 平均差 8.8 倍），拿它当现金会把股数、市值和 5 元最低佣金的临界点
+全算错。
 
-# 之后每天推进一次：同一条命令，可省掉 --from（历史净值不重算）
-.venv\Scripts\python.exe -m rpsboard.cli trade run --max-participation 0.05
+```powershell
+# 建账户：资金、起点、策略参数**只在这里给**（创建时固化，之后不受环境变量影响）
+.venv\Scripts\python.exe -m rpsboard.cli trade account new \
+    --name 我的手动盘 --kind manual --cash 200000 --from 2026-01-01
+.venv\Scripts\python.exe -m rpsboard.cli trade account new \
+    --name RPS60 --kind strategy --cash 200000 --from 2026-01-01 \
+    --period 60 --threshold 80 --hold 20 --max-positions 20 --signal rps
+.venv\Scripts\python.exe -m rpsboard.cli trade account list
+
+# 推进：只挑账户与终点，历史净值不重算
+.venv\Scripts\python.exe -m rpsboard.cli trade run --account 2
+.venv\Scripts\python.exe -m rpsboard.cli trade run --account 2 --to 2026-06-30
 
 # 也可以挂在数据更新后面（默认关：它会加载全市场矩阵，耗时以分钟计）
+# 只推进 active 的**策略**账户；手动账户得你自己下单
 .venv\Scripts\python.exe -m rpsboard.cli update --paper
 
-.venv\Scripts\python.exe -m rpsboard.cli trade paper   # 打印净值与持仓
+.venv\Scripts\python.exe -m rpsboard.cli trade paper --account 2   # 打印净值与持仓
+.venv\Scripts\python.exe -m rpsboard.cli trade risk  --account 2   # 组合风险体检
+.venv\Scripts\python.exe -m rpsboard.cli trade archive --account 2 --label RPS60
+.venv\Scripts\python.exe -m rpsboard.cli trade archive --list-history
 ```
 
-页面上「交易 → 自建模拟盘」有净值曲线、绩效复盘、逐笔回合、持仓与行业分布，
-并可用**回看**下拉看历史某一天（`/api/trade/paper?date=`）；净值/委托/成交都能
-**导出 CSV**（页面按钮或 `GET /api/trade/paper/export.csv?kind=nav|orders|fills`）。
-**不需要任何券商账号，也不连 QMT**（参考价直接用库里的收盘价）。
+页面上「模拟持仓」有账户切换/新建、净值曲线、绩效复盘、逐笔回合、持仓与行业分布、
+手动限价委托（含交易理由与事后复盘文本）、公司行为核对、停牌登记，
+并可用**回看**下拉看历史某一天（`/api/portfolio/accounts/{id}?date=`）；净值/持仓/委托/
+成交都能**导出 CSV**。**不需要任何券商账号，也不连 QMT**。
+
+> **数据闸门**：推进前会检查相关股票的**原价行情、当日实测涨跌停行、公司行为是否已核对**；
+> 缺哪样就停在那天之前并给出精确原因（`raw_bar_missing` / `price_limit_missing` /
+> `corporate_action_unresolved` / `corporate_tax_unresolved` / `calendar_missing`）。
+> 缺日线又确实停牌时，用页面上的「停牌核对」登记（需要公告依据）—— **绝不**从复牌间隔
+> 猜停牌，也绝不拿成本价当市价。
 
 > 曲线点数上限 `NAV_CURVE_LIMIT = 2000`（约 8 年交易日）。真的超了时响应里
 > `curve_truncated=true`，页面会明确提示"区间收益/回撤只基于前 2000 天" ——
 > 静默截断会让人把部分区间当全区间读。
 
-> **续跑语义（重要）**：`trade run` 是**幂等推进**，不是"重算区间"。
-> 已结算的交易日一律跳过。早先的实现每次都从 `--from` 重走，而账户是从**当前**
-> 状态载入的 —— 于是重跑一次就把整条历史净值改成"用今天的持仓去估那天的价"
-> （实测 41/41 个已结算日、475 行持仓被改写）。要换参数或换初始资金，必须显式
-> `--reset --yes-reset` 重建；参数/资金与已有曲线不一致时命令会直接报错，不会静默混算。
+> **幂等推进（重要）**：`trade run` 只结算「上次之后」的交易日，已结算的一律跳过；
+> 早先的实现每次都从起点重走，而账户是从**当前**状态载入的 —— 重跑一次就把整条历史净值
+> 改成"用今天的持仓去估那天的价"（实测 41/41 个已结算日、475 行持仓被改写）。
+> 换参数/参与率请**新建账户**（`trade account new`），新曲线不会覆盖旧曲线；
+> `--reset/--yes-reset` 这类整体清空入口已经下线。
+>
+> **创建当天就有一条全现金净值**：新账户不会显示权益 0（那看起来像建失败了）。
 
 ### 复盘口径（绩效数字从哪来）
 
@@ -1252,10 +1275,10 @@ QMT 客户端自带的那 11 个「模拟」通道**全是期货**，股票的�
 ### 组合风险体检（阈值 + 可选推送）
 
 ```powershell
-.venv\Scripts\python.exe -m rpsboard.cli trade risk              # 只打印
-.venv\Scripts\python.exe -m rpsboard.cli trade risk --dry-run    # 打印推送内容，不发送
-.venv\Scripts\python.exe -m rpsboard.cli trade risk --push       # 有告警时推到微信
-.venv\Scripts\python.exe -m rpsboard.cli trade risk --max-single 0.15 --max-drawdown 0.15
+.venv\Scripts\python.exe -m rpsboard.cli trade risk --account 2            # 只打印
+.venv\Scripts\python.exe -m rpsboard.cli trade risk --account 2 --dry-run  # 打印推送内容，不发送
+.venv\Scripts\python.exe -m rpsboard.cli trade risk --account 2 --push     # 有告警时推到微信
+.venv\Scripts\python.exe -m rpsboard.cli trade risk --account 2 --max-single 0.15
 ```
 
 | 项 | 默认阈值 | 环境变量 |
@@ -1271,7 +1294,7 @@ QMT 客户端自带的那 11 个「模拟」通道**全是期货**，股票的�
 - 退出码：无告警 `0`、有告警 `3`、推送/配置失败 `2`（与 `alert` 一套约定）。
 - **默认不推送**：要发微信必须显式 `--push`（与项目的「只手动推送」边界一致）；
   地址没配时给明确错误，不静默跳过。
-- 页面上「交易 → 自建模拟盘」会把告警渲染成顶部提示条（**只显示，不推送**），
+- 页面上「模拟持仓 → 组合风险」会把告警渲染成顶部提示条（**只显示，不推送**），
   数据来自只读接口 `GET /api/trade/risk`。
 
 ### 策略对照：换策略前先归档
@@ -1321,10 +1344,11 @@ QMT 客户端自带的那 11 个「模拟」通道**全是期货**，股票的�
 | 期末 | 755,396 元（**−24.46%**），最大回撤 **43.20%**，期末持仓 22 只 |
 | 累计费用 | 4,075.53 元（约本金的 0.41%） |
 
-> ⚠️ **这一组数字是修复前跑出来的，偏乐观。** 当时 `_apply` 有缺陷：**部分卖出
-> 没有把持仓改小**，账户会照着虚高的数量再卖一次，凭空多出这笔现金。在这份库里
-> 实测有 3 笔这样的成交、共 300 股虚增（约 2.97 万元）。要得到真实数字必须
-> `trade run --reset --yes-reset` 重建整条曲线 —— 重放旧成交无法还原（当时的
+> ⚠️ **这一组数字是修复前跑出来的，偏乐观，且口径已经换过。** 旧实现有两个缺陷：
+> **部分卖出没有把持仓改小**（账户会照着虚高的数量再卖一次，凭空多出现金；实测 3 笔
+> 共 300 股、约 2.97 万元），以及用**后复权价**当钱记账。旧曲线现在只在「历史曲线归档」
+> 里只读保留、不重算；要看真实口径请在**新建的原价账户**里用同参数重跑 ——
+> 重放旧成交无法还原（当时的
 > 目标股数本身就是按错的持仓算出来的）。
 
 这一版用的是 RPS 信号（同一区间换成合成分是 −3.21%，见上一节的对照）。
@@ -1341,11 +1365,14 @@ QMT 客户端自带的那 11 个「模拟」通道**全是期货**，股票的�
 | **P2 影子** | `trade plan` 按**回测同一套口径**生成买卖计划；`trade shadow` 假装成交，用来校准成本假设 | 否 |
 | **P3 券商模拟盘** | `trade execute --plan-id N` 往券商**模拟**账户真发**限价单** | 是 |
 
-**没有实盘这档**：代码里根本没有 `live` 这个模式，`TRADE_MODE` 只认 `paper` / `local` /
-`sim`（`local` 就是上一节那个自建模拟盘，压根不连券商），而且 `execute` 必须显式带上
-`--i-know-this-is-sim` 才肯发单。⚠️ 但要注意：**本项目识别不出客户端登录的是模拟还是实盘
+**没有实盘这档**：代码里根本没有 `live` 这个模式，`TRADE_MODE` 只认 `paper` / `sim`，
+而且 `execute` 必须显式带上 `--i-know-this-is-sim` 才肯发单。⚠️ 但要注意：**本项目识别不出客户端登录的是模拟还是实盘
 资金账户** —— 如果 QMT 客户端登的是实盘，配错了就会真的发出实盘单。所有动作都是手动
 执行，**没有守护进程、没有定时器**。
+
+> 自建模拟盘已经**迁出**本页：它现在支持多个账户、用不复权原价记账，见
+> 「模拟持仓」。券商侧只保留只读/影子/券商模拟盘三种模式，`RPSBOARD_TRADE_MODE`
+> 也只接受 `paper` / `sim`；设成 `local` 会被明确拒绝并提示迁移路径。
 
 ### 为什么要多起一个 Python 3.11 的子进程
 
@@ -1373,7 +1400,7 @@ xtquant 自己的日志和断线事件都改走 stderr（断线写成 `{"event":
 | `RPSBOARD_QMT_USERDATA_MINI` | `<QMT_DIR>\userdata_mini` | 交给 `XtQuantTrader` 的登录态目录 |
 | `RPSBOARD_QMT_PYTHON` | 无（**用 QMT 时必须填**） | 跑桥的 3.11 解释器，位数和版本要跟客户端的 `.pyd` 对得上。默认故意留空：写死某个人的目录等于把本机路径发到公开仓库。建法：`uv venv --python 3.11 backend/.venv-qmt`，再指到 `.venv-qmt\Scripts\python.exe` |
 | `RPSBOARD_QMT_ACCOUNT` | 无（必填） | 资金账号。按凭据对待：日志、接口、页面一律只留后 4 位 |
-| `RPSBOARD_TRADE_MODE` | `paper` | 只允许 `paper` / `local` / `sim`（`local` = 自建模拟盘，见上一节） |
+| `RPSBOARD_TRADE_MODE` | `paper` | 只允许 `paper`（影子）/ `sim`（券商模拟盘）；自建模拟盘已迁到「模拟持仓」，不再是一条交易模式 |
 | `RPSBOARD_TRADE_HALT_FILE` | `data/trade.halt` | 总开关的哨兵文件：它一存在就禁止一切发单 |
 
 QMT 客户端必须**一直开着并保持登录**（`userdata_mini` 那个目录就是行情和交易的本地通道）。
@@ -1459,10 +1486,17 @@ $env:RPSBOARD_TRADE_MODE = "sim"
 | `GET /api/trade/positions` · `/orders?date=` · `/fills?date=` · `/plans?limit=` | 持仓快照 / 当日委托 / 成交 / 计划列表（只读） |
 | `POST /api/trade/halt` | 发单总开关（只增删 `data/trade.halt` 哨兵文件，不连客户端） |
 | `POST /api/trade/snapshot` · `GET /api/trade/snapshot/status` | 页面「重取持仓快照」：后台线程连 QMT + 轮询 |
-| `GET/POST /api/trade/paper/archive[s]` · `DELETE /api/trade/paper/archives/{id}` | 曲线归档：列出 / 存一份（写库）/ 删除；供「策略对照」叠加比较 |
-| `GET /api/trade/paper/export.csv?kind=nav\|orders\|fills` | 模拟盘净值/委托/成交导出 CSV（BOM + 公式注入防护） |
+| `GET /api/portfolio/accounts` · `POST /api/portfolio/accounts` | 模拟账户：列出 / 新建（手动或策略，参数与参与率**创建时固化**） |
+| `GET /api/portfolio/accounts/{id}?date=` | 账户详情：权益/可用现金/冻结、净值曲线、绩效复盘、持仓（`date` 就近回退并在 `date` 回显） |
+| `GET /api/portfolio/accounts/{id}/orders\|fills?date=&limit=&offset=` | 委托/成交：**截至** `date`（历史状态按截止日重建，未来成交不泄漏） |
+| `POST /api/portfolio/accounts/{id}/orders` · `/{order_id}/cancel` · `/{order_id}/review` | 手动限价委托（幂等 `request_id`）/ 撤余量 / 事后复盘文本 |
+| `POST /api/portfolio/accounts/{id}/advance` | 逐日推进（数据缺口则以 `ok=false` + `blocked_reason` 停在缺口前） |
+| `GET/POST /api/portfolio/accounts/{id}/actions` · `POST /api/portfolio/suspensions` | 公司行为核对 / 停牌登记（都要公告依据） |
+| `GET /api/portfolio/accounts/{id}/risk` · `/export.csv?kind=nav\|positions\|orders\|fills` | 该账户的风险体检 / 导出 CSV（BOM + 公式注入防护） |
+| `POST /api/tools/position-size` · `/round-trip` · `/stress` | 交易工具：仓位预算 / 往返成本与保本价 / 持仓压力测试（前两项纯计算，空库可用） |
+| `GET /api/review/note?date=&symbol=` · `POST /api/review/note` | 复盘笔记（市场级 `symbol=''` / 个股级）；日期必须是有效交易日，否则 422 并给出生效日 |
 | `GET /api/trade/risk` | 组合风险体检（集中度/相关性/当前回撤，只读**不推送**；推送走 `cli trade risk --push`） |
-| `GET /api/trade/paper?date=` | 自建模拟盘：净值曲线 + **绩效复盘**（逐笔回合/胜率/盈亏比/持有天数/费用/基准超额）+ 当前或指定日持仓（**只读库，不连券商**）；`date` 就近回退并在 `date` 字段回显生效日 |
+| `GET /api/portfolio/archives?limit=` | 历史曲线归档（迁移前的 HFQ 研究口径，只读） |
 
 ## 许可证
 

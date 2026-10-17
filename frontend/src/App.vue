@@ -10,9 +10,11 @@
         <router-link to="/sectors" :class="{ active: $route.path === '/sectors' }">板块强弱</router-link>
         <router-link to="/review" :class="{ active: $route.path === '/review' }">每日复盘</router-link>
         <router-link to="/backtest" :class="{ active: $route.path === '/backtest' }">策略回测</router-link>
+        <router-link to="/portfolio" :class="{ active: $route.path === '/portfolio' }">模拟持仓</router-link>
+        <router-link to="/tools" :class="{ active: $route.path === '/tools' }">交易工具</router-link>
         <router-link to="/watchlist" :class="{ active: $route.path === '/watchlist' }">自选预警</router-link>
         <router-link to="/factors" :class="{ active: $route.path === '/factors' }">因子研究</router-link>
-        <router-link to="/trade" :class="{ active: $route.path === '/trade' }">交易</router-link>
+        <router-link to="/trade" :class="{ active: $route.path === '/trade' }">券商接入</router-link>
       </nav>
       <div class="status">
         <span class="dot" :class="statusDot"></span>
@@ -33,7 +35,7 @@
     </div>
 
     <main class="content">
-      <router-view v-if="dbReady" :key="$route.fullPath" />
+      <router-view v-if="showContent" :key="$route.fullPath" />
       <div v-else class="empty-guide panel">
         <h2>数据尚未初始化</h2>
         <p>数据库为空。请在项目根目录依次执行：</p>
@@ -41,7 +43,10 @@
 .venv\Scripts\python.exe -m rpsboard.cli init
 .venv\Scripts\python.exe -m rpsboard.cli backfill
 .venv\Scripts\python.exe -m rpsboard.cli compute-rps</pre>
-        <p class="muted">首次 backfill 约需 12~20 分钟（拉取约 5200 只 A 股一年半历史）。</p>
+        <p class="muted">首次 backfill 需拉取约 5200 只 A 股的<b>后复权 + 不复权</b>两套日K
+          （模拟账户用原价记账），约 15~25 分钟。</p>
+        <p class="muted">只想用交易工具？<router-link to="/tools">交易工具</router-link> 的
+          仓位与费用计算不依赖数据库。</p>
       </div>
     </main>
   </div>
@@ -49,7 +54,19 @@
 
 <script setup>
 import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { useRoute } from 'vue-router'
 import { metaApi, adminApi } from './api'
+
+const route = useRoute()
+
+/**
+ * 不依赖行情库初始化的页面：模拟持仓有自己的账户数据，交易工具里的
+ * 仓位/费用计算**纯计算**（不读证券表也不读行情）。行情分析页仍然要求
+ * 数据库就绪 —— 那里没有数据确实无从显示。
+ */
+const ROUTES_WITHOUT_MARKET_DB = ['/portfolio', '/tools']
+const showContent = computed(() => dbReady.value
+  || ROUTES_WITHOUT_MARKET_DB.some((p) => route.path.startsWith(p)))
 
 /** 给任何请求加硬超时兜底：请求挂起时不能让整页永远停在「加载中」 */
 function withTimeout(promise, ms) {
@@ -109,8 +126,9 @@ const PHASES = {
   rps: '重算 RPS',
   patterns: '识别三升底',
   alerts: '评估预警规则',
+  corporate: '更新公司行为',
   quality: '复权异常扫描（约 20 秒）',
-  paper: '推进模拟盘',
+  paper: '推进模拟策略账户',
   done: '完成',
   failed: '失败',
 }
@@ -194,6 +212,17 @@ const statusText = computed(() => {
     parts.push(`涨跌停实测 ${lim.days}/${lim.total_days || lim.days} 天`)
   }
   if (q.concept?.total) parts.push(`概念 ${q.concept.with_rps}/${q.concept.total}`)
+  // 原价（不复权）采集进度：模拟账户的成交与估值全靠它，缺了要看得见
+  const raw = s.raw_state || {}
+  if (raw.latest_complete_date) {
+    parts.push(`原价至 ${raw.latest_complete_date}`)
+  } else if (raw.last_raw_date) {
+    parts.push(`原价未采全（最新 ${raw.last_raw_date}）`)
+  } else {
+    parts.push('原价未采集')
+  }
+  if (raw.checkpoint_error) parts.push('原价记录损坏')
+  if (raw.failed_count) parts.push(`原价失败 ${raw.failed_count} 只`)
   const ev = q.adjust_events || {}
   const anomalies = (ev['internal/hfq_jump'] || 0)
     + (ev['internal/tiny_price'] || 0)

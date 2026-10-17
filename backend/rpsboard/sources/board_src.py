@@ -64,8 +64,13 @@ def fetch_boards(src: TdxSource | None = None, category: str = "概念") -> pd.D
         if not full and code:
             full = ("sh" if code.startswith(("88", "000")) else "sz") + code
         name = getattr(r, "board_name", "") or ""
+        board_code = code or (full[2:] if len(full) > 2 else "")
+        if not board_code:
+            # 畸形行（只有交易所前缀、没有板块代码）：丢了也不能让它变成一条
+            # 空键的行 —— 空 board_code 后续会被 DELETE 匹配成一片空白。
+            continue
         recs.append({
-            "board_code": code or full[2:],
+            "board_code": board_code,
             "full_code": full,
             "board_name": name,
             "is_concept": 1 if _is_concept(name) else 0,

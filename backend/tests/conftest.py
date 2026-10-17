@@ -152,3 +152,103 @@ def trade_db(tmp_path, monkeypatch):
     monkeypatch.setattr(qmt, "tick", lambda codes: {c: last_close[c] for c in codes})
     monkeypatch.setattr(qmt, "asset", lambda: {"cash": TRADE_CASH})
     return path, plan_date, last_close
+
+
+# ── 新前端/接口测试用的客户端夹具 ───────────────────────────────────
+@pytest.fixture()
+def client(tmp_path, monkeypatch):
+    """带 lifespans 的 TestClient（临时库，进入上下文才会执行启动迁移）。
+
+    直接用 `TestClient(create_app())` 而不进上下文的话，lifespan 根本不会跑 ——
+    启动迁移的回归就形同虚设。所有发请求的夹具都必须用 `with`。
+    """
+    import sqlite3
+
+    import pandas as pd
+    from fastapi.testclient import TestClient
+    from rpsboard.analytics import rps as rps_engine
+    from rpsboard.analytics.matrix import (
+        build_close_matrix,
+        build_st_flags,
+        build_tradable_matrix,
+    )
+    from rpsboard.api import create_app
+
+    path = tmp_path / "api_client.db"
+    path.unlink(missing_ok=True)
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    conn.executescript(dbmod.SCHEMA)
+    cs = config.MIN_CROSS_SECTION
+    config.MIN_CROSS_SECTION = 2
+    try:
+        df = make_long(n_symbols=40, n_days=320, seed=77)
+        bars = df.assign(open=df["close"] * 0.995, high=df["close"] * 1.02,
+                         low=df["close"] * 0.98, volume=1_000_000.0, amount=1e8)
+        bars[["symbol", "date", "open", "high", "low", "close", "volume", "amount",
+              "pct_chg", "is_st", "tradestatus"]].to_sql(
+            "daily_bar", conn, if_exists="append", index=False)
+        syms = sorted(df["symbol"].unique())
+        pd.DataFrame({
+            "symbol": syms, "name": [f"测试{i}" for i in range(len(syms))],
+            "exchange": "sz", "ipo_date": "20150101", "is_st": 0,
+            "updated_at": "2026-01-01"}).to_sql(
+            "security_master", conn, if_exists="append", index=False)
+        ind = make_industry_map_zh(syms, 5)
+        ind.rename("industry").reset_index().rename(
+            columns={"index": "symbol"}).assign(
+            industry_cls="证监会", updated_at="2026-01-01").to_sql(
+            "industry_map", conn, if_exists="append", index=False)
+        rps_engine.materialize(conn, build_close_matrix(bars),
+                               build_tradable_matrix(bars), build_st_flags(bars),
+                               ind, None)
+        conn.commit()
+    finally:
+        config.MIN_CROSS_SECTION = cs
+        conn.close()
+
+    monkeypatch.setattr(config, "DB_PATH", path)
+    import rpsboard.api as apimod
+    monkeypatch.setattr(apimod, "_cache", {"conn": None, "opened": None})
+    with TestClient(create_app()) as c:
+        yield c
+
+
+@pytest.fixture()
+def portfolio_client(tmp_path, monkeypatch):
+    """冒烟种子库 + 一个「A/B 两持仓 + 现金 2 万」的快照。
+
+    压力测试的手算输入（现金 20000 / A 50000 / B 30000）必须来自**固定**快照，
+    不能依赖随机行情跑出来的市值。
+    """
+    from fastapi.testclient import TestClient
+    from rpsboard.api import create_app
+    from rpsboard.broker import accounts as accounts_mod
+
+    from .test_portfolio import seed_portfolio_smoke
+
+    path = tmp_path / "portfolio_client.db"
+    info = seed_portfolio_smoke(str(path))
+    monkeypatch.setattr(config, "DB_PATH", path)
+    aid = info["manual_account_id"]
+    a, b = "000001", "000002"
+    last = info["latest_complete_date"]
+    with dbmod.session(path) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO paper_nav(account_id, trade_date, cash,"
+            " market_value, receivable, total, nav, n_positions, filled_orders)"
+            " VALUES (?,?,20000,80000,0,100000,0.5,2,0)", (aid, last))
+        conn.execute("DELETE FROM paper_position WHERE account_id=?", (aid,))
+        for sym, mv, px in ((a, 50_000.0, 10.0), (b, 30_000.0, 10.0)):
+            conn.execute(
+                "INSERT INTO paper_position(account_id, trade_date, symbol, volume,"
+                " available_volume, avg_price, cost_basis, close, price_date,"
+                " market_value) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (aid, last, sym, int(mv / px), int(mv / px), px, mv, px, last, mv))
+        conn.execute("UPDATE paper_account SET status='active' WHERE id=?", (aid,))
+        conn.commit()
+        accounts_mod.get_account(conn, aid)
+    import rpsboard.api as apimod
+    monkeypatch.setattr(apimod, "_cache", {"conn": None, "opened": None})
+    with TestClient(create_app()) as c:
+        yield c, {**info, "smoke_account_id": aid, "a": a, "b": b}

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date
+from decimal import ROUND_HALF_UP, Decimal
 
 import pandas as pd
 
@@ -54,24 +55,15 @@ class CostModel:
 
     # ── 单边 ──────────────────────────────────────────────────────
     def buy_cost(self, notional: float = 1.0) -> float:
-        """买入一单位名义金额的成本。notional 是成交金额（元或万元均可）。"""
-        if not self.enabled:
-            return 0.0
-        commission = max(notional * self.commission_rate, self.commission_min)
-        return commission + notional * self.transfer_fee_rate + notional * self.slippage_rate
+        """买入一单位名义金额的成本（**研究口径**，浮点、不量化）。
+
+        记账口径请用 `costs.fee_decimal`：它同一个公式，但一次量化到分。
+        """
+        return _raw_components(self, notional, "buy", None)
 
     def sell_cost(self, notional: float = 1.0, on: date | None = None) -> float:
-        """卖出一单位名义金额的成本。印花税按 on 当日是否已下调分段。"""
-        if not self.enabled:
-            return 0.0
-        commission = max(notional * self.commission_rate, self.commission_min)
-        stamp_rate = self.stamp_after if (on and on >= self.stamp_cutoff) else self.stamp_before
-        return (
-            commission
-            + notional * self.transfer_fee_rate
-            + notional * self.slippage_rate
-            + notional * stamp_rate
-        )
+        """卖出一单位名义金额的成本（研究口径）。印花税按 on 当日是否已下调分段。"""
+        return _raw_components(self, notional, "sell", on)
 
     # ── 往返 ──────────────────────────────────────────────────────
     def buy_rate(self, n_positions: int, portfolio: float) -> float:
@@ -147,6 +139,40 @@ def _as_date(x) -> date | None:
         return pd.Timestamp(x).date()
     except Exception:  # noqa: BLE001
         return None
+
+
+def _raw_components(model: CostModel, notional: float, side: str,
+                    on: date | None) -> float:
+    """未量化的单边成本（元）。`buy_cost`/`sell_cost` 与 `fee_decimal` 共用它，
+    所以研究口径与记账口径**永远同源**，不会一个改了另一个没改。"""
+    if not model.enabled or notional <= 0:
+        return 0.0
+    commission = max(notional * model.commission_rate, model.commission_min)
+    total = commission + notional * model.transfer_fee_rate + notional * model.slippage_rate
+    if side == "sell":
+        d = _as_date(on)
+        stamp_rate = (model.stamp_after if (d and d >= model.stamp_cutoff)
+                      else model.stamp_before)
+        total += notional * stamp_rate
+    return total
+
+
+def fee_decimal(model: CostModel, notional: Decimal, *, side: str,
+                on: date | None = None) -> Decimal:
+    """**记账用**的单边费用：一次算完后 `ROUND_HALF_UP` 到分。
+
+    为什么不能沿用 `buy_cost`/`sell_cost` 的 float：它们是研究口径，逐项
+    累加的浮点误差在跨日部分成交里会被反复放大约分位，而现金、成本余额、
+    已实现盈亏都是要长期对账的数。这里把费率从**十进制字符串**转成 Decimal，
+    佣金/过户费/滑点/印花税累加后**只量化一次** —— 先分别取整再相加会和
+    单笔实际收费不一致。
+
+    最低佣金（5 元）与按日分段的印花税都由同一个 `_raw_components` 决定。
+    """
+    if not model.enabled or notional <= 0:
+        return Decimal("0.00")
+    raw = _raw_components(model, float(notional), side, on)
+    return Decimal(repr(raw)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
 def default_cost_model(enabled: bool = True) -> CostModel:

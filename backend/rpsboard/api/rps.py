@@ -531,7 +531,7 @@ def _csv_bytes(df: pd.DataFrame, headers: list[str] | None) -> bytes:
     if headers is None:
         return b"\xef\xbb\xbf"
 
-    # 转义规则集中在本模块顶部的 csv_cell（与 /api/trade/paper/export.csv 共用），
+    # 转义规则集中在本模块顶部的 csv_cell（与 /api/portfolio/.../export.csv 共用），
     # 这里只负责排行榜特有的列（代码包公式、收益率转百分数）
     cell = csv_cell
 

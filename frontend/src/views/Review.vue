@@ -8,24 +8,26 @@
         <span class="muted">{{ data?.date ? `数据日期 ${data.date}` : '加载中…' }}</span>
         <div class="spacer" />
         <label class="muted">日期
-          <select v-model="date" style="margin-left:6px;min-width:130px" @change="load">
+          <select v-model="date" style="margin-left:6px;min-width:130px" @change="applyQuery">
             <option value="">最新</option>
             <option v-for="d in availableDates" :key="d" :value="d">{{ d }}</option>
           </select>
         </label>
         <label class="muted">周期
-          <select v-model.number="period" style="margin-left:6px" @change="load">
+          <select v-model.number="period" style="margin-left:6px" @change="applyQuery">
             <option v-for="p in periods" :key="p" :value="p">RPS{{ p }}</option>
           </select>
         </label>
         <label class="muted">信号阈值
           <input v-model.number="threshold" type="number" min="0" max="100"
-                 style="width:74px;margin-left:6px" @change="load" />
+                 style="width:74px;margin-left:6px" @change="applyQuery" />
         </label>
         <button class="btn" @click="load">刷新</button>
       </div>
 
       <p v-if="data && !data.date" class="muted">{{ data.message }}</p>
+
+      <ReviewNote :date="data?.date || ''" />
 
       <template v-if="data?.breadth">
         <div class="stats">
@@ -79,7 +81,9 @@
         </thead>
         <tbody>
           <tr v-for="x in data.limit_up" :key="x.symbol">
-            <td class="mono">{{ x.symbol }}</td>
+            <td class="mono">
+              <router-link :to="stockLink(x.symbol)" class="mono">{{ x.symbol }}</router-link>
+            </td>
             <td>{{ x.name || '—' }}</td>
             <td class="muted">{{ x.industry || '未分类' }}</td>
             <td class="num up">{{ pct(x.pct / 100) }}</td>
@@ -104,7 +108,9 @@
         </thead>
         <tbody>
           <tr v-for="x in data.limit_down" :key="x.symbol">
-            <td class="mono">{{ x.symbol }}</td>
+            <td class="mono">
+              <router-link :to="stockLink(x.symbol)" class="mono">{{ x.symbol }}</router-link>
+            </td>
             <td>{{ x.name || '—' }}</td>
             <td class="muted">{{ x.industry || '未分类' }}</td>
             <td class="num down">{{ pct(x.pct / 100) }}</td>
@@ -150,7 +156,7 @@
         <tbody>
           <tr v-for="s in data.signals" :key="s.symbol">
             <td class="mono">
-              <router-link :to="`/stock/${s.symbol}`" class="mono">{{ s.symbol }}</router-link>
+              <router-link :to="stockLink(s.symbol)" class="mono">{{ s.symbol }}</router-link>
             </td>
             <td>{{ s.name || '—' }}</td>
             <td class="muted">{{ s.industry || '未分类' }}</td>
@@ -170,18 +176,48 @@
 
 <script setup>
 import { computed, onMounted, ref } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { metaApi, reviewApi } from '../api'
 import { DEFAULT_PERIOD, usePeriods } from '../composables/usePeriods'
 import { useLatestRequest } from '../composables/useLatestRequest'
+import ReviewNote from '../components/ReviewNote.vue'
+import { stockLink as makeStockLink } from '../composables/useStockLinks'
 
+const route = useRoute()
+const router = useRouter()
 const { periods } = usePeriods()
 const data = ref(null)
 const errMsg = ref('')
-const date = ref('')
-const period = ref(DEFAULT_PERIOD)
-const threshold = ref(80)
+// URL 是日期的**唯一真源**：在 setup 阶段读一次（不是 mount 后再写回控件）——
+// mount 后写回会连带触发重挂载再请求一次。
+const q0 = route.query
+const qNum = (k, fallback) => (q0[k] != null && q0[k] !== '' ? Number(q0[k]) : fallback)
+const date = ref(typeof q0.date === 'string' ? q0.date : '')
+const period = ref(qNum('period', DEFAULT_PERIOD))
+const threshold = ref(qNum('threshold', 80))
 const availableDates = ref([])
 const latest = useLatestRequest()
+
+/**
+ * 把当前筛选写进 URL：**只改 query、不发请求**。
+ * App.vue 用 `$route.fullPath` 做 key，query 一变就重新挂载 → 由新实例加载一次。
+ * 选好某天再点个股、再返回时，日期就靠这个 query 传过去。
+ */
+function applyQuery() {
+  router.replace({
+    path: '/review',
+    query: {
+      ...(date.value ? { date: date.value } : {}),
+      ...(period.value !== DEFAULT_PERIOD ? { period: period.value } : {}),
+      ...(threshold.value !== 80 ? { threshold: threshold.value } : {}),
+    },
+  })
+}
+
+/** 个股链接：带**生效日**与来源，返回时才能回到这天的复盘页。 */
+function stockLink(symbol) {
+  return makeStockLink(symbol, data.value?.date || '', 'review')
+}
 
 const sectorRows = computed(() => {
   const rows = data.value?.sectors || []
@@ -208,7 +244,11 @@ async function load() {
     })
     if (!latest.isCurrent(t)) return
     data.value = d
-    if (d?.date) date.value = date.value || d.date
+    // 回显生效日（最近交易日）到 URL：用户选周末时看到的仍是明确的一天
+    if (d?.date && d.date !== date.value) {
+      date.value = d.date
+      applyQuery()
+    }
   } catch (e) {
     if (!latest.isCurrent(t)) return
     console.error(e)

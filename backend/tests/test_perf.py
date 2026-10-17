@@ -31,7 +31,8 @@ def perf_env(tmp_path, monkeypatch):
     from rpsboard.api import create_app
 
     perf.reset()
-    return TestClient(create_app()), tmp_path
+    with TestClient(create_app()) as client:
+        yield client, tmp_path
 
 
 def _paths(body: dict) -> dict[str, dict]:

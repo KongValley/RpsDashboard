@@ -135,6 +135,7 @@ import { useRouter, useRoute } from 'vue-router'
 import { rpsApi, metaApi, watchApi, screenApi } from '../api'
 import { DEFAULT_PERIOD, usePeriods } from '../composables/usePeriods'
 import { useLatestRequest } from '../composables/useLatestRequest'
+import { stockLink as makeStockLink } from '../composables/useStockLinks'
 import RpsTable from '../components/RpsTable.vue'
 
 const router = useRouter()
@@ -263,7 +264,10 @@ function setPeriod(p) {
 }
 
 function goDetail(symbol) {
-  router.push(`/stock/${symbol}`)
+  // 带**生效日**与来源：从排行榜点进个股再返回时仍停在那一天
+  // （dataDate 是后端就近回退后的真实交易日，优先于控件里选的原值）
+  const day = dataDate.value || date.value || ''
+  router.push(makeStockLink(symbol, day, 'rankings'))
 }
 
 /**

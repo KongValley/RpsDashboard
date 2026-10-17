@@ -177,23 +177,21 @@ if (_qmt_python := os.environ.get("RPSBOARD_QMT_PYTHON", "").strip()):
     QMT_PYTHON = Path(_qmt_python)
 #: 资金账号。**凭据级**：只从环境变量 / `.env.local` 读，日志/接口/页面只留后 4 位。
 QMT_ACCOUNT = os.environ.get("RPSBOARD_QMT_ACCOUNT", "").strip()
-#: 交易模式：paper=影子（按限价模拟成交）、local=**自建模拟盘**（本项目自己撮合，
-#: 不连任何券商）、sim=券商模拟盘（QMT）。
-#: 没有 live —— 实盘不在本项目范围内，见 README「QMT 自动化边界」。
+#: 交易模式：paper=影子（按限价模拟成交）、sim=券商模拟盘（QMT）。
+#: **没有 live**（实盘不在本项目范围内），**也没有 local** —— 自建模拟盘已迁到
+#: 多账户原价引擎（`broker/sim.py` + `paper_order/paper_fill`），不再是一条
+#: 「交易模式」。旧环境变量设成 local 时由 CLI 给出明确迁移提示。
 TRADE_MODE = os.environ.get("RPSBOARD_TRADE_MODE", "paper").strip().lower()
-TRADE_MODES = ("paper", "local", "sim")
+TRADE_MODES = ("paper", "sim")
+#: 自建模拟盘（多账户）的参与率默认值来源；账户创建时固化，之后不随环境改变。
+PAPER_MAX_PARTICIPATION = float(os.environ.get(
+    "RPSBOARD_PAPER_MAX_PARTICIPATION", "0.10"))
+
 #: halt 哨兵文件：存在即禁止任何发单（CLI `trade halt --on`、页面上的开关都只碰它）
 TRADE_HALT_FILE = Path(os.environ.get(
     "RPSBOARD_TRADE_HALT_FILE", DATA_DIR / "trade.halt"))
 
-# ── 自建模拟盘的成交假设 ────────────────────────────────────────────
-#: 单日最多吃掉该股成交量的百分之几。一次调仓要买几十只票，若假设
-#: "想买多少就能成交多少"，小盘股的当日成交量根本吃不下，净值会系统性偏乐观。
-#: 0 = 不限制（老行为）；当日成交量未知（NULL/0）时也不限制。
-PAPER_MAX_PARTICIPATION = float(os.environ.get(
-    "RPSBOARD_PAPER_MAX_PARTICIPATION", "0.10"))
-
-# ── 组合风险阈值（cli trade risk / GET /api/trade/risk）────────────────
+# ── 组合风险阈值（cli trade risk / GET /api/portfolio/accounts/{id}/risk）──
 #: 单票权重上限（持仓市值 / 总权益）。等权 20 只时单票约 5%，
 #: 超过 25% 说明某只票的仓位已经明显偏离策略设定。
 RISK_MAX_SINGLE_WEIGHT = float(os.environ.get("RPSBOARD_RISK_MAX_SINGLE_WEIGHT", "0.25"))

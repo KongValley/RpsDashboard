@@ -63,7 +63,8 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(apimod, "_cache", {"conn": None, "opened": None})
     from rpsboard.api import create_app
 
-    return TestClient(create_app()), path
+    with TestClient(create_app()) as client:
+        yield client, path
 
 
 # ── 自选股池 ────────────────────────────────────────────────────────
@@ -336,15 +337,15 @@ def test_review_limit_list_matches_alert_rule(client):
 
 
 def test_update_pipeline_paper_phase_is_opt_in(tmp_path, monkeypatch):
-    """`paper=True` 才推进模拟盘；且续跑参数取库里记录的那一份。
+    """`paper=True` 才推进模拟账户；且**只推进 active 的策略账户**。
 
-    验证的是**接线**：默认关闭（它会加载全市场矩阵，耗时以分钟计）、
-    打开时用已有曲线的参数调用 `sim.run`，而不是另写一套默认值 ——
-    那样会与曲线创建时的参数不一致，被续跑校验直接拒绝。
+    验证的是**接线**：默认关闭（推进要加载全市场矩阵，耗时以分钟计）；打开时
+    对每个 active/strategy 账户调用 `sim.advance`，手动账户与 legacy 一律不动。
     """
     from rpsboard import cli
     from rpsboard import config as cfg
     from rpsboard import db as dbmod
+    from rpsboard.broker import accounts as accounts_mod
     from rpsboard.broker import sim
 
     path = tmp_path / "paper_pipe.db"
@@ -355,35 +356,41 @@ def test_update_pipeline_paper_phase_is_opt_in(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "cmd_compute_rps", lambda _ns: 0)
     monkeypatch.setattr(cli, "cmd_patterns", lambda _ns: 0)
     monkeypatch.setattr(cli, "cmd_industry_map", lambda _ns: 0)
+    monkeypatch.setattr(cli, "cmd_corporate", lambda _ns: 0)
     from rpsboard.sources import limit_src
 
     monkeypatch.setattr(limit_src, "sync_price_limits", lambda *_a, **_k: 0)
-    calls: list[dict] = []
-    monkeypatch.setattr(sim, "run", lambda conn, **kw: (
-        calls.append(kw), {"days": 3, "final_total": 1.0, "return": 0.0})[1])
+    calls: list[int] = []
+    monkeypatch.setattr(sim, "advance", lambda conn, **kw: (
+        calls.append(kw["account_id"]), {"days": 3, "settled_through": "2026-01-07",
+                                         "blocked_reason": None})[1])
 
     phases: list[str] = []
     res = cli.run_update_pipeline(progress=phases.append)
-    assert res["paper"] is None and not calls, "默认不该推进模拟盘"
+    assert res["paper"] is None and not calls, "默认不该推进模拟账户"
     assert "paper" not in phases
 
+    # 建两个账户：一个 active 策略（要推进）、一个归档的（不该推进）
     with dbmod.session(path) as conn:
-        conn.execute(
-            "INSERT INTO paper_nav(trade_date, cash, market_value, total, nav,"
-            " n_positions) VALUES ('2026-01-05', 1000000, 0, 1000000, 1.0, 0)")
-        # 老格式：缺 signal 键
-        conn.execute("INSERT INTO paper_meta(key, value) VALUES ('params', ?)",
-                     ('{"period":60,"threshold":80.0,"hold":20,"max_positions":20,'
-                      '"exclude_st":true,"resonance":false}',))
+        conn.execute("INSERT INTO benchmark_bar(symbol,date,close)"
+                     " VALUES ('000001','2026-01-05',3000)")
         conn.commit()
+        live = accounts_mod.create_account(
+            conn, name="要推进", kind="strategy", cash=100000.0,
+            start_date="2026-01-05", params={"period": 60, "threshold": 0.0,
+                                             "hold": 1, "max_positions": 2,
+                                             "exclude_st": True, "resonance": False,
+                                             "signal": "rps"})
+        dead = accounts_mod.create_account(
+            conn, name="已归档", kind="strategy", cash=100000.0,
+            start_date="2026-01-05")
+        accounts_mod.archive_account(conn, dead["id"])
 
     phases2: list[str] = []
     res2 = cli.run_update_pipeline(progress=phases2.append, paper=True)
     assert "paper" in phases2 and phases2[-1] == "done"
-    assert res2["paper"] == {"days": 3, "total": 1.0, "return": 0.0}
-    assert calls, "paper=True 必须真的调用 sim.run"
-    assert calls[-1]["signal"] == "rps" and calls[-1]["hold"] == 20, \
-        "续跑参数必须取库里记录的那一份（老格式缺 signal 时按默认值补齐）"
+    assert calls == [live["id"]], f"只推进 active 策略账户，实际 {calls}"
+    assert res2["paper"]["accounts"][0]["id"] == live["id"]
 
 
 def test_cli_alert_rm_removes_hits(tmp_path, monkeypatch):

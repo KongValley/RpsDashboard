@@ -12,7 +12,8 @@
 6. 非法周期必须回落到默认周期而不是报错
 7. QMT 交易端点在**没有交易数据**时也必须返回结构化空结果（不是 500），
    且任何接口里都不出现未脱敏的资金账号
-8. 自建模拟盘端点 `/api/trade/paper` 在没跑过时返回空结构而不是 500
+8. 模拟持仓端点在**没有任何账户**时返回空列表而不是 500；不猜默认账户 id
+9. 交易工具的纯计算（仓位/往返成本）在**空库**上也必须能算（不读证券表/行情）
 
 用法（服务默认 http://127.0.0.1:8000）：
     backend/.venv/Scripts/python.exe -m rpsboard.cli serve     # 另开一个终端
@@ -164,18 +165,50 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001
         check(False, "/api/trade/summary 契约", f"{type(exc).__name__}: {exc}")
 
-    # ── 自建模拟盘（不连券商）──────────────────────────────────────
+    # ── 模拟持仓（多账户、原价、不连券商）──────────────────────────
     try:
-        pp = get_json(base, "/api/trade/paper")
-        check(isinstance(pp.get("days"), int) and isinstance(pp.get("curve"), list),
-              "/api/trade/paper 返回 200")
-        if pp.get("days"):
-            check(isinstance(pp.get("positions"), list),
-                  "模拟盘持仓非空", f"{len(pp['positions'])} 只")
+        accs = get_json(base, "/api/portfolio/accounts")
+        rows = accs.get("rows") or []
+        check(isinstance(rows, list), "/api/portfolio/accounts 返回 200")
+        if rows:
+            # **用返回的真实 id**，绝不猜默认账户（没有「默认账户」这回事）
+            aid = rows[0]["id"]
+            detail = get_json(base, f"/api/portfolio/accounts/{aid}")
+            check(isinstance(detail.get("days"), int)
+                  and isinstance(detail.get("curve"), list),
+                  "账户详情返回 200", f"#{aid} {detail.get('days')} 天")
+            check(isinstance(detail.get("available_cash"), (int, float)),
+                  "账户详情含可用现金（工具带入资金要用它）")
+            risk = get_json(base, f"/api/portfolio/accounts/{aid}/risk")
+            check(risk.get("account_id") == aid and "alerts" in risk,
+                  "账户风险体检带 account_id")
         else:
-            check(True, "模拟盘为空（尚未跑过 trade run）")
+            check(True, "模拟盘为空（还没有建过账户）")
     except Exception as exc:  # noqa: BLE001
-        check(False, "/api/trade/paper 返回 200", f"{type(exc).__name__}: {exc}")
+        check(False, "/api/portfolio/accounts 契约", f"{type(exc).__name__}: {exc}")
+
+    # 旧的单账户端点必须已经下线
+    try:
+        old = get_json(base, "/api/trade/paper")
+        check(not isinstance(old, dict) or "days" not in old,
+              "/api/trade/paper 已下线（不再返回模拟盘结构）")
+    except Exception:
+        check(True, "/api/trade/paper 已下线（返回错误而不是 JSON）")
+
+    # ── 交易工具：纯计算不依赖数据库 ──────────────────────────────
+    try:
+        body = json.dumps({"symbol": "000001", "volume": 1000, "buy_price": 10.0,
+                           "sell_price": 11.0, "trade_date": "2026-01-05"}).encode()
+        req = urllib.request.Request(base + "/api/tools/round-trip", data=body,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            rt = json.loads(resp.read().decode("utf-8"))
+        check(abs(rt.get("net_pnl", 0) - 984.29) < 0.01
+              and abs(rt.get("breakeven_price", 0) - 10.02) < 0.001,
+              "往返成本工具可独立于行情计算",
+              f"net_pnl={rt.get('net_pnl')} breakeven={rt.get('breakeven_price')}")
+    except Exception as exc:  # noqa: BLE001
+        check(False, "/api/tools/round-trip 契约", f"{type(exc).__name__}: {exc}")
 
     # ── 因子评估（只读库；没跑过时要返回空结构而不是 500）──────────
     try:

@@ -10,7 +10,7 @@
         </span>
         <div class="spacer" />
         <label class="muted">日期
-          <select v-model="date" style="margin-left:6px;min-width:130px" @change="reload">
+          <select v-model="date" style="margin-left:6px;min-width:130px" @change="applyDate">
             <option value="">最新</option>
             <option v-for="d in availableDates" :key="d" :value="d">{{ d }}</option>
           </select>
@@ -33,8 +33,12 @@
             <td><span v-if="r.is_st" class="badge st">ST</span>{{ r.name || '—' }}</td>
             <td class="muted">{{ r.industry || '未分类' }}</td>
             <td class="num" v-for="p in periods" :key="p">{{ num(r[`rps${p}`]) }}</td>
-            <td class="muted">{{ r.note || '' }}</td>
             <td>
+              <input v-model="r._note" type="text" maxlength="120"
+                     placeholder="备注" style="width:150px" @click.stop />
+            </td>
+            <td>
+              <button class="btn" @click.stop="saveNote(r)">存备注</button>
               <button class="btn" @click.stop="remove(r.symbol)">移除</button>
             </td>
           </tr>
@@ -97,17 +101,23 @@
           </tr>
         </tbody>
       </table>
-      <p v-else class="muted">这一天没有命中记录。</p>
+      <p v-else class="muted">
+        {{ date
+          ? `该日没有已记录的命中（预警只在 \`cli alert run\` / 更新数据当天写入评估结果）`
+          : '还没有命中记录。' }}
+      </p>
     </div>
   </div>
 </template>
 
 <script setup>
 import { ref, onMounted, watch } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { watchApi, alertApi, metaApi } from '../api'
+import { stockLink as makeStockLink } from '../composables/useStockLinks'
 import { usePeriods } from '../composables/usePeriods'
 
+const route = useRoute()
 const router = useRouter()
 const { periods, error: periodsError } = usePeriods()
 const items = ref([])
@@ -118,16 +128,26 @@ const kinds = ref([])
 const errMsg = ref('')
 watch(periodsError, (v) => { if (v) errMsg.value = v }, { immediate: true })
 const newRule = ref({ name: '', kind: 'rps_threshold', params: '{"period":60,"min":90,"max":100}' })
-/** 回看日期（空 = 最新）；选项来自 /api/meta/dates，与排行榜/个股页同一套 */
-const date = ref('')
+/** 回看日期（空 = 最新）：从 URL 初始化，选项与排行榜/个股页同一套 */
+const date = ref(typeof route.query.date === 'string' ? route.query.date : '')
 const availableDates = ref([])
 
 const num = (v) => (v == null ? '—' : Number(v).toFixed(0))
 
+/** 只改 query：App 以 fullPath 重挂载，由新实例统一加载一次。 */
+function applyDate() {
+  router.replace({
+    path: '/watchlist',
+    query: { ...(date.value ? { date: date.value } : {}) },
+  })
+}
+
 async function reload() {
   errMsg.value = ''
   try {
-    items.value = await watchApi.list(date.value ? { date: date.value } : undefined)
+    const rows = await watchApi.list(date.value ? { date: date.value } : undefined)
+    // 备注用本地副本编辑：不点「存备注」就不该改动服务端
+    items.value = (rows || []).map((r) => ({ ...r, _note: r.note || '' }))
   } catch (e) {
     errMsg.value = `自选列表加载失败：${e?.message || e}`
   }
@@ -137,10 +157,23 @@ async function reload() {
     errMsg.value = `预警规则加载失败：${e?.message || e}`
   }
   try {
-    hits.value = await alertApi.hits({})
-    hitDate.value = hits.value.length ? hits.value[0].date : null
+    // 命中记录跟着**当前所选日**：不传日期的话后端给的是最新评估日，
+    // 与同一屏里按日回看的自选列表口径不一致。
+    hits.value = await alertApi.hits(date.value ? { date: date.value } : {})
+    hitDate.value = hits.value.length ? hits.value[0].date : (date.value || null)
   } catch (e) {
     errMsg.value = `命中记录加载失败：${e?.message || e}`
+  }
+}
+
+/** 显式保存备注（不用失焦自动保存：那会静默覆盖用户正在写的内容） */
+async function saveNote(row) {
+  try {
+    await watchApi.add(row.symbol, row._note || '')
+    row.note = row._note || ''
+    errMsg.value = ''
+  } catch (e) {
+    errMsg.value = `备注保存失败：${e?.message || e}`
   }
 }
 
@@ -180,7 +213,8 @@ async function removeRule(id) {
 }
 
 function goDetail(symbol) {
-  router.push(`/stock/${symbol}`)
+  const day = date.value || items.value.find((r) => r.symbol === symbol)?.data_date || ''
+  router.push(makeStockLink(symbol, day, 'watchlist'))
 }
 
 onMounted(async () => {

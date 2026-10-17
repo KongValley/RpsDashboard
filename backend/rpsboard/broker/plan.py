@@ -36,8 +36,7 @@ class PlanError(RuntimeError):
     """计划不可生成 / 不可执行。"""
 
 
-def _cash_budget_from_account(cash_budget: float, conn: sqlite3.Connection,
-                              *, local: bool = False) -> float:
+def _cash_budget_from_account(cash_budget: float, conn: sqlite3.Connection) -> float:
     """cash_budget=0 → 用账户权益的 95%（留 5% 给佣金与价格波动）。
 
     **权益 = 现金 + 持仓市值**，不是只有现金：这是一个等权再平衡的组合，
@@ -46,16 +45,6 @@ def _cash_budget_from_account(cash_budget: float, conn: sqlite3.Connection,
     """
     if cash_budget and cash_budget > 0:
         return float(cash_budget)
-    if local:
-        row = conn.execute("SELECT cash FROM paper_account WHERE id = 1").fetchone()
-        cash = float(row["cash"]) if row else 0.0
-        mv = conn.execute(
-            "SELECT COALESCE(SUM(market_value), 0) AS mv FROM paper_position"
-            " WHERE trade_date = (SELECT MAX(trade_date) FROM paper_nav)").fetchone()
-        equity = cash + float(mv["mv"] or 0.0)
-        if equity <= 0:
-            raise PlanError("no_account：自建模拟盘尚未初始化（cli trade run --cash N）")
-        return equity * 0.95
     try:
         asset = qmt.asset() or {}
     except qmt.QmtError as exc:
@@ -68,27 +57,17 @@ def _cash_budget_from_account(cash_budget: float, conn: sqlite3.Connection,
     return equity * 0.95
 
 
-def _held_map(conn: sqlite3.Connection, *, local: bool) -> dict[str, int]:
-    """现持股数。local 读 `paper_position`，否则读券商回报。"""
-    if not local:
-        return {p["symbol"]: int(p.get("volume") or 0) for p in (qmt.positions() or [])}
-    from . import sim
-
-    return {p["symbol"]: int(p["volume"]) for p in sim.positions_at(conn)}
+def _held_map(conn: sqlite3.Connection) -> dict[str, int]:
+    """现持股数（券商回报）。"""
+    return {p["symbol"]: int(p.get("volume") or 0) for p in (qmt.positions() or [])}
 
 
 def _price_map(conn: sqlite3.Connection, plan_date: str, symbols: list[str],
-               *, local: bool) -> dict[str, float]:
-    """参考价。local 取库内收盘价（后复权），否则取 QMT 最新价（不复权）。"""
+               ) -> dict[str, float]:
+    """参考价：QMT 最新价（不复权，与 price_limit_daily 同一基准）。"""
     if not symbols:
         return {}
-    if not local:
-        return qmt.tick(symbols)
-    marks = ",".join("?" * len(symbols))
-    rows = conn.execute(
-        f"SELECT symbol, close FROM daily_bar WHERE date = ? AND symbol IN ({marks})",
-        [plan_date, *symbols]).fetchall()
-    return {r["symbol"]: float(r["close"]) for r in rows if r["close"]}
+    return qmt.tick(symbols)
 
 
 def _in_clause(symbols: list[str]) -> str:
@@ -121,9 +100,49 @@ def _lot_volume(per_name: float, price: float) -> int:
 
 
 def _sort_score(scores: pd.Series, sym: str) -> float:
-    """排序用的打分：取不到（NaN）当作 -inf，排在最后。"""
+    """排序用的打分：取不到（NaN）当作 -inf，排在最后。
+
+    **不能写 `value or -inf`** —— 那会把合法收益 0.0（横盘）也当成「取不到」，
+    于是一只横盘的票会排到全市场最后。0.0 是真实值，必须原样参与排序。
+    """
     v = scores.get(sym)
     return -float("inf") if v is None or v != v else float(v)
+
+
+def select_candidates(
+    ctx: dict,
+    entry: bt.EntryMask,
+    *,
+    date: str,
+    period: int = config.DEFAULT_PERIOD,
+    max_positions: int = 20,
+    exclude_st: bool = True,
+    signal: str = "rps",
+    score: pd.DataFrame | None = None,
+) -> list[str]:
+    """当日 entry_mask 命中里，按排序键取前 `max_positions` 只。
+
+    **单一真源**：QMT 交易计划与原价策略账户都走这里，避免两套取前 N 的逻辑
+    慢慢漂移（`signal="composite"` 时排序键是合成分，`"rps"` 时是 `ret{period}`）。
+
+    排序键是**静态**的（只用信号日之前的行情），不是前瞻收益 ——
+    用未来收益排序等于按结果挑股票。
+    """
+    if date not in entry.mask.index:
+        raise PlanError(f"{date} 不是信号日（rps_daily 无值或不在回测矩阵内）")
+    sel = entry.mask.loc[date]
+    names = sorted(sel.index[sel.fillna(False).astype(bool)])
+    if signal == "composite":
+        if score is None:
+            raise PlanError("signal=composite 需要调用方预先算好 score")
+        if date not in score.index:
+            raise PlanError(f"{date} 不在合成分矩阵内")
+        s = score.loc[date]
+        names.sort(key=lambda sym: (-_sort_score(s, sym), sym))
+    else:
+        ret = bt.get_frames(ctx, exclude_st)[f"ret{period}"].loc[date]
+        names.sort(key=lambda sym: (-_sort_score(ret, sym), sym))
+    return names[:max_positions]
 
 
 def build_plan(
@@ -154,13 +173,10 @@ def build_plan(
     每一只候选都会落成一行，包括被跳过的那些（reason 写明原因）——
     「为什么这只没买」必须看得见，不能靠猜。
 
-    `mode="local"`（自建模拟盘）时**不连 QMT**：参考价取库内 `daily_bar.close`，
-    现持取 `paper_position`。`ctx` / `entry` / `score` 可由调用方预先算好传入
-    （逐日循环里算一次就够，每次重算要几十秒到几分钟）。
+    **自建模拟盘不再走这里**：原价策略账户由 `broker/sim.py` 的 `advance`
+    自己出计划（原价、多账户、独立流水）。本函数只剩 QMT 的 paper/sim 模式。
 
-    `signal="composite"` 时**取前 M 只的排序键换成合成分**（`score`）；
-    `signal="rps"` 时排序键保持 `ret{period}` 不变（README 已写明该口径，
-    改了会让已记录在案的模拟盘数字悄悄对不上）。
+    `ctx` / `entry` / `score` 可由调用方预先算好传入（逐日循环里算一次就够）。
     """
     SIGNALS = bt.SIGNALS
     if mode not in config.TRADE_MODES:
@@ -171,9 +187,8 @@ def build_plan(
         raise PlanError(f"signal={signal!r} 非法，只允许 {list(SIGNALS)}")
     if max_positions < 1:
         raise PlanError(f"max_positions 必须 ≥ 1，收到 {max_positions}")
-    local = mode == "local"
-    held = _held_map(conn, local=local)
-    budget = _cash_budget_from_account(cash_budget, conn, local=local)
+    held = _held_map(conn)
+    budget = _cash_budget_from_account(cash_budget, conn)
     per_name = budget / max_positions
 
     if signal == "composite" and (ctx is None or "high" not in ctx):
@@ -184,54 +199,33 @@ def build_plan(
         entry = bt.entry_mask(ctx, conn, period, threshold,
                               exclude_st=exclude_st, resonance=resonance,
                               score=score)
-    if plan_date not in entry.mask.index:
-        raise PlanError(f"{plan_date} 不是信号日（rps_daily 无值或不在回测矩阵内）")
-    sel = entry.mask.loc[plan_date]
-    names = sorted(sel.index[sel.fillna(False).astype(bool)])
-
-    # 取前 max_positions：无论用哪个排序键都是**静态**的（只用信号日之前的行情），
-    # 不是前瞻收益 —— 用 fwd 排序等于按未来挑股票。
-    if signal == "composite":
+    if signal == "composite" and score is None:
         from ..analytics import factors as fac
 
-        if score is None:
-            score = fac.composite_score(ctx, conn, period=period, hold=hold,
-                                       exclude_st=exclude_st)
-        if plan_date not in score.index:
-            raise PlanError(f"{plan_date} 不是信号日（rps_daily 无值或不在回测矩阵内）")
-        s = score.loc[plan_date]
-        # 取不到合成分（NaN）的票排最后：排不出名次就不该占名额
-        names.sort(key=lambda sym: (-_sort_score(s, sym), sym))
-        key_desc = "合成分"
-    else:
-        ret = bt.get_frames(ctx, exclude_st)[f"ret{period}"].loc[plan_date]
-        names.sort(key=lambda s: (-(ret.get(s) or float("-inf")), s))
-        key_desc = f"ret{period}"
-    candidates = names[:max_positions]
+        score = fac.composite_score(ctx, conn, period=period, hold=hold,
+                                    exclude_st=exclude_st)
+    candidates = select_candidates(
+        ctx, entry, date=plan_date, period=period, max_positions=max_positions,
+        exclude_st=exclude_st, signal=signal, score=score)
+    names = list(entry.mask.loc[plan_date].index[
+        entry.mask.loc[plan_date].fillna(False).astype(bool)])
+    key_desc = "合成分" if signal == "composite" else f"ret{period}"
     orphans = sorted(s for s, v in held.items() if v > 0 and s not in set(candidates))
     # 孤儿持仓也要价：清仓同样要挂限价单，取不到价就卖不掉
-    ticks = _price_map(conn, plan_date, sorted(set(candidates) | set(orphans)), local=local)
+    ticks = _price_map(conn, plan_date, sorted(set(candidates) | set(orphans)))
     limits = _limits(conn, plan_date, candidates)
     statuses = _bar_status(conn, plan_date, candidates)
 
     items: list[dict] = []
     skipped: dict[str, int] = {}
     # 越界校验只在**同一价格基准**下成立：`price_limit_daily.limit_up/down` 是不复权
-    # 价，QMT 最新价也是不复权，两者可比；而 `daily_bar.close` 是**后复权**价，
-    # 直接比会凭空判出一大批「越界」（实测 20 只候选里 12 只被误杀）。
-    # 后复权口径的涨跌停由撮合引擎按收益率比处理（broker/sim.py::_limit_blocked），
-    # 与回测用的是同一条规则。
-    check_limits = not local
+    # 价，QMT 最新价也是不复权，两者可比。
     for sym in candidates:
         reason, ref, price, target, side = "ok", 0.0, None, 0, "hold"
         if statuses.get(sym) is None or not int(statuses.get(sym) or 0):
             reason = "suspended"
-        elif check_limits and sym not in limits:
+        elif sym not in limits:
             # 没有实测涨跌停行就不推算：宁可不出计划，也不拿猜出来的价位发单。
-            # **只对需要比价的模式成立**（QMT 发单要比 limit_up/down）；
-            # 自建模拟盘全程只读库内日K，涨跌停由撮合引擎按收益率比处理，
-            # 不该因为缺这一行就把候选整只跳过（那会让模拟盘在缺数据的日子
-            # 一笔都不成交，而它本来完全不需要这行数据）。
             reason = "no_limit_row"
         else:
             last = ticks.get(sym)
@@ -239,14 +233,12 @@ def build_plan(
                 reason = "no_tick"
             else:
                 ref = round(float(last), 4)
-                # 自建模拟盘（check_limits=False）不需要实测涨跌停行：缺失时
-                # 按「无约束」处理，绝不 KeyError。
                 lim = limits.get(sym) or {}
                 has_limit = (lim.get("status") or "normal") != "no_price_limit"
                 buy_px = round(ref * (1 + PRICE_OFFSET), 2)
                 sell_px = round(ref * (1 - PRICE_OFFSET), 2)
                 want = _lot_volume(per_name, buy_px)
-                in_band = (not check_limits) or not has_limit or (
+                in_band = not has_limit or (
                     float(lim["limit_down"] or 0) <= buy_px <= float(lim["limit_up"] or 0))
                 if want <= 0:
                     reason = "too_small"
@@ -257,7 +249,7 @@ def build_plan(
                     have = int(held.get(sym) or 0)
                     if have > want:
                         side, price = "sell", sell_px
-                        if check_limits and has_limit and not (
+                        if has_limit and not (
                                 float(lim["limit_down"] or 0) <= sell_px
                                 <= float(lim["limit_up"] or 0)):
                             side, price, reason = "hold", None, "price_out_of_limit"
@@ -304,13 +296,13 @@ def build_plan(
         "candidates": len(candidates), "selected": len(names),
         "skipped": skipped, "limit_warnings": entry.warnings,
         "orphans": orphans, "liquidate_orphans": bool(liquidate_orphans),
-        "price_source": "daily_bar.close" if local else "qmt.tick",
+        "price_source": "qmt.tick",
         "signal": signal,
     }
     note = (
         f"目标 = 回测口径的 {len(names)} 只候选里按 {key_desc} 取前 {len(candidates)} 只"
         f"（回测为全市场等权，共 {len(names)} 只）；"
-        f"委托价 = {'库内收盘价' if local else 'QMT 最新价'} ∓{PRICE_OFFSET:.1%} 的限价；"
+        f"委托价 = QMT 最新价 ∓{PRICE_OFFSET:.1%} 的限价；"
         + (f"掉出候选的 {len(orphans)} 只持仓本次清仓；"
            if liquidate_orphans else f"不在候选内的持仓 {len(orphans)} 只，本次不动；")
         + "未建模：分红送转对持股数的影响以券商回报为准。"

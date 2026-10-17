@@ -370,6 +370,42 @@ def cmd_price_limits(args: argparse.Namespace) -> int:
     return 0
 
 
+# ── corporate（公司行为/权息事件）───────────────────────────────────
+def cmd_corporate(args: argparse.Namespace) -> int:
+    """采集公司行为事件（分红/送转/配股/股本变动）。
+
+    **只发现事件**：接口没有登记日、到账日、可卖日与个人分红税，所以这里不写
+    任何入账时间表 —— 那些必须由用户按公告核对后填（模拟持仓页的公司行为核对）。
+    """
+    from .sources import corporate_src
+
+    db.init_db()
+    symbols = getattr(args, "symbols", None)
+    if symbols:
+        symbols = [s.strip() for s in str(symbols).split(",") if s.strip()]
+    with db.session() as conn:
+        run_id = db.start_run(conn, task="corporate", source=config.DATA_SOURCE)
+        t0 = time.time()
+        try:
+            res = corporate_src.sync_corporate(
+                conn, symbols, workers=int(getattr(args, "workers", 8) or 8))
+        except Exception as exc:  # noqa: BLE001
+            db.finish_run(conn, run_id, "failed", 0, f"{type(exc).__name__}: {exc}")
+            print(f"[corporate] 公司行为采集失败：{exc}", file=sys.stderr)
+            return 2
+        msg = (f"{res['ok']} 只 / {res['events']} 个事件块"
+               + (f"；失败 {len(res['failed'])} 只" if res["failed"] else ""))
+        db.finish_run(conn, run_id,
+                      "success" if not res["failed"] else "partial",
+                      res["ok"], msg)
+    if not res["ok"]:
+        print("[corporate] 没有任何股票被采集（先跑 cli backfill 建立覆盖）",
+              file=sys.stderr)
+        return 2
+    print(f"[corporate] 完成：{msg}，用时 {time.time()-t0:.0f}s")
+    return 0
+
+
 # ── quality（复权因子异常检测）──────────────────────────────────────
 def cmd_quality(args: argparse.Namespace) -> int:
     """复权因子异常检测：官方因子 + 库内单日跳变。
@@ -844,148 +880,194 @@ def cmd_status(_: argparse.Namespace) -> int:
 # ── trade（自建模拟盘 / QMT 只读·影子·券商模拟盘）──────────────────
 # 退出码：0 正常；2 配置或连接失败；3 有差异/有跳过项；4 部分委托失败。
 # **没有实盘分支**：`execute` 只在 plan.mode=sim 且带 --i-know-this-is-sim 时放行。
+def _account_summary_line(conn, account_id: int) -> str:
+    from .broker import accounts as accounts_mod
+    from .broker import sim
+
+    acc = accounts_mod.get_account(conn, account_id)
+    s = sim.summary(conn, account_id=int(account_id))
+    span = f"{s['from']}~{s['to']}" if s["days"] else "—"
+    return (f"#{acc['id']:<3}{str(acc['name'])[:16]:<18}{acc['kind']:<10}"
+            f"{acc['price_basis']:<5}{acc['status']:<9}{span:<24}"
+            f"{s['return']:>+8.2%}{s['total']:>14,.0f}")
+
+
+def cmd_trade_account_list(args: argparse.Namespace) -> int:
+    """列出全部模拟账户（含已归档与旧研究账户）。**不连券商。**"""
+    db.init_db()
+    conn = db.connect()
+    try:
+        rows = [r["id"] for r in conn.execute("SELECT id FROM paper_account ORDER BY id")]
+        if not rows:
+            print("[account] 还没有模拟账户：cli trade account new --name 我的 --kind manual "
+                  "--cash 1000000 --from <起始交易日>")
+            return 0
+        print(f"{'ID':<4}{'名称':<18}{'类型':<10}{'口径':<5}{'状态':<9}{'区间':<24}"
+              f"{'收益':>8}{'总权益':>14}")
+        for i in rows:
+            print(_account_summary_line(conn, i))
+    finally:
+        conn.close()
+    return 0
+
+
+def cmd_trade_account_new(args: argparse.Namespace) -> int:
+    """新建模拟账户：`--kind manual` 或 `strategy`（策略参数创建时固化）。"""
+    from .broker import accounts as accounts_mod
+
+    config.ensure_dirs()
+    db.init_db()
+    params = None
+    if args.kind == "strategy":
+        params = {"period": args.period, "threshold": args.threshold,
+                  "hold": args.hold, "max_positions": args.max_positions,
+                  "exclude_st": not args.no_exclude_st, "resonance": args.resonance,
+                  "signal": args.signal}
+    conn = db.connect()
+    try:
+        acc = accounts_mod.create_account(
+            conn, name=args.name, kind=args.kind, cash=args.cash,
+            start_date=args.from_date, params=params,
+            participation=args.max_participation)
+    except accounts_mod.AccountError as exc:
+        print(f"[account] {exc}", file=sys.stderr)
+        return 2
+    finally:
+        conn.close()
+    print(f"[account] 已建账户 #{acc['id']}「{acc['name']}」"
+          f"kind={acc['kind']} basis={acc['price_basis']} 资金 {_money(acc['cash'])}"
+          f" 起点 {acc['start_date']}")
+    if params:
+        print(f"[account] 策略参数：{params}")
+    print(f"[account] 参与率 {acc['execution'].get('participation')}"
+          "（创建时固化，之后改参数要新建账户）")
+    return 0
+
+
 def cmd_trade_paper_run(args: argparse.Namespace) -> int:
-    """自建模拟盘：在区间上逐日「出计划 → 次日撮合 → 盯市」。**不连 QMT。**"""
+    """推进某个模拟账户到今天（缺省）或 `--to`。**不连任何券商。**"""
+    from .broker import accounts as accounts_mod
     from .broker import sim
 
     config.ensure_dirs()
     db.init_db()
-    if args.reset and not args.yes_reset:
-        print("[trade] --reset 会清空模拟账户、持仓与净值（不可恢复）。"
-              "确认请加 --yes-reset", file=sys.stderr)
-        return 2
-    with db.session() as conn:
-        run_id = db.start_run(conn, task="trade-paper", source="local")
-        t0 = time.time()
-
-        def progress(done: int, total: int, day: str) -> None:
-            if done % 20 == 0 or done == total:
-                print(f"  {day}  {done}/{total}  ({time.time() - t0:.0f}s)")
-
+    conn = db.connect()
+    try:
         try:
-            res = sim.run(
-                conn, from_date=args.from_date, to_date=args.to_date,
-                cash=args.cash, period=args.period, threshold=args.threshold,
-                hold=args.hold, max_positions=args.max_positions,
-                exclude_st=not args.no_exclude_st, resonance=args.resonance,
-                signal=args.signal, participation=args.max_participation,
-                reset=args.reset and args.yes_reset, progress=progress)
-        except sim.SimError as exc:
-            db.finish_run(conn, run_id, "failed", 0, str(exc))
-            print(f"[trade] 模拟盘运行失败：{exc}", file=sys.stderr)
+            with accounts_mod.account_write_lock(conn, args.account):
+                res = sim.advance(conn, account_id=args.account,
+                                  to_date=getattr(args, "to", None))
+        except (accounts_mod.AccountError, sim.SimError) as exc:
+            print(f"[paper] {exc}", file=sys.stderr)
             return 2
-        except Exception as exc:  # noqa: BLE001
-            db.finish_run(conn, run_id, "failed", 0, f"{type(exc).__name__}: {exc}")
-            print(f"[trade] 模拟盘运行失败：{type(exc).__name__}: {exc}", file=sys.stderr)
-            return 2
-        db.finish_run(conn, run_id, "success", res["filled"],
-                      f"模拟盘 {res['plans']} 次调仓，收益 {res['return']:.2%}")
-        summary = sim.summary(conn)
+    finally:
+        conn.close()
 
-    print(f"\n[paper] 初始资金 {_money(summary['initial_cash'])} → "
-          f"期末 {_money(summary['total'])}（{summary['return']:+.2%}，"
-          f"{summary['days']} 个交易日 {summary['from']}~{summary['to']}）")
-    if res.get("resumed_from"):
-        print(f"[paper] 本次为续跑：已结算到 {res['resumed_from']}，"
-              f"新增结算 {res['days']} 个交易日（历史净值不重算）")
-    else:
-        print(f"[paper] 本次新建曲线，结算 {res['days']} 个交易日")
-    print(f"[paper] 最大回撤 {summary['max_drawdown']:.2%}｜期末持仓 "
-          f"{len(summary['positions'])} 只｜计划 {res['plans']} 次，"
-          f"委托 {res['orders']} 笔，成交 {res['filled']} 笔，"
-          f"限价未触及 {res['canceled']} 笔，涨停/停牌顺延 {res['deferred']} 笔")
-    print(f"[paper] 累计费用 {_money(res['fee'])}")
-    if res.get("capped") or res.get("illiquid"):
-        print(f"[paper] 参与率限制：{res.get('capped', 0)} 笔只吃下部分量（剩余顺延），"
-              f"{res.get('illiquid', 0)} 笔当日量不足一手")
+    if res.get("blocked_reason"):
+        print(f"[paper] 推进到 {res['settled_through'] or '（尚未开始）'}，"
+              f"本次新增 {res['days']} 个交易日。")
+        print(f"[paper] ⚠ 数据缺口挡住继续推进：{res['blocked_reason']}")
+        for m in (res.get("missing") or [])[:10]:
+            print(f"[paper]   · {m}")
+        print("[paper] 补齐数据（或按公告核对公司行为/停牌）后重跑即可从断点继续。")
+        return 3
+    print(f"[paper] 已结算到 {res['settled_through']}，本次新增 {res['days']} 个交易日。")
     return 0
 
 
 def cmd_trade_paper(args: argparse.Namespace) -> int:
-    """打印自建模拟盘账户：净值、持仓明细。"""
+    """打印某个模拟账户：净值、持仓明细。"""
     from .broker import sim
 
     db.init_db()
-    with db.session() as conn:
+    conn = db.connect()
+    try:
         try:
-            s = sim.summary(conn)
+            s = sim.summary(conn, account_id=args.account)
         except sim.SimError as exc:
             print(f"[paper] {exc}", file=sys.stderr)
             return 2
+    finally:
+        conn.close()
     if not s["days"]:
-        print("[paper] 模拟盘还是空的：cli trade run --from 2026-01-01 --cash 1000000")
+        print("[paper] 这个账户还没有净值：先 cli trade run --account N")
         return 0
     print(f"初始资金  {_money(s['initial_cash'])}")
-    print(f"当前净值  {_money(s['total'])}（{s['return']:+.2%}，净值 {s['nav']}）")
-    print(f"最大回撤  {s['max_drawdown']:.2%}")
+    print(f"当前净值  {_money(s['total'])}"
+          f"（现金 {_money(s['cash'])} + 市值 {_money(s['market_value'])}"
+          f" + 应收 {_money(s['receivable'])}）")
+    print(f"区间收益  {s['return']:+.2%}　最大回撤 {s['max_drawdown']:.2%}")
     print(f"区间      {s['from']} ~ {s['to']}（{s['days']} 个交易日）")
-    print(f"\n{'代码':<8}{'股数':>8}{'成本':>9}{'现价':>9}{'市值':>14}{'浮盈':>12}")
+    print(f"\n{'代码':<8}{'股数':>8}{'可卖':>8}{'成本价':>9}{'现价':>9}"
+          f"{'市值':>14}{'浮盈':>12}")
     for p in s["positions"]:
-        pnl = (p["close"] - p["avg_price"]) * p["volume"]
-        print(f"{p['symbol']:<8}{p['volume']:>8}{p['avg_price']:>9.2f}"
-              f"{p['close']:>9.2f}{p['market_value']:>14,.0f}{pnl:>+12,.0f}")
+        cost = float(p["cost_basis"] or 0.0)
+        pnl = float(p["market_value"]) - cost
+        print(f"{p['symbol']:<8}{int(p['volume']):>8}"
+              f"{int(p['available_volume'] or 0):>8}{float(p['avg_price']):>9.2f}"
+              f"{float(p['close']):>9.2f}{float(p['market_value']):>14,.0f}{pnl:>+12,.0f}")
     return 0
 
 
 def cmd_trade_archive(args: argparse.Namespace) -> int:
-    """模拟盘曲线归档：`--save` 存一份、`--rm` 删一份、都不给则列出。**不连 QMT。**"""
+    """归档某个账户的曲线（`--account`），或列出全部历史归档（`--list-history`）。"""
     from .broker import sim
 
     db.init_db()
-    with db.session() as conn:
-        if args.rm is not None:
-            ok = sim.delete_archive(conn, int(args.rm))
-            print(f"[paper] 归档 #{args.rm} " + ("已删除" if ok else "不存在"))
-            return 0 if ok else 2
-        if getattr(args, "save", False):
-            try:
-                res = sim.archive(conn, args.label)
-            except sim.SimError as exc:
-                print(f"[paper] {exc}", file=sys.stderr)
-                return 2
-            print(f"[paper] 已归档 #{res['id']}「{res['label']}」"
-                  f"{res['days']} 个交易日，收益 {res['return']:+.2%}")
+    conn = db.connect()
+    try:
+        if getattr(args, "list_history", False):
+            rows = sim.list_archives(conn, limit=50)
+            if not rows:
+                print("[archive] 还没有归档。")
+                return 0
+            print(f"{'ID':>4}  {'名称':<24}{'口径':<6}{'区间':<25}{'收益':>9}{'天':>6}")
+            for r in rows:
+                span = f"{r.get('from_date') or '—'}~{r.get('to_date') or '—'}"
+                print(f"{r['id']:>4}  {str(r['label'])[:22]:<24}"
+                      f"{str(r.get('price_basis') or 'hfq'):<6}{span:<25}"
+                      f"{float(r['total_return']):>+8.2%}{int(r['days']):>6}")
             return 0
-        rows = sim.list_archives(conn)
-
-    if not rows:
-        print("[paper] 还没有归档：cli trade archive --save --label RPS60")
+        try:
+            res = sim.archive(conn, args.label, account_id=args.account)
+        except sim.SimError as exc:
+            print(f"[archive] {exc}", file=sys.stderr)
+            return 2
+        print(f"[archive] 已归档 #{res['id']}「{res['label']}」"
+              f"{res['days']} 个交易日，收益 {res['return']:+.2%}")
         return 0
-    print(f"{'ID':>4}  {'名称':<20}{'区间':<25}{'收益':>9}{'回撤':>9}{'天':>6}")
-    for r in rows:
-        mdd = float((r.get("metrics") or {}).get("max_drawdown") or 0.0)
-        span = f"{r.get('from_date') or '—'}~{r.get('to_date') or '—'}"
-        print(f"{r['id']:>4}  {str(r['label'])[:18]:<20}{span:<25}"
-              f"{float(r['total_return']):>+8.2%}{-mdd:>9.2%}{int(r['days']):>6}")
-    print("\n页面上可以在「交易 → 策略对照」里叠加比较；跑新策略前记得先 --save。")
-    return 0
+    finally:
+        conn.close()
 
 
 def cmd_trade_risk(args: argparse.Namespace) -> int:
-    """模拟盘组合风险体检（集中度/相关性/回撤）。**默认只打印**，`--push` 才推微信。"""
+    """某个账户的组合风险体检。**默认只打印**，`--push` 才推微信。"""
     from .broker import risk_alerts, sim
 
     db.init_db()
-    with db.session() as conn:
+    conn = db.connect()
+    try:
+        over = {k: v for k, v in (
+            ("max_single", args.max_single), ("max_industry", args.max_industry),
+            ("max_avg_corr", args.max_avg_corr),
+            ("max_drawdown", args.max_drawdown)) if v is not None}
+        t = risk_alerts.thresholds(**over)
         try:
-            over = {k: v for k, v in (
-                ("max_single", args.max_single), ("max_industry", args.max_industry),
-                ("max_avg_corr", args.max_avg_corr),
-                ("max_drawdown", args.max_drawdown)) if v is not None}
-            t = risk_alerts.thresholds(**over)
-            alerts = risk_alerts.evaluate(conn, **over)
+            alerts = risk_alerts.evaluate(conn, account_id=args.account, **over)
         except sim.SimError as exc:
             print(f"[risk] {exc}", file=sys.stderr)
             return 2
+    finally:
+        conn.close()
 
-    print(f"阈值：单票 ≤ {t['max_single_weight']:.0%}｜行业 ≤ {t['max_industry_weight']:.0%}"
+    print(f"账户 #{args.account}　阈值：单票 ≤ {t['max_single_weight']:.0%}"
+          f"｜行业 ≤ {t['max_industry_weight']:.0%}"
           f"｜平均相关 ≤ {t['max_avg_corr']:.2f}｜当前回撤 ≤ {t['max_drawdown']:.0%}")
     if not alerts:
         print("[risk] 没有触发任何告警。")
         return 0
     for a in alerts:
         print(f"[risk] ⚠ {a['name']}：{a['detail']}")
-
     title, content = risk_alerts.format_alerts(alerts, t)
     if args.dry_run or not args.push:
         print(f"\n{title}\n{content}")
@@ -1008,6 +1090,14 @@ def cmd_trade_risk(args: argparse.Namespace) -> int:
 # **没有实盘分支**：`execute` 只在 plan.mode=sim 且带 --i-know-this-is-sim 时放行。
 def cmd_trade(args: argparse.Namespace) -> int:
     action = getattr(args, "action", None)
+    if action == "account":
+        acc_action = getattr(args, "account_action", None)
+        fn = {"list": cmd_trade_account_list,
+              "new": cmd_trade_account_new}.get(acc_action)
+        if fn is None:
+            print("[trade] 用法：cli trade account list|new", file=sys.stderr)
+            return 2
+        return fn(args)
     fn = {
         "status": cmd_trade_status,
         "snapshot": cmd_trade_snapshot,
@@ -1023,8 +1113,10 @@ def cmd_trade(args: argparse.Namespace) -> int:
         "risk": cmd_trade_risk,
     }.get(action)
     if fn is None:
-        print("[trade] 用法：cli trade run|paper|archive|risk|status|snapshot|plan|"
-              "shadow|calibrate|execute|reconcile|halt", file=sys.stderr)
+        print("[trade] 用法：cli trade account list|new ｜ "
+              "run|paper|archive|risk --account N ｜ "
+              "status|snapshot|plan|shadow|calibrate|execute|reconcile|halt（QMT）",
+              file=sys.stderr)
         return 2
     return fn(args)
 
@@ -1090,6 +1182,11 @@ def cmd_trade_plan(args: argparse.Namespace) -> int:
     from .broker import qmt
 
     mode = (args.mode or config.TRADE_MODE or "paper").lower()
+    if mode == "local" or config.TRADE_MODE == "local":
+        print("[trade] 自建模拟盘已迁移到多账户原价引擎，不再是 --mode local。"
+              "请用：cli trade account new / cli trade run --account N"
+              "（或页面的「模拟持仓」）。券商计划只支持 paper/sim。", file=sys.stderr)
+        return 2
     if mode not in config.TRADE_MODES:
         print(f"[trade] --mode 只能是 {'/'.join(config.TRADE_MODES)}", file=sys.stderr)
         return 2
@@ -1430,6 +1527,13 @@ def run_update_pipeline(progress=None, workers: int | None = None,
     from .sources import limit_src
     n_lim = limit_src.sync_price_limits()
 
+    # 公司行为（权息）事件：raw 之后采一次。失败不阻断更新 —— 它只影响模拟账户的
+    # 推进闸门（缺核对时会停下来），不该把行情更新一起拖挂。
+    say("corporate")
+    rc = cmd_corporate(_ns("corporate"))
+    if rc != 0:
+        print(f"[corporate] 公司行为采集失败（退出码 {rc}），本次更新继续")
+
     # 行业分类只补空表：作者机器上已有证监会口径的数据不能被悄悄换掉
     with db.session() as conn:
         has_industry = db.table_has_rows(conn, "industry_map")
@@ -1470,27 +1574,45 @@ def run_update_pipeline(progress=None, workers: int | None = None,
     if rc != 0:
         print(f"[quality] 复权异常扫描失败（退出码 {rc}），本次更新继续")
 
-    # 自建模拟盘增量推进（可选）：只结算上次之后的新交易日，历史净值不重算。
-    # 失败不阻断更新的其余部分 —— 模拟盘是消费端，不该因为它把数据更新拖挂。
+    # 模拟账户增量推进（可选）：只结算上次之后的新交易日，历史净值不重算。
+    # **只推进 active 的 strategy 账户**：手动账户只能由用户自己下单推进，
+    # 归档与旧研究账户一律只读。单个账户失败/受阻不阻断其余账户与本次更新。
     paper_info: dict | None = None
     if paper:
         say("paper")
+        from .broker import accounts as accounts_mod
         from .broker import sim
+        info: list[dict] = []
+        conn = db.connect()
         try:
-            with db.session() as conn:
-                if sim.last_settled_date(conn) is None:
-                    print("[paper] 还没有模拟盘曲线，跳过"
-                          "（首次：cli trade run --from <日期>）")
+            targets = [dict(r) for r in conn.execute(
+                "SELECT id, name FROM paper_account WHERE status='active'"
+                " AND kind='strategy' ORDER BY id")]
+            if not targets:
+                print("[paper] 没有 active 的策略账户，跳过"
+                      "（建一个：cli trade account new --kind strategy ...）")
+            for t in targets:
+                try:
+                    with accounts_mod.account_write_lock(conn, t["id"]):
+                        st = sim.advance(conn, account_id=t["id"])
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[paper] #{t['id']}「{t['name']}」推进失败："
+                          f"{type(exc).__name__}: {exc}")
+                    info.append({"id": t["id"], "error": str(exc)})
+                    continue
+                if st.get("blocked_reason"):
+                    print(f"[paper] #{t['id']}「{t['name']}」推进到 "
+                          f"{st['settled_through']}（+{st['days']} 日），"
+                          f"数据缺口：{st['blocked_reason']}")
                 else:
-                    p = sim.resume_params(conn)
-                    c = float(sim.meta_get(conn, "initial_cash") or 1_000_000.0)
-                    st = sim.run(conn, cash=c, **p)
-                    paper_info = {"days": st["days"], "total": st["final_total"],
-                                  "return": st["return"]}
-                    print(f"[paper] 推进 {st['days']} 个交易日，"
-                          f"净值 {st['final_total']:,.0f}（{st['return']:+.2%}）")
-        except Exception as exc:  # noqa: BLE001
-            print(f"[paper] 推进失败：{type(exc).__name__}: {exc}（本次更新继续）")
+                    print(f"[paper] #{t['id']}「{t['name']}」推进到 "
+                          f"{st['settled_through']}（+{st['days']} 日）")
+                info.append({"id": t["id"], "days": st["days"],
+                             "settled_through": st["settled_through"],
+                             "blocked_reason": st.get("blocked_reason")})
+        finally:
+            conn.close()
+        paper_info = {"accounts": info} if info else None
 
     say("done")
     return {"ok": True, "price_limit_rows": n_lim, "alert_hits": n_hits,
@@ -1518,8 +1640,8 @@ def build_parser() -> argparse.ArgumentParser:
     up.add_argument("--workers", type=int, default=config.TDX_WORKERS,
                     help="日K 采集并发线程数（默认 8）")
     up.add_argument("--paper", action="store_true",
-                    help="更新后把自建模拟盘增量推进到今天（耗时以分钟计，默认关；"
-                         "首次仍需先手动 cli trade run --from <日期>）")
+                    help="更新后把所有 active 的策略模拟账户推进到今天"
+                         "（耗时以分钟计，默认关；手动账户需自己在页面/CLI 推进）")
     up.set_defaults(func=lambda ns: (run_update_pipeline(
         workers=ns.workers, paper=ns.paper), 0)[1])
 
@@ -1566,6 +1688,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_concept)
 
     sub.add_parser("patterns", help="计算三升底形态").set_defaults(func=cmd_patterns)
+
+    sp = sub.add_parser("corporate", help="采集公司行为（权息）事件；只发现事件，"
+                                          "入账时间表由用户在页面上核对")
+    sp.add_argument("--symbols", default=None,
+                    help="只采这些代码（逗号分隔）；缺省 = 全部有行情覆盖的股票")
+    sp.add_argument("--workers", type=int, default=8, help="并发线程数")
+    sp.set_defaults(func=cmd_corporate)
 
     sp = sub.add_parser("factors", help="多因子评估：全样本 IC/IR、分层收益、相关矩阵")
     sp.add_argument("--period", type=int, default=config.DEFAULT_PERIOD,
@@ -1625,36 +1754,51 @@ def build_parser() -> argparse.ArgumentParser:
     tsub = tsp.add_subparsers(dest="action", required=True)
 
     # 自建模拟盘：全程只读库里的日 K，不需要任何券商账号
-    t_run = tsub.add_parser("run", help="自建模拟盘逐日推进：出计划 → 次日撮合 → 盯市")
-    t_run.add_argument("--from", dest="from_date", default=None,
-                       help="起始信号日（**只在首次建曲线时用**；已有曲线时被忽略，"
-                            "曲线起点固定，要改起点请配合 --reset）")
-    t_run.add_argument("--to", dest="to_date", default=None, help="结束日（缺省至今）")
-    t_run.add_argument("--cash", type=float, default=1_000_000.0, help="初始资金（元）")
-    t_run.add_argument("--period", type=int, default=config.DEFAULT_PERIOD,
-                       choices=list(config.PERIODS))
-    t_run.add_argument("--threshold", type=float, default=80.0)
-    t_run.add_argument("--hold", type=int, default=20, help="调仓间隔（交易日）")
-    t_run.add_argument("--max-positions", type=int, default=20)
-    t_run.add_argument("--resonance", action="store_true")
-    t_run.add_argument("--no-exclude-st", action="store_true")
-    t_run.add_argument("--signal", choices=("rps", "composite"), default="rps",
-                       help="信号源：rps 单因子 / composite 多因子等权合成")
-    t_run.add_argument("--max-participation", type=float, default=None,
-                       help="单日最多吃掉该股成交量的比例（默认 0.10，0=不限制）；"
-                            "当日成交量未知时不做限制")
-    t_run.add_argument("--reset", action="store_true", help="先清空模拟盘再跑（不可恢复）")
-    t_run.add_argument("--yes-reset", action="store_true", help="确认 --reset")
-    tsub.add_parser("paper", help="打印模拟盘净值与持仓")
+    # ── 模拟账户（多账户、原价、独立流水）──────────────────────────
+    t_acc = tsub.add_parser("account", help="模拟账户：list 列出 / new 新建")
+    t_acc_sub = t_acc.add_subparsers(dest="account_action", required=True)
+    t_acc_sub.add_parser("list", help="列出全部模拟账户（含已归档与旧研究账户）")
+    t_acc_new = t_acc_sub.add_parser("new", help="新建手动或策略账户")
+    t_acc_new.add_argument("--name", required=True, help="账户名（1–60 字）")
+    t_acc_new.add_argument("--kind", required=True, choices=("manual", "strategy"))
+    t_acc_new.add_argument("--cash", type=float, default=1_000_000.0, help="初始资金（元）")
+    t_acc_new.add_argument("--from", dest="from_date", required=True,
+                           help="起始交易日（必须是有原价数据的市场交易日）")
+    t_acc_new.add_argument("--max-participation", type=float, default=None,
+                           help="单日最多吃掉该股成交量的比例（默认取配置值 0.10）；"
+                                "创建时固化，之后不受环境变量影响")
+    # 策略账户专属参数（manual 不接收）
+    t_acc_new.add_argument("--period", type=int, default=config.DEFAULT_PERIOD,
+                           choices=list(config.PERIODS))
+    t_acc_new.add_argument("--threshold", type=float, default=80.0)
+    t_acc_new.add_argument("--hold", type=int, default=20, help="调仓间隔（交易日）")
+    t_acc_new.add_argument("--max-positions", type=int, default=20)
+    t_acc_new.add_argument("--resonance", action="store_true")
+    t_acc_new.add_argument("--no-exclude-st", action="store_true")
+    t_acc_new.add_argument("--signal", choices=("rps", "composite"), default="rps",
+                           help="信号源：rps 单因子 / composite 多因子等权合成")
 
-    # 曲线归档：跑第二种策略前先把第一种存下来（模拟盘只有一个活动账户）
-    t_arch = tsub.add_parser("archive", help="模拟盘曲线归档：--save 存一份 / --rm 删一份 / 缺省列出")
-    t_arch.add_argument("--save", action="store_true", help="把当前曲线归档一份")
-    t_arch.add_argument("--label", default=None, help="归档名（配合 --save，缺省按信号源+时间生成）")
-    t_arch.add_argument("--rm", type=int, default=None, help="删除指定 id 的归档")
+    # 推进：资金/起点/策略参数都在建账户时给，这里只挑账户与终点
+    t_run = tsub.add_parser("run", help="把某个模拟账户推进到今天（或 --to）")
+    t_run.add_argument("--account", type=int, required=True, help="账户 id")
+    t_run.add_argument("--to", dest="to", default=None,
+                       help="推进到哪一天（缺省 = 最新完整市场交易日）")
+
+    t_paper = tsub.add_parser("paper", help="打印某个模拟账户的净值与持仓")
+    t_paper.add_argument("--account", type=int, required=True)
+
+    # 曲线归档：--account 归档该账户当前曲线；--list-history 只读列出全部历史归档
+    t_arch = tsub.add_parser("archive", help="归档账户曲线（--account）或列出历史（--list-history）")
+    t_arch_group = t_arch.add_mutually_exclusive_group(required=True)
+    t_arch_group.add_argument("--account", type=int, default=None,
+                              help="归档这个账户当前的曲线")
+    t_arch_group.add_argument("--list-history", action="store_true",
+                              help="只读列出全部历史曲线归档（含迁移前的 HFQ 口径）")
+    t_arch.add_argument("--label", default=None, help="归档名（缺省按信号源+账户+时间生成）")
 
     # 组合风险体检：默认只打印，--push 才推微信（与 alert push 同一套约定）
-    t_risk = tsub.add_parser("risk", help="模拟盘组合风险体检（集中度/相关性/回撤）")
+    t_risk = tsub.add_parser("risk", help="某个账户的组合风险体检（集中度/相关性/回撤）")
+    t_risk.add_argument("--account", type=int, required=True)
     t_risk.add_argument("--push", action="store_true", help="有告警时推到手机（默认只打印）")
     t_risk.add_argument("--dry-run", action="store_true", help="只打印推送内容，不发送")
     t_risk.add_argument("--max-single", type=float, default=None,

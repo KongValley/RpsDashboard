@@ -27,10 +27,12 @@ PERIODS = config.PERIODS
 PERIODS_DEFAULT = config.DEFAULT_PERIOD
 
 
-@pytest.fixture()
-def seeded(tmp_path, monkeypatch):
-    """建一个装好合成数据的临时库，并把 config.DB_PATH 指过去。"""
-    path = tmp_path / "api.db"
+def _make_seeded_db(path, monkeypatch):
+    """建一个装好合成数据的临时库，并把 config.DB_PATH 指过去。
+
+    只负责**造库**；发请求的客户端由调用方用 `with TestClient(...)` 打开 ——
+    不进上下文的话 lifespan（启动迁移）根本不会跑。
+    """
     conn = sqlite3.connect(str(path))
     conn.executescript(dbmod.SCHEMA)
 
@@ -66,9 +68,17 @@ def seeded(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "DB_PATH", path)
     import rpsboard.api as apimod
     monkeypatch.setattr(apimod, "_cache", {"conn": None, "opened": None})
+    return df, ind
 
+
+@pytest.fixture()
+def seeded(tmp_path, monkeypatch):
+    """装好合成数据的临时库 + **已进入 lifespan** 的客户端。"""
     from rpsboard.api import create_app
-    return TestClient(create_app()), df, ind
+
+    df, ind = _make_seeded_db(tmp_path / "api.db", monkeypatch)
+    with TestClient(create_app()) as client:
+        yield client, df, ind
 
 
 # ── meta ────────────────────────────────────────────────────────────
@@ -268,20 +278,21 @@ def test_review_day_breadth_limits_and_signals(seeded):
     assert fallback["date"] == day
 
 
-def test_review_day_on_empty_db(monkeypatch):
-    """空库不 500：返回空结构并给出提示。"""
+def test_review_day_on_empty_db(tmp_path, monkeypatch):
+    """空库不 500：返回空结构并给出提示。
+
+    用**临时文件库**（不是每次 connect 都新建的内存库）：启动迁移要真的跑过，
+    后续请求才是在「已迁移但没数据」的库上回答 —— 那才是真实的首启状态。
+    """
     import rpsboard.api as apimod
     from rpsboard.api import create_app, perf
 
-    def fresh():
-        c = sqlite3.connect(":memory:", check_same_thread=False)
-        c.row_factory = sqlite3.Row
-        return c
-
-    monkeypatch.setattr(dbmod, "connect", fresh)
+    path = tmp_path / "empty_review.db"
+    monkeypatch.setattr(config, "DB_PATH", path)
     monkeypatch.setattr(perf, "_append_jsonl", lambda entry: None)
     monkeypatch.setattr(apimod, "_cache", {"conn": None, "opened": None})
-    body = TestClient(create_app()).get("/api/review/day").json()
+    with TestClient(create_app()) as c:
+        body = c.get("/api/review/day").json()
     assert body["date"] is None and body["breadth"] is None
     assert body["limit_up"] == [] and body["message"]
 
@@ -506,17 +517,26 @@ def test_empty_db_graceful(tmp_path, monkeypatch):
     monkeypatch.setattr(apimod, "_cache", {"conn": None, "opened": None})
     from rpsboard.api import create_app
 
-    client = TestClient(create_app())
-    st = client.get("/api/meta/status").json()
-    assert st["db_ready"] is False
+    with TestClient(create_app()) as client:
+        st = client.get("/api/meta/status").json()
+        assert st["db_ready"] is False
+        # 原价状态也要能读（还没采过 = 全 None 而不是 500）
+        assert st["raw_state"]["market_date"] is None
+        assert st["raw_state"]["latest_complete_date"] is None
 
-    rank = client.get("/api/rps/ranking").json()
-    assert rank["rows"] == [] and rank["total"] == 0
+        rank = client.get("/api/rps/ranking").json()
+        assert rank["rows"] == [] and rank["total"] == 0
 
-    assert client.get("/api/rps/sector").status_code == 200
-    assert client.get("/api/rps/heatmap").status_code == 200
-    assert client.get("/api/meta/industries").json() == []
-    assert client.get("/api/meta/dates").json() == []
+        assert client.get("/api/rps/sector").status_code == 200
+        assert client.get("/api/rps/heatmap").status_code == 200
+        assert client.get("/api/meta/industries").json() == []
+        assert client.get("/api/meta/dates").json() == []
+        # 空库也要能打开模拟持仓与工具（纯计算工具不依赖行情）
+        assert client.get("/api/portfolio/accounts").json()["rows"] == []
+        assert client.post("/api/tools/round-trip", json={
+            "symbol": "000001", "volume": 1000, "buy_price": 10.0,
+            "sell_price": 11.0, "trade_date": "2026-01-05"}).json()["net_pnl"] \
+            == pytest.approx(984.29)
 
 
 def test_ranking_core_columns_present(seeded):
@@ -855,7 +875,7 @@ def trade_client(seeded, tmp_path, monkeypatch):
     monkeypatch.setattr(config, "TRADE_HALT_FILE", tmp_path / "trade.halt")
     monkeypatch.setattr(config, "TRADE_MODE", "paper")
     monkeypatch.setattr(trade_api, "_summary_cache", {})
-    return seeded[0]
+    yield seeded[0]
 
 
 def _seed_trade_rows(conn, plan_date="2026-01-01"):
@@ -1037,140 +1057,187 @@ def test_trade_endpoints_tolerate_empty_db(trade_client):
     assert s["plan"] is None and s["positions"] == [] and s["reconcile"] == []
 
 
-def test_trade_paper_endpoint_shape(seeded, tmp_path, monkeypatch):
-    """自建模拟盘端点：空库返回空结构（days=0），不 500。"""
-    client, *_ = seeded
-    body = client.get("/api/trade/paper").json()
-    assert body["days"] == 0 and body["curve"] == [] and body["positions"] == []
+def _portfolio_seed(tmp_path, monkeypatch):
+    """建一个可用的多账户库并返回 (客户端, 账户 id)。"""
+    from rpsboard.api import create_app
+
+    from .test_portfolio import seed_portfolio_smoke
+
+    path = tmp_path / "portfolio_api.db"
+    info = seed_portfolio_smoke(str(path))
+    monkeypatch.setattr(config, "DB_PATH", path)
+    import rpsboard.api as apimod
+    monkeypatch.setattr(apimod, "_cache", {"conn": None, "opened": None})
+    client = TestClient(create_app())
+    return client, info
 
 
-def test_trade_paper_endpoint_returns_nav_and_positions(seeded, tmp_path, monkeypatch):
-    client, *_ = seeded
+def test_portfolio_accounts_endpoint(tmp_path, monkeypatch):
+    """账户列表/新建/详情：空库不 500，新建后能查到，参数会被校验。"""
+    client, info = _portfolio_seed(tmp_path, monkeypatch)
+    with client:
+        rows = client.get("/api/portfolio/accounts").json()["rows"]
+        assert {r["kind"] for r in rows} == {"manual", "strategy"}
+        # 未知字段直接 422（不能静默忽略）
+        bad = client.post("/api/portfolio/accounts", json={
+            "name": "x", "kind": "manual", "cash": 1000.0,
+            "start_date": info["start_date"], "nope": 1})
+        assert bad.status_code == 422
+        # 起点必须是交易日
+        bad2 = client.post("/api/portfolio/accounts", json={
+            "name": "x", "kind": "manual", "cash": 1000.0,
+            "start_date": "1999-01-01"})
+        assert bad2.status_code == 409
+        ok = client.post("/api/portfolio/accounts", json={
+            "name": "接口手动", "kind": "manual", "cash": 50000.0,
+            "start_date": info["start_date"]})
+        assert ok.status_code == 200 and ok.json()["ok"] is True
+        aid = ok.json()["account"]["id"]
+        detail = client.get(f"/api/portfolio/accounts/{aid}").json()
+        assert detail["account"]["name"] == "接口手动"
+        # 建账户当天就有一条全现金净值（否则页面上新账户显示权益 0）
+        assert detail["days"] == 1 and len(detail["curve"]) == 1
+        assert detail["total"] == 50000.0 and detail["positions"] == []
+        assert detail["account"]["price_basis"] == "raw"
+        assert client.get("/api/portfolio/accounts/999999").status_code == 404
+        # 查得比账户起点还早：明确告知「那天还没有这个账户」，不前跳到首日
+        early = client.get(f"/api/portfolio/accounts/{aid}",
+                           params={"date": "1999-01-04"}).json()
+        assert early["days"] == 0 and early["requested_date"] == "1999-01-04"
+        assert early["message"] == "该日期账户尚未建立"
+
+
+def test_portfolio_order_flow_and_history(tmp_path, monkeypatch):
+    """下单 → 推进 → 成交；历史查询是「截至」而不是「当日」。"""
+    client, info = _portfolio_seed(tmp_path, monkeypatch)
+    aid = info["manual_account_id"]
+    with client:
+        client.post(f"/api/portfolio/accounts/{aid}/advance",
+                    json={"to_date": info["start_date"]})
+        created = client.post(f"/api/portfolio/accounts/{aid}/orders", json={
+            "request_id": "api-1", "symbol": "000001", "side": "buy",
+            "volume": 1000, "price": 10.0, "thesis": "接口冒烟"})
+        assert created.status_code == 200, created.text
+        order = created.json()["order"]
+        assert order["status"] == "pending" and order["thesis"] == "接口冒烟"
+        # 同一 request_id 重复提交 → 复用同一笔
+        again = client.post(f"/api/portfolio/accounts/{aid}/orders", json={
+            "request_id": "api-1", "symbol": "000001", "side": "buy",
+            "volume": 1000, "price": 10.0, "thesis": "接口冒烟"})
+        assert again.json()["order"]["order_id"] == order["order_id"]
+        # 内容冲突 → 409
+        conflict = client.post(f"/api/portfolio/accounts/{aid}/orders", json={
+            "request_id": "api-1", "symbol": "000002", "side": "buy",
+            "volume": 1000, "price": 10.0})
+        assert conflict.status_code == 409
+
+        # 回看「挂单当天」：还没成交
+        at0 = client.get(f"/api/portfolio/accounts/{aid}/orders",
+                         params={"date": info["start_date"]}).json()
+        assert at0["rows"][0]["filled_volume"] == 0
+
+        client.post(f"/api/portfolio/accounts/{aid}/advance", json={})
+        latest = client.get(f"/api/portfolio/accounts/{aid}/orders").json()
+        assert latest["rows"][0]["status"] == "filled"
+        fills = client.get(f"/api/portfolio/accounts/{aid}/fills").json()
+        assert fills["total"] == 1 and fills["rows"][0]["volume"] == 1000
+        # 历史仍然回答「当时」的样子
+        still = client.get(f"/api/portfolio/accounts/{aid}/orders",
+                           params={"date": info["start_date"]}).json()
+        assert still["rows"][0]["filled_volume"] == 0
+
+        # 复盘文本可单独修改，且不能改数量
+        oid = order["order_id"]
+        rn = client.post(
+            f"/api/portfolio/accounts/{aid}/orders/{oid}/review",
+            json={"review_note": "事后看这单买早了"})
+        assert rn.status_code == 200
+        assert rn.json()["order"]["review_note"] == "事后看这单买早了"
+        assert rn.json()["order"]["volume"] == 1000
+
+
+def test_portfolio_export_csv_and_risk(tmp_path, monkeypatch):
+    client, info = _portfolio_seed(tmp_path, monkeypatch)
+    aid = info["strategy_account_id"]
+    with client:
+        client.post(f"/api/portfolio/accounts/{aid}/advance", json={})
+        for kind in ("nav", "positions", "orders", "fills"):
+            r = client.get(f"/api/portfolio/accounts/{aid}/export.csv",
+                           params={"kind": kind})
+            assert r.status_code == 200
+            first = r.content.decode("utf-8-sig").splitlines()[0]
+            assert first and not first.startswith("HTTP")
+        assert client.get(f"/api/portfolio/accounts/{aid}/export.csv",
+                          params={"kind": "nope"}).status_code == 422
+        risk = client.get(f"/api/portfolio/accounts/{aid}/risk").json()
+        assert risk["account_id"] == aid
+        assert "alerts" in risk and "thresholds" in risk
+
+
+def test_portfolio_archives_and_config(tmp_path, monkeypatch):
+    client, info = _portfolio_seed(tmp_path, monkeypatch)
+    with client:
+        cfg = client.get("/api/portfolio/config").json()
+        assert "participation_default" in cfg and "manual" in cfg["kinds"]
+        # 空归档列表不该 500（迁移前的旧库没有这张表也会被迁移补齐）
+        assert client.get("/api/portfolio/archives").json()["rows"] == []
+
+
+def test_retired_local_routes_are_gone(tmp_path, monkeypatch):
+    """旧的单账户本地模拟盘端点必须**真的下线**（不再返回 JSON）。"""
+    client, _info = _portfolio_seed(tmp_path, monkeypatch)
+    with client:
+        for path in ("/api/trade/paper", "/api/trade/paper/archives",
+                     "/api/trade/risk"):
+            r = client.get(path)
+            body = r.text
+            assert not body.lstrip().startswith("{"), f"{path} 仍返回 JSON"
+        assert client.post("/api/trade/paper/archive",
+                           json={"label": "x"}).status_code == 405
+        assert client.delete("/api/trade/paper/archives/1").status_code == 405
+
+
+def test_trade_summary_excludes_retired_local_rows(tmp_path, monkeypatch):
+    """券商页只显示 QMT 的计划与回报：旧本地流水不能混进来。"""
+    client = trade_client_and_seed(tmp_path, monkeypatch)
+    with client:
+        body = client.get("/api/trade/summary").json()
+        assert body["plan"] is None or body["plan"]["mode"] != "local"
+        assert all(o["broker_order_id"] is None or o["broker_order_id"] < 900_000_000
+                   for o in body["orders"])
+        assert all(f["broker_order_id"] is None or f["broker_order_id"] < 900_000_000
+                   for f in body["fills"])
+
+
+def trade_client_and_seed(tmp_path, monkeypatch):
+    """QMT 交易端点用的客户端 + 一条 local 计划（验证它被过滤掉）。"""
+    from rpsboard.api import create_app
+    from rpsboard.api import trade as trade_api
+
+    path = tmp_path / "trade_filter.db"
+    _make_seeded_db(path, monkeypatch)
+    monkeypatch.setattr(config, "TRADE_HALT_FILE", tmp_path / "trade.halt")
+    monkeypatch.setattr(config, "TRADE_MODE", "paper")
+    monkeypatch.setattr(trade_api, "_summary_cache", {})
     with dbmod.connect() as conn:
-        conn.execute(
-            "INSERT INTO paper_account(id, cash, created_at, updated_at)"
-            " VALUES (1, 500000, '2026-01-01', '2026-01-02')")
-        conn.executemany(
-            "INSERT INTO paper_nav(trade_date, cash, market_value, total, nav, n_positions)"
-            " VALUES (?,?,?,?,?,?)",
-            [("2026-01-01", 900000, 100000, 1000000, 1.0, 1),
-             ("2026-01-02", 920000, 80000, 1000000, 1.0, 1)])
-        conn.execute(
-            "INSERT INTO paper_position(trade_date, symbol, volume, avg_price, close,"
-            " market_value) VALUES ('2026-01-02','000001',1000,10.0,10.5,10500)")
-        conn.commit()
-    body = client.get("/api/trade/paper").json()
-    assert body["days"] == 2 and body["from"] == "2026-01-01"
-    assert [p["symbol"] for p in body["positions"]] == ["000001"]
-    assert len(body["curve"]) == 2
-
-
-# ── 自建模拟盘的归档（策略对照）─────────────────────────────────
-def test_paper_archive_endpoints(trade_client):
-    """归档三个入口：空账户明确报错、归档成功、列表、删除。"""
-    client = trade_client
-    empty = client.post("/api/trade/paper/archive", json={"label": "x"}).json()
-    assert empty["ok"] is False and "无可归档" in empty["error"]
-
-    with dbmod.connect() as conn:
-        conn.execute(
-            "INSERT INTO paper_account(id, cash, created_at, updated_at)"
-            " VALUES (1, 900000, '2026-01-01', '2026-01-02')")
-        conn.executemany(
-            "INSERT INTO paper_nav(trade_date, cash, market_value, total, nav, n_positions)"
-            " VALUES (?,?,?,?,?,?)",
-            [("2026-01-01", 900000, 100000, 1000000, 1.0, 1),
-             ("2026-01-02", 920000, 80000, 1000000, 1.0, 1)])
-        conn.commit()
-
-    created = client.post("/api/trade/paper/archive", json={"label": "RPS60"}).json()
-    assert created["ok"] is True and created["label"] == "RPS60"
-    rows = client.get("/api/trade/paper/archives").json()["rows"]
-    assert [r["label"] for r in rows] == ["RPS60"]
-    assert rows[0]["days"] == 2 and len(rows[0]["curve"]) == 2
-
-    assert client.delete(f"/api/trade/paper/archives/{created['id']}").json()["ok"] is True
-    assert client.get("/api/trade/paper/archives").json()["rows"] == []
-
-
-def test_paper_export_csv(trade_client):
-    """模拟盘导出：空库给带表头的空文件；有数据时转义正确、公式注入被前缀。"""
-    import io
-
-    client = trade_client
-    empty = client.get("/api/trade/paper/export.csv")
-    assert empty.status_code == 200
-    assert empty.content.decode("utf-8-sig").splitlines()[0].startswith("日期")
-
-    with dbmod.connect() as conn:
-        conn.execute(
-            "INSERT INTO paper_account(id, cash, created_at, updated_at)"
-            " VALUES (1, 900000, '2026-01-05', '2026-01-05')")
-        conn.executemany(
-            "INSERT INTO paper_nav(trade_date, cash, market_value, total, nav, n_positions)"
-            " VALUES (?,?,?,?,?,?)",
-            [("2026-01-05", 900000, 100000, 1000000, 1.0, 1),
-             ("2026-01-06", 920000, 80000, 1000000, 1.0, 1)])
+        cur = conn.execute(
+            "INSERT INTO trade_plan(plan_date, mode, params, cash_budget, status,"
+            " note, created_at) VALUES ('2026-01-01','local','{}',100000,"
+            " 'planned','旧本地盘',?)", (dbmod.now(),))
+        pid = int(cur.lastrowid)
         conn.execute(
             "INSERT INTO trade_order(plan_id, trade_date, symbol, side, volume, price,"
-            " status, broker_order_id, err_msg, created_at, updated_at)"
-            " VALUES (1,'2026-01-05','000001','buy',1000,12.1,'pending',900000001,"
-            " '=1+1',?,?)", (dbmod.now(), dbmod.now()))
+            " status, broker_order_id, created_at, updated_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (pid, "2026-01-01", "000001", "buy", 100, 10.0, "filled", 900_000_001,
+             dbmod.now(), dbmod.now()))
         conn.execute(
-            "INSERT INTO trade_fill(trade_date, broker_order_id, broker_trade_id, symbol,"
-            " side, volume, price, traded_at, fee, realized_pnl)"
-            " VALUES ('2026-01-06',900000001,1,'000001','sell',1000,12.5,?,3.2,380.0)",
+            "INSERT INTO trade_fill(trade_date, broker_order_id, broker_trade_id,"
+            " symbol, side, volume, price, traded_at)"
+            " VALUES ('2026-01-01', 900000001, 1, '000001', 'buy', 100, 10.0, ?)",
             (dbmod.now(),))
         conn.commit()
-
-    nav = client.get("/api/trade/paper/export.csv", params={"kind": "nav"})
-    rows = list(csv.reader(io.StringIO(nav.content.decode("utf-8-sig"))))
-    assert rows[0][:2] == ["日期", "现金"]
-    assert len(rows) == 3, "两行净值 + 表头"
-    assert "paper_nav_2026-01-06.csv" in nav.headers["content-disposition"]
-
-    orders = client.get("/api/trade/paper/export.csv",
-                        params={"kind": "orders"}).content.decode("utf-8-sig")
-    assert "'=1+1" in orders, "以 = 开头的文本必须加前缀（CSV 公式注入）"
-
-    fills = client.get("/api/trade/paper/export.csv",
-                       params={"kind": "fills"}).content.decode("utf-8-sig")
-    assert "3.2000" in fills and "380.0000" in fills, "费用与已实现盈亏要导出"
-
-
-def test_trade_paper_endpoint_supports_date_and_review(seeded):
-    """`/api/trade/paper?date=` 回看历史某日（就近回退），并带复盘字段。"""
-    client, *_ = seeded
-    with dbmod.connect() as conn:
-        conn.execute(
-            "INSERT INTO paper_account(id, cash, created_at, updated_at)"
-            " VALUES (1, 900000, '2026-01-01', '2026-01-02')")
-        conn.executemany(
-            "INSERT INTO paper_nav(trade_date, cash, market_value, total, nav, n_positions)"
-            " VALUES (?,?,?,?,?,?)",
-            [("2026-01-01", 900000, 100000, 1000000, 1.0, 1),
-             ("2026-01-02", 920000, 80000, 1000000, 1.0, 1)])
-        conn.execute(
-            "INSERT INTO paper_position(trade_date, symbol, volume, avg_price, close,"
-            " market_value) VALUES ('2026-01-01','000001',1000,10.0,10.5,10500)")
-        conn.execute(
-            "INSERT INTO paper_position(trade_date, symbol, volume, avg_price, close,"
-            " market_value) VALUES ('2026-01-02','000002',500,20.0,21.0,10500)")
-        conn.commit()
-
-    d1 = client.get("/api/trade/paper", params={"date": "2026-01-01"}).json()
-    assert d1["date"] == "2026-01-01"
-    assert [p["symbol"] for p in d1["positions"]] == ["000001"], "回看日应给那天的持仓"
-    assert d1["nav_row"]["trade_date"] == "2026-01-01"
-    assert "review" in d1 and d1["review"]["summary"]["round_trips"] == 0
-
-    # 早于曲线第一天 → 就近落到第一天（不是静默换成最新一天）
-    early = client.get("/api/trade/paper", params={"date": "2025-12-28"}).json()
-    assert early["date"] == "2026-01-01"
-
-    latest = client.get("/api/trade/paper").json()
-    assert latest["date"] == "2026-01-02"
-    assert [p["symbol"] for p in latest["positions"]] == ["000002"]
+    return TestClient(create_app())
 
 
 # ── 因子评估 ────────────────────────────────────────────────────────
@@ -1272,21 +1339,82 @@ def test_read_sql_missing_table_and_real_errors():
         conn.close()
 
 
-def test_meta_lists_before_init(monkeypatch):
-    """全新未建表的库：日期/行业/概念清单都是空列表，不是 500。"""
+def test_meta_lists_before_init(tmp_path, monkeypatch):
+    """全新未建表的库：日期/行业/概念清单都是空列表，不是 500。
+
+    临时**文件**库：启动迁移会建好表结构（但没有任何数据），请求要在这上面
+    正常回答 —— 用内存库替身就验证不到「启动迁移之后仍为空」这件事。
+    """
     import rpsboard.api as apimod
     from rpsboard.api import create_app, perf
 
-    def fresh_conn():
-        c = sqlite3.connect(":memory:", check_same_thread=False)
-        c.row_factory = sqlite3.Row
-        return c
-
-    monkeypatch.setattr(dbmod, "connect", fresh_conn)
+    path = tmp_path / "brand_new.db"
+    monkeypatch.setattr(config, "DB_PATH", path)
     monkeypatch.setattr(perf, "_append_jsonl", lambda entry: None)   # 不写真实日志
     monkeypatch.setattr(apimod, "_cache", {"conn": None, "opened": None})
-    client = TestClient(create_app())
-    for ep in ("/api/meta/dates", "/api/meta/industries", "/api/rps/concepts"):
-        r = client.get(ep)
-        assert r.status_code == 200, f"{ep} → {r.status_code}"
-        assert r.json() == [], ep
+    with TestClient(create_app()) as client:
+        for ep in ("/api/meta/dates", "/api/meta/industries", "/api/rps/concepts"):
+            r = client.get(ep)
+            assert r.status_code == 200, f"{ep} → {r.status_code}"
+            assert r.json() == [], ep
+    # lifespan 结束后共享连接必须已被清掉（否则进程里留着半迁移状态）
+    assert apimod._cache["conn"] is None
+
+
+#: 改造前的单账户模拟盘 DDL（启动迁移的输入）
+_OLD_PAPER_DDL = """
+CREATE TABLE paper_account (
+  id INTEGER PRIMARY KEY CHECK (id = 1), cash REAL NOT NULL,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE paper_nav (
+  trade_date TEXT NOT NULL, cash REAL NOT NULL, market_value REAL NOT NULL,
+  total REAL NOT NULL, nav REAL NOT NULL, n_positions INTEGER NOT NULL,
+  filled_orders INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (trade_date));
+CREATE TABLE paper_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+"""
+
+
+# ── 启动生命周期（lifespan）─────────────────────────────────────────
+def test_lifespan_migrates_old_db_before_serving(tmp_path, monkeypatch):
+    """旧结构库：进入 lifespan 就完成迁移，**第一个请求**就能用。
+
+    以前 API 进程从不调用 `db.init_db()`，于是「代码已升级、库还停在旧结构」
+    时第一个读新列的请求直接 500。现在启动即迁移，失败就拒绝启动。
+    """
+    import rpsboard.api as apimod
+    from rpsboard.api import create_app
+
+    path = tmp_path / "old_api.db"
+    conn = sqlite3.connect(str(path))
+    conn.executescript(_OLD_PAPER_DDL)
+    conn.execute("INSERT INTO paper_account VALUES (1, 5000.0, '2026-01-01', '2026-01-01')")
+    conn.execute("INSERT INTO paper_nav VALUES ('2026-01-01',5000,0,5000,1.0,0,0)")
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(config, "DB_PATH", path)
+    monkeypatch.setattr(apimod, "_cache", {"conn": None, "opened": None})
+    with TestClient(create_app()) as client:
+        assert client.get("/api/meta/status").status_code == 200
+        rows = client.get("/api/portfolio/accounts").json()["rows"]
+        assert [r["kind"] for r in rows] == ["legacy_hfq"], "旧曲线进了只读 legacy 账户"
+        assert client.get(f"/api/portfolio/accounts/{rows[0]['id']}").status_code == 200
+    assert [p for p in tmp_path.iterdir() if "pre-workbench" in p.name], \
+        "启动迁移也要留备份"
+    assert apimod._cache["conn"] is None, "退出时共享连接必须清掉"
+
+
+def test_lifespan_refuses_to_start_when_migration_fails(tmp_path, monkeypatch):
+    """迁移失败 → 拒绝启动（半迁移状态提供服务比启动失败危险得多）。"""
+    import rpsboard.api as apimod
+    from rpsboard.api import create_app
+
+    def boom(*_a, **_k):
+        raise RuntimeError("迁移炸了")
+
+    monkeypatch.setattr(apimod.db, "init_db", boom)
+    monkeypatch.setattr(config, "DB_PATH", tmp_path / "x.db")
+    monkeypatch.setattr(apimod, "_cache", {"conn": None, "opened": None})
+    with pytest.raises(RuntimeError, match="迁移炸了"):
+        with TestClient(create_app()):
+            pass

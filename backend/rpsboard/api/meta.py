@@ -91,6 +91,42 @@ def _quality(conn) -> dict:
     return value
 
 
+def _raw_state(conn) -> dict:
+    """原价行情与采集进度（模拟账户的数据就绪状态）。
+
+    刻意与 HFQ 分开显示：`last_bar_date` 是后复权的最新日（研究口径），而模拟
+    账户要的是**不复权**行情 + 全市场完整日检查点。以前页面只有一个「日K 最新
+    日期」，用户看不出「原价还没采」和「原价采了一半」，只能靠猜。
+    """
+    state: dict = {
+        "market_date": None,
+        "latest_complete_date": None,
+        "last_raw_date": None,
+        "failed_symbols": [],
+        "checkpoint_error": None,
+    }
+    try:
+        state["market_date"] = db.market_date(conn)
+        state["last_raw_date"] = (
+            conn.execute("SELECT MAX(date) AS d FROM raw_bar").fetchone()["d"]
+            if db.table_exists(conn, "raw_bar") else None)
+        try:
+            cp = db.read_raw_checkpoint(conn)
+        except RuntimeError as exc:
+            # 检查点损坏要**显示出来**，不能静默当作「没采过」
+            state["checkpoint_error"] = str(exc)
+            cp = None
+        if cp:
+            state["latest_complete_date"] = cp.get("latest_complete_date")
+            failed = list(cp.get("raw_failed_symbols") or [])
+            state["failed_symbols"] = failed[:50]
+            state["failed_count"] = len(failed)
+            state["scope"] = cp.get("scope")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("读取原价状态失败: %s", exc)
+    return state
+
+
 @router.get("/status")
 def status() -> dict:
     conn = db.connect()
@@ -127,6 +163,7 @@ def status() -> dict:
             "last_bar_date": last_bar,
             "unmapped_symbols": unmapped,
             "quality": quality,
+            "raw_state": _raw_state(conn),
             "source": config.DATA_SOURCE,
             "periods": list(config.PERIODS),
             "last_collect_log": last,

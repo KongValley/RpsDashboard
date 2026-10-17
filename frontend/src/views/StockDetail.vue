@@ -7,7 +7,7 @@
     <template v-else>
       <div class="panel head">
         <div class="flex items-center gap-3">
-          <router-link to="/" class="btn">← 返回</router-link>
+          <router-link :to="backLinkTo" class="btn">← 返回 {{ backLabelText }}</router-link>
           <h2 style="margin:0">{{ info.name }}</h2>
           <span class="mono muted">{{ info.symbol }} · {{ info.exchange?.toUpperCase() }}</span>
           <span v-if="info.is_st" class="badge st">ST</span>
@@ -18,7 +18,7 @@
           <span v-if="dataDate"> · 数据日期 {{ dataDate }}</span>
           <label style="margin-left:12px">回看
             <select v-model="reviewDate" style="margin-left:6px;font-size:12px"
-                    @change="reloadAll">
+                    @change="applyDate">
               <option value="">最新</option>
               <option v-for="d in availableDates" :key="d" :value="d">{{ d }}</option>
             </select>
@@ -117,6 +117,10 @@
         </table>
       </div>
 
+      <div class="panel" style="margin-top:12px">
+        <ReviewNote :date="dataDate || ''" :symbol="symbol" />
+      </div>
+
       <div v-if="industryRps" class="panel" style="margin-top:12px">
         <h3 style="margin-top:0">所属行业强弱 · {{ info.industry }}</h3>
         <div class="flex gap-3" style="flex-wrap:wrap">
@@ -153,12 +157,21 @@
 
 <script setup>
 import { ref, computed, onMounted, watch } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { stockApi, metaApi } from '../api'
 import { usePeriods } from '../composables/usePeriods'
 import { useLatestRequest } from '../composables/useLatestRequest'
+import ReviewNote from '../components/ReviewNote.vue'
+import { backLabel, backLink } from '../composables/useStockLinks'
 
 const route = useRoute()
+const router = useRouter()
+
+// 返回链接与文案都走公共白名单（不接受 URL 里的任意返回地址）
+const backFrom = typeof route.query.from === 'string' ? route.query.from : ''
+const backLabelText = backLabel(backFrom)
+const backLinkTo = computed(() => backLink(backFrom, reviewDate.value,
+  { period: route.query.period }))
 const { periods, error: periodsError } = usePeriods()
 const symbol = computed(() => route.params.symbol)
 
@@ -170,8 +183,9 @@ const industryRps = ref(null)
 const curve = ref({ dates: [], close: [] })
 const pattern = ref(null)
 const days = ref(250)
-/** 回看日期（空 = 最新）；选项来自 /api/meta/dates，与排行榜同一套 */
-const reviewDate = ref('')
+/** 回看日期（空 = 最新）：**从 URL 初始化**，这样从复盘页点进来就停在那天。
+ *  选项来自 /api/meta/dates，与排行榜同一套。 */
+const reviewDate = ref(typeof route.query.date === 'string' ? route.query.date : '')
 const availableDates = ref([])
 /** RPS 曲线配色（按系列下标取用，周期数增减都不改写法） */
 const RPS_COLORS = ['#4c9aff', '#f6465d', '#f0a020', '#2ebd85', '#b06cf0', '#38bdf8']
@@ -330,6 +344,17 @@ function rpsColor(v) {
   if (v >= 70) return '#f0a020'
   if (v >= 50) return '#4c9aff'
   return '#2ebd85'
+}
+
+/** 切日期只改 URL：App 以 fullPath 重挂载，由新实例统一加载一次。 */
+function applyDate() {
+  router.replace({
+    path: `/stock/${symbol.value}`,
+    query: {
+      ...(reviewDate.value ? { date: reviewDate.value } : {}),
+      ...(typeof route.query.from === 'string' ? { from: route.query.from } : {}),
+    },
+  })
 }
 
 function reloadAll() {

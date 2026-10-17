@@ -11,7 +11,8 @@
 from __future__ import annotations
 
 import pandas as pd
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, Field
 
 from .. import config, db
 from ..analytics.limits import daily_limit_lists
@@ -50,6 +51,83 @@ def _limit_streaks(conn, date: str, symbols: list[str]) -> dict[str, int]:
                 break
         out[sym] = n
     return out
+
+
+class NoteIn(BaseModel):
+    date: str | None = None
+    symbol: str = ""
+    note: str = Field(default="", max_length=10000)
+
+
+def _effective(conn, date: str | None) -> str | None:
+    """把请求日期归一到**实际生效的交易日**（就近回退）。"""
+    return resolve_date(conn, date)
+
+
+def _note_symbol(raw: str) -> str:
+    sym = str(raw or "").strip()
+    if sym and not (len(sym) == 6 and sym.isascii() and sym.isdigit()):
+        raise HTTPException(status_code=422, detail="个股笔记的 symbol 必须是 6 位代码")
+    return sym
+
+
+@router.get("/note")
+def get_note(date: str | None = None, symbol: str = "") -> dict:
+    """读某日笔记：`symbol=''` 是市场笔记，6 位代码是个股笔记。
+
+    空行情库返回**同构空结构**（不是 404/500），页面不必写分支。
+    """
+    conn = db.connect()
+    try:
+        sym = _note_symbol(symbol)
+        d = _effective(conn, date)
+        if not d or not db.table_exists(conn, "review_note"):
+            return {"date": None, "symbol": sym, "note": "", "updated_at": None}
+        row = conn.execute(
+            "SELECT note, updated_at FROM review_note WHERE date=? AND symbol=?",
+            (d, sym)).fetchone()
+        return {"date": d, "symbol": sym,
+                "note": row["note"] if row else "",
+                "updated_at": row["updated_at"] if row else None}
+    finally:
+        conn.close()
+
+
+@router.post("/note")
+def save_note(body: NoteIn) -> dict:
+    """写某日笔记。**必须落在有效交易日上**：周末日期直接 422 并给出建议生效日，
+    否则笔记会写进一行永远读不到的孤儿记录。空串 = 删除该日笔记。
+    """
+    conn = db.connect()
+    try:
+        sym = _note_symbol(body.symbol)
+        d = _effective(conn, body.date)
+        if not d:
+            raise HTTPException(status_code=409,
+                                detail="数据库为空，无法锚定笔记日期")
+        raw = str(body.date or "").strip()
+        if raw and raw != d:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{raw} 不是有数据的交易日，最近的生效日是 {d}")
+        note = str(body.note or "")
+        if not note.strip():
+            conn.execute("DELETE FROM review_note WHERE date=? AND symbol=?",
+                         (d, sym))
+            conn.commit()
+            return {"ok": True, "date": d, "symbol": sym, "note": "",
+                    "updated_at": None}
+        ts = db.now()
+        conn.execute(
+            "INSERT INTO review_note(date, symbol, note, updated_at) VALUES (?,?,?,?)"
+            " ON CONFLICT(date, symbol) DO UPDATE SET note=excluded.note,"
+            " updated_at=excluded.updated_at",
+            (d, sym, note, ts))
+        conn.commit()
+        return {"ok": True, "date": d, "symbol": sym, "note": note,
+                "updated_at": ts}
+    finally:
+        conn.close()
 
 
 @router.get("/day")

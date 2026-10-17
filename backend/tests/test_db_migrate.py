@@ -9,6 +9,7 @@ from __future__ import annotations
 import sqlite3
 
 import pandas as pd
+import pytest
 from rpsboard import config
 from rpsboard import db as dbmod
 
@@ -185,3 +186,135 @@ def test_full_materialize_drops_and_rebuilds_period_index(tmp_path):
             f"全量重算后覆盖索引必须重建：{indexes.get('idx_rps_date_period')}"
     finally:
         conn.close()
+
+
+# ── 模拟盘多账户迁移 ────────────────────────────────────────────────
+#: 改造前的单账户 DDL（paper_* 没有 account_id；trade_fill 没有费用列）
+OLD_PAPER_DDL = """
+CREATE TABLE paper_account (
+  id INTEGER PRIMARY KEY CHECK (id = 1), cash REAL NOT NULL,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE paper_position (
+  trade_date TEXT NOT NULL, symbol TEXT NOT NULL, volume INTEGER NOT NULL,
+  avg_price REAL NOT NULL, close REAL NOT NULL, market_value REAL NOT NULL,
+  PRIMARY KEY (trade_date, symbol));
+CREATE INDEX idx_paper_position_date ON paper_position(trade_date);
+CREATE TABLE paper_nav (
+  trade_date TEXT NOT NULL, cash REAL NOT NULL, market_value REAL NOT NULL,
+  total REAL NOT NULL, nav REAL NOT NULL, n_positions INTEGER NOT NULL,
+  filled_orders INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (trade_date));
+CREATE TABLE paper_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+"""
+
+
+def _make_old_paper_db(path) -> None:
+    conn = sqlite3.connect(str(path))
+    conn.executescript(OLD_PAPER_DDL)
+    conn.executescript(OLD_FILL_DDL)
+    conn.execute("INSERT INTO paper_account VALUES (1, 5000.0, '2026-01-01', '2026-01-01')")
+    conn.execute("INSERT INTO paper_nav VALUES ('2026-01-01',4000,1100,5100,1.02,1,1)")
+    conn.execute("INSERT INTO paper_position VALUES ('2026-01-01','000001',100,10.0,11.0,1100.0)")
+    conn.execute("INSERT INTO paper_meta VALUES ('initial_cash','5000.0')")
+    conn.execute("INSERT INTO trade_fill VALUES ('2026-01-01',123,1,'000001','buy',100,10.0,'x')")
+    conn.commit()
+    conn.close()
+
+
+def test_paper_migration_preserves_values_and_makes_backup(tmp_path):
+    """迁移：数值原样进 legacy 只读账户，QMT 成交不动，且有迁移前备份。"""
+    path = tmp_path / "old_paper.db"
+    _make_old_paper_db(path)
+    dbmod.init_db(path)
+
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == dbmod.SCHEMA_VERSION
+    acc = dict(conn.execute("SELECT * FROM paper_account").fetchone())
+    assert acc["id"] == 1 and acc["kind"] == "legacy_hfq"
+    assert acc["price_basis"] == "hfq" and acc["status"] == "archived"
+    assert acc["initial_cash"] == 5000.0 and acc["cash"] == 5000.0
+    # 曲线与持仓逐值保留（receivable 是新列，默认 0）
+    nav = dict(conn.execute("SELECT * FROM paper_nav WHERE trade_date='2026-01-01'").fetchone())
+    assert (nav["account_id"], nav["cash"], nav["market_value"], nav["total"], nav["nav"],
+            nav["filled_orders"]) == (1, 4000.0, 1100.0, 5100.0, 1.02, 1)
+    pos = dict(conn.execute("SELECT * FROM paper_position").fetchone())
+    assert (pos["account_id"], pos["symbol"], pos["volume"], pos["cost_basis"]) == \
+        (1, "000001", 100, 1000.0)
+    # QMT 成交原样（只多了费用列，值不变）
+    fill = dict(conn.execute("SELECT * FROM trade_fill").fetchone())
+    assert fill["broker_order_id"] == 123 and fill["volume"] == 100
+    # 费用列是「补出来的」→ legacy 标记 costs_complete=false
+    meta = {r["key"]: r["value"] for r in conn.execute(
+        "SELECT key, value FROM paper_meta WHERE account_id=1")}
+    assert meta["costs_complete"] == "false"
+    conn.close()
+    backups = [p for p in tmp_path.iterdir() if "pre-workbench" in p.name]
+    assert len(backups) == 1, "迁移前必须有且只有一份备份"
+
+
+def test_paper_migration_is_idempotent_and_does_not_rebackup(tmp_path):
+    path = tmp_path / "old_paper2.db"
+    _make_old_paper_db(path)
+    dbmod.init_db(path)
+    after_first = sorted(p.name for p in tmp_path.iterdir() if "pre-workbench" in p.name)
+    dbmod.init_db(path)
+    after_second = sorted(p.name for p in tmp_path.iterdir() if "pre-workbench" in p.name)
+    assert after_first == after_second, "第二次 init 不该再备份"
+    conn = sqlite3.connect(str(path))
+    n = conn.execute("SELECT COUNT(*) FROM paper_account").fetchone()[0]
+    assert n == 1, "重复迁移不该产生重复账户"
+    conn.close()
+
+
+def test_paper_migration_on_empty_db_creates_no_legacy_account(tmp_path):
+    """空库（没有旧账户/净值/持仓）不该凭空造出一个 legacy 账户。"""
+    path = tmp_path / "empty.db"
+    conn = sqlite3.connect(str(path))
+    conn.executescript(OLD_PAPER_DDL)
+    conn.commit()
+    conn.close()
+    dbmod.init_db(path)
+    conn = sqlite3.connect(str(path))
+    assert conn.execute("SELECT COUNT(*) FROM paper_account").fetchone()[0] == 0
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == dbmod.SCHEMA_VERSION
+    conn.close()
+    # 旧结构被**重建**过 → 仍然要给一份备份（备份是按「是否做了破坏性重建」判断的，
+    # 不是按「有没有数据」）；但不该凭空造出 legacy 账户。
+    assert [p for p in tmp_path.iterdir() if "pre-workbench" in p.name], \
+        "做过破坏性重建就必须留备份"
+
+
+def test_schema_version_guard_refuses_newer_db(tmp_path):
+    path = tmp_path / "future.db"
+    dbmod.init_db(path)
+    conn = sqlite3.connect(str(path))
+    conn.execute(f"PRAGMA user_version = {dbmod.SCHEMA_VERSION + 1}")
+    conn.commit()
+    conn.close()
+    with pytest.raises(RuntimeError, match="比本程序支持的"):
+        dbmod.init_db(path)
+
+
+def test_finish_run_does_not_truncate_long_message(tmp_path):
+    """检查点 JSON 不能被 2000 字符截断（否则读回来就解析不了）。"""
+    path = tmp_path / "log.db"
+    dbmod.init_db(path)
+    with dbmod.session(path) as conn:
+        payload = "x" * 5000
+        run_id = dbmod.start_run(conn, task="raw-bar-sync", source="eltdx")
+        dbmod.finish_run(conn, run_id, "success", 0, payload)
+        row = conn.execute("SELECT message FROM collect_log WHERE run_id=?",
+                           (run_id,)).fetchone()
+    assert len(row["message"]) == 5000
+
+
+def test_read_raw_checkpoint_rejects_malformed(tmp_path):
+    path = tmp_path / "cp.db"
+    dbmod.init_db(path)
+    with dbmod.session(path) as conn:
+        assert dbmod.read_raw_checkpoint(conn) is None
+        run_id = dbmod.start_run(conn, task="raw-bar-sync", source="eltdx")
+        dbmod.finish_run(conn, run_id, "success", 0, "{not json")
+    with dbmod.session(path) as conn:
+        with pytest.raises(RuntimeError, match="合法 JSON"):
+            dbmod.read_raw_checkpoint(conn)

@@ -88,12 +88,13 @@ def detail(symbol: str, date: str | None = None) -> dict:
         # 「这只票历史上有这个问题、哪一段时间受影响」。
         anomalies: list[dict] = []
         try:
+            # 只看**生效日及之前**的异常：回看历史时不该展示还没发生的复权事件
             anomalies = [
                 {"date": r["date"], "kind": r["kind"], "detail": r["detail"]}
                 for r in conn.execute(
-                    "SELECT date, kind, detail FROM adjust_event WHERE symbol = ? "
-                    "ORDER BY date DESC LIMIT 12",
-                    (symbol,),
+                    "SELECT date, kind, detail FROM adjust_event WHERE symbol = ?"
+                    " AND date <= ? ORDER BY date DESC LIMIT 12",
+                    (symbol, current.get("date") or "9999-12-31"),
                 )
             ]
         except Exception as exc:  # noqa: BLE001 - 旧库没有这张表

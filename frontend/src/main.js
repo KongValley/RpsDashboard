@@ -43,8 +43,12 @@ const routes = [
     meta: { title: '自选与预警' } },
   { path: '/factors', name: 'factors', component: () => import('./views/Factors.vue'),
     meta: { title: '因子研究' } },
+  { path: '/portfolio', name: 'portfolio',
+    component: () => import('./views/Portfolio.vue'), meta: { title: '模拟持仓' } },
+  { path: '/tools', name: 'tools', component: () => import('./views/Tools.vue'),
+    meta: { title: '交易工具' } },
   { path: '/trade', name: 'trade', component: () => import('./views/Trade.vue'),
-    meta: { title: '交易' } },
+    meta: { title: '券商接入' } },
 ]
 
 const router = createRouter({

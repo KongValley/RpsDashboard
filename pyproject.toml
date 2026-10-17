@@ -41,7 +41,7 @@ packages = ["backend/rpsboard"]
 
 [tool.pytest.ini_options]
 testpaths = ["backend/tests"]
-# 覆盖率门槛放在 CI 的 pytest 命令里（全套实测 TOTAL 54% → 门槛 50）：
+# 覆盖率门槛放在 CI 的 pytest 命令里（全套实测 TOTAL 80.89% → 门槛 80）：
 # 写进 addopts 会让「只跑一个测试文件」也因总覆盖率不足而失败，本地开发很难用。
 # timeout 让 pytest-timeout 真正生效（此前装了但没有任何 timeout 设置）。
 addopts = "-q --cov=rpsboard --cov-report=term-missing"

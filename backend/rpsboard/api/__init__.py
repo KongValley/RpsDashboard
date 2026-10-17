@@ -11,6 +11,7 @@ from __future__ import annotations
 import csv
 import io
 import sqlite3
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -188,10 +189,32 @@ def csv_response(headers: list[str], rows: list[list], filename: str) -> Streami
 
 
 def create_app() -> FastAPI:
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        """启动时先迁移数据库，再开放请求。
+
+        迁移**只在这里**（以及 CLI 里）发生：以前 API 进程从不调用 `db.init_db`，
+        于是「代码已升级、库还停在旧结构」时，第一个读费用列的请求就直接 500
+        （实测缺 `paper_archive` 表与 `trade_fill` 的三个列）。启动即迁移，
+        失败就拒绝启动 —— 半迁移状态提供服务比启动失败危险得多。
+        """
+        # 迁移前先丢弃可能存在的旧连接，避免它在重建表期间持有旧 schema
+        if _cache["conn"] is not None:
+            _cache["conn"].close()
+            _cache["conn"] = None
+        db.init_db()
+        try:
+            yield
+        finally:
+            if _cache["conn"] is not None:
+                _cache["conn"].close()
+                _cache["conn"] = None
+
     app = FastAPI(
         title="A股 RPS 看板",
         description="欧奈尔相对价格强度看板 · 数据源 eltdx（通达信行情协议，TCP 直连）",
         version=__version__,
+        lifespan=lifespan,
     )
     app.add_middleware(
         CORSMiddleware,
@@ -205,7 +228,7 @@ def create_app() -> FastAPI:
     app.add_middleware(perf.PerfMiddleware)
 
     from . import backtest as bt_api
-    from . import factors, meta, review, rps, screens, stock, trade, watchlist
+    from . import factors, meta, portfolio, review, rps, screens, stock, tools, trade, watchlist
 
     app.include_router(perf.router)
     app.include_router(watchlist.router)
@@ -217,15 +240,10 @@ def create_app() -> FastAPI:
     app.include_router(bt_api.router)
     app.include_router(trade.router)
     app.include_router(factors.router)
+    app.include_router(portfolio.router)
+    app.include_router(tools.router)
 
     _mount_frontend(app)
-
-    @app.on_event("shutdown")
-    def _close_conn() -> None:
-        if _cache["conn"] is not None:
-            _cache["conn"].close()
-            _cache["conn"] = None
-
     return app
 
 
